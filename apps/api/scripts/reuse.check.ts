@@ -11,6 +11,7 @@ import assert from 'node:assert/strict';
 import {
   agentGraphSchema,
   buildBenchmarkReport,
+  promotionCandidates,
   runReuse,
   type BenchmarkSample,
   type BrowserTargetMemory,
@@ -21,6 +22,7 @@ import {
   type ToolLifecycleEvent,
 } from '@htn/shared';
 import { buildGraphReuseReport } from '../src/core/graph/reuseReport.js';
+import { renderOptimizeRequest } from '../src/services/optimization.service.js';
 
 const at = '2026-10-17T12:00:00.000Z';
 let checks = 0;
@@ -253,6 +255,118 @@ check('the editor report lists frozen nodes, remembered targets and site alerts'
     ['site_changed:https://shop.example', 'site_blocked:https://www.google.com'],
     'another graph’s memory and old blocks are left out',
   );
+});
+
+check('an agent node that keeps doing the same verified thing is a promotion candidate', () => {
+  const graph = agentGraphSchema.parse({
+    id: 'g1',
+    name: 'G',
+    version: 1,
+    createdAt: at,
+    updatedAt: at,
+    edges: [],
+    nodes: [
+      { id: 'research', type: 'agent_task', label: 'Research', config: { goal: 'Read notes.' } },
+    ],
+  });
+  const runOf = (
+    id: string,
+    tools: string[],
+    options: { verified?: boolean; query?: string; labels?: ('public' | 'private')[] } = {},
+  ) => {
+    const stepId = 's_' + id;
+    return {
+      run: { ...run, id },
+      steps: [
+        {
+          ...step(stepId, 'research'),
+          output: { completionDecision: { status: 'done', verified: options.verified ?? true } },
+        } as Step,
+      ],
+      egress: [],
+      scheduleDecisions: [
+        {
+          ...schedule(stepId, 'jev-routed'),
+          requestedCapability: 'agent.runtime' as const,
+          exposedTools: ['web.search', 'docs.read'],
+        },
+      ],
+      toolLifecycle: tools.map((toolId, index): ToolLifecycleEvent => ({
+        id: id + index,
+        runId: id,
+        stepId,
+        sessionStateId: 'ss',
+        phase: 'succeeded',
+        action: {
+          toolId,
+          arguments: { query: options.query ?? 'agentos' },
+          dataLabels: options.labels ?? ['public'],
+        } as unknown as ToolLifecycleEvent['action'],
+        at: '2026-10-17T12:00:0' + index + '.000Z',
+      })),
+    };
+  };
+  const same = ['web.search', 'docs.read'];
+  const [candidate] = promotionCandidates({
+    graph,
+    runs: [runOf('r3', same), runOf('r2', same), runOf('r1', same)],
+  });
+  assert.equal(candidate?.suggestion, 'tool_nodes');
+  assert.deepEqual(candidate?.tools, same);
+  assert.equal(candidate?.stableArguments, true);
+  assert.equal(candidate?.arguments?.length, 2, 'public stable arguments are offered');
+  assert.equal(
+    promotionCandidates({
+      graph,
+      runs: [
+        runOf('r3', same, { verified: false }),
+        runOf('r2', same),
+        runOf('r1', same),
+        runOf('r0', same),
+      ],
+    }).length,
+    0,
+    'the newest run must be verified: only an unbroken recent streak counts',
+  );
+  assert.equal(
+    promotionCandidates({
+      graph,
+      runs: [runOf('r3', same), runOf('r2', ['web.search']), runOf('r1', same)],
+    }).length,
+    0,
+    'a different tool sequence is not the same work',
+  );
+  const varied = promotionCandidates({
+    graph,
+    runs: [runOf('r3', same, { query: 'a' }), runOf('r2', same, { query: 'b' }), runOf('r1', same)],
+  })[0];
+  assert.equal(varied?.stableArguments, false);
+  assert.equal(varied?.arguments, undefined);
+  const privateCandidate = promotionCandidates({
+    graph,
+    runs: ['r3', 'r2', 'r1'].map((id) => runOf(id, same, { labels: ['private'] })),
+  })[0];
+  assert.equal(
+    privateCandidate?.arguments,
+    undefined,
+    'private arguments never leave in a suggestion',
+  );
+  const request = renderOptimizeRequest(
+    {
+      graphId: 'g1',
+      runsAnalyzed: 3,
+      lowConfidence: false,
+      assertionFailures: [],
+      costOutliers: [],
+      latencyOutliers: [],
+      toolDivergenceOutliers: [],
+      failureEvidence: [],
+    },
+    [candidate!],
+  );
+  assert.match(request, /web\.search -> docs\.read/);
+  assert.match(request, /Keep every approval, submit and handoff gate/);
+  assert.doesNotMatch(request, /Nothing obviously wrong/);
 });
 
 console.log('\n' + checks + ' reuse checks passed.');

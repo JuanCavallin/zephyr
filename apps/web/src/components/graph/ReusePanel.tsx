@@ -118,6 +118,20 @@ export function ReusePanel({
           ))}
         </ul>
       )}
+      {report.promotions.length > 0 && (
+        <ul className="mt-3 space-y-1 text-xs" aria-label="Promotion suggestions">
+          {report.promotions.map((promotion) => (
+            <li key={promotion.nodeId} className="text-sky-300">
+              <Badge tone="accent">could be fixed steps</Badge>{' '}
+              {graph.nodes.find((node) => node.id === promotion.nodeId)?.label ?? promotion.nodeId}{' '}
+              did the same thing in its last {promotion.runs} verified runs:{' '}
+              {promotion.tools.join(' → ')}
+              {promotion.stableArguments ? ', same arguments' : ''}. “Suggest an improvement”
+              proposes the change as a separate graph for review.
+            </li>
+          ))}
+        </ul>
+      )}
     </Card>
   );
 }

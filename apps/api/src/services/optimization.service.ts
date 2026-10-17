@@ -16,6 +16,9 @@ import {
   agentGraphSchema,
   buildGraphCritique,
   isTerminal,
+  promotionCandidates,
+  type PromotionCandidate,
+  type ToolLifecycleEvent,
   type AgentGraph,
   type Approval,
   type EgressEvent,
@@ -55,6 +58,7 @@ interface PerRunData {
   egress: Map<string, EgressEvent[]>;
   scheduleDecisions: Map<string, ScheduleDecision[]>;
   approvals: Map<string, Approval[]>;
+  toolLifecycle: Map<string, ToolLifecycleEvent[]>;
 }
 
 /** Fetch what rollup() needs for each run, in parallel. */
@@ -63,27 +67,36 @@ async function loadPerRunData(runs: Run[]): Promise<PerRunData> {
   const egress = new Map<string, EgressEvent[]>();
   const scheduleDecisions = new Map<string, ScheduleDecision[]>();
   const approvals = new Map<string, Approval[]>();
+  const toolLifecycle = new Map<string, ToolLifecycleEvent[]>();
 
   await Promise.all(
     runs.map(async (run) => {
-      const [s, e, d, a] = await Promise.all([
+      const [s, e, d, a, events] = await Promise.all([
         store.listSteps(run.id),
         store.listEgress(run.id),
         store.listScheduleDecisions(run.id),
         store.listApprovals(run.id),
+        store.eventsSince(run.id, 0),
       ]);
       steps.set(run.id, s);
       egress.set(run.id, e);
       scheduleDecisions.set(run.id, d);
       approvals.set(run.id, a);
+      toolLifecycle.set(
+        run.id,
+        events.flatMap(({ event }) => (event.type === 'tool.lifecycle' ? [event.lifecycle] : [])),
+      );
     }),
   );
 
-  return { steps, egress, scheduleDecisions, approvals };
+  return { steps, egress, scheduleDecisions, approvals, toolLifecycle };
 }
 
 /** Render a GraphCritique as the compact "OPTIMIZE: " request the synthesiser reads. */
-export function renderOptimizeRequest(critique: GraphCritique): string {
+export function renderOptimizeRequest(
+  critique: GraphCritique,
+  promotions: PromotionCandidate[] = [],
+): string {
   const lines: string[] = [];
 
   lines.push(
@@ -129,6 +142,21 @@ export function renderOptimizeRequest(critique: GraphCritique): string {
         ' tool call(s) -- it made partial progress before running out of budget.',
     );
   }
+  for (const p of promotions) {
+    lines.push(
+      'Agent node "' + p.nodeId + '" finished verified in its last ' + p.runs +
+        ' run(s) by calling the same tool(s) in the same order: ' + p.tools.join(' -> ') + '. ' +
+        (p.suggestion === 'dispatch'
+          ? 'Consider a dispatch or tool node instead of an agent loop.'
+          : 'Consider replacing the agent loop with fixed tool nodes in that order.') +
+        (p.arguments
+          ? ' The arguments were identical every run: ' + JSON.stringify(p.arguments).slice(0, 600) + '.'
+          : p.stableArguments
+            ? ''
+            : ' Arguments varied between runs; wire them from upstream node outputs, not literals.') +
+        ' Keep every approval, submit and handoff gate.',
+    );
+  }
   if (critique.baselineComparison) {
     const b = critique.baselineComparison;
     lines.push(
@@ -144,7 +172,8 @@ export function renderOptimizeRequest(critique: GraphCritique): string {
     critique.costOutliers.length === 0 &&
     critique.latencyOutliers.length === 0 &&
     critique.toolDivergenceOutliers.length === 0 &&
-    critique.failureEvidence.length === 0;
+    critique.failureEvidence.length === 0 &&
+    promotions.length === 0;
 
   lines.push(
     nothingFound
@@ -218,7 +247,17 @@ export async function optimizeGraph(graphId: string): Promise<OptimizeGraphResul
     baselineEgressByRun: baselineData.egress,
   });
 
-  const request = 'OPTIMIZE: ' + renderOptimizeRequest(critique);
+  const promotions = promotionCandidates({
+    graph: source,
+    runs: graphRuns.map((run) => ({
+      run,
+      steps: runData.steps.get(run.id) ?? [],
+      egress: runData.egress.get(run.id) ?? [],
+      scheduleDecisions: runData.scheduleDecisions.get(run.id) ?? [],
+      toolLifecycle: runData.toolLifecycle.get(run.id) ?? [],
+    })),
+  });
+  const request = 'OPTIMIZE: ' + renderOptimizeRequest(critique, promotions);
 
   const synthesis = await synthesiseGraph({
     conversationId: newId('conv'),

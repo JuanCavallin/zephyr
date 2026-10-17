@@ -15,7 +15,7 @@ import type {
   ReuseAlert,
   RollupInput,
 } from '@htn/shared';
-import { runReuse } from '@htn/shared';
+import { promotionCandidates, runReuse } from '@htn/shared';
 
 const RECENT_BLOCK_MS = 7 * 24 * 60 * 60 * 1000;
 /** Two misses in a row: the element was looked for twice and was not there. */
@@ -134,5 +134,6 @@ export function buildGraphReuseReport(input: {
     totals,
     nodes,
     alerts,
+    promotions: promotionCandidates({ graph, runs: input.runs }),
   };
 }

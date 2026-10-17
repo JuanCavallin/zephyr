@@ -120,4 +120,96 @@ export interface GraphReuseReport {
   totals: ReuseCounts;
   nodes: Record<string, NodeReuse>;
   alerts: ReuseAlert[];
+  /** Agent nodes that keep doing the same thing and could be fixed steps. */
+  promotions: PromotionCandidate[];
+}
+
+/* -------------------------------------------------------------------------- */
+/* Promotion: an agent node that keeps doing the same thing                   */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * An agent_task node whose recent runs all finished with a verified `done`,
+ * were exposed the same tools and called the same tools in the same order.
+ * Its harness loop is no longer earning its cost: the same work could be
+ * fixed graph steps (one model-free call each, still brokered and approved).
+ * A suggestion for a person or the optimizer, never applied automatically.
+ */
+export interface PromotionCandidate {
+  nodeId: string;
+  /** Consecutive most-recent runs that agree. */
+  runs: number;
+  /** Tool ids in call order. */
+  tools: string[];
+  exposedTools: string[];
+  /** Every call had identical arguments in every run. */
+  stableArguments: boolean;
+  /** The arguments, only when stable AND every call was on public data. */
+  arguments?: unknown[];
+  suggestion: 'dispatch' | 'tool_nodes';
+}
+
+const MIN_PROMOTION_RUNS = 3;
+
+/** `runs` newest first, as the store lists them. */
+export function promotionCandidates(input: {
+  graph: import('./schemas/graph.js').AgentGraph;
+  runs: RollupInput[];
+  minRuns?: number;
+}): PromotionCandidate[] {
+  const minRuns = input.minRuns ?? MIN_PROMOTION_RUNS;
+  const out: PromotionCandidate[] = [];
+  for (const node of input.graph.nodes) {
+    if (node.type !== 'agent_task') continue;
+    const observed: { tools: string[]; exposed: string[]; args: string[]; public: boolean }[] = [];
+    for (const run of input.runs) {
+      const steps = run.steps.filter((step) => step.nodeId === node.id);
+      const verified = steps.some((step) => {
+        const decision = (
+          step.output as { completionDecision?: { status?: string; verified?: boolean } } | null
+        )?.completionDecision;
+        return decision?.status === 'done' && decision.verified === true;
+      });
+      // Only an unbroken streak of verified runs counts; older agreement does not.
+      if (!verified) break;
+      const stepIds = new Set(steps.map((step) => step.id));
+      const calls = (run.toolLifecycle ?? [])
+        .filter((event) => event.phase === 'succeeded' && stepIds.has(event.stepId))
+        .sort((a, b) => a.at.localeCompare(b.at));
+      const exposed =
+        (run.scheduleDecisions ?? []).find(
+          (decision) =>
+            stepIds.has(decision.stepId) && decision.requestedCapability === 'agent.runtime',
+        )?.exposedTools ?? [];
+      observed.push({
+        tools: calls.map((event) => event.action.toolId),
+        exposed: [...exposed].sort(),
+        args: calls.map((event) => JSON.stringify(event.action.arguments)),
+        public: calls.every((event) =>
+          event.action.dataLabels.every((label) => label === 'public'),
+        ),
+      });
+    }
+    if (observed.length < minRuns) continue;
+    const first = observed[0]!;
+    if (first.tools.length === 0) continue;
+    const same = (a: string[], b: string[]) =>
+      a.length === b.length && a.every((item, i) => item === b[i]);
+    if (!observed.every((run) => same(run.tools, first.tools) && same(run.exposed, first.exposed)))
+      continue;
+    const stableArguments = observed.every((run) => same(run.args, first.args));
+    const allPublic = observed.every((run) => run.public);
+    out.push({
+      nodeId: node.id,
+      runs: observed.length,
+      tools: first.tools,
+      exposedTools: first.exposed,
+      stableArguments,
+      ...(stableArguments && allPublic
+        ? { arguments: first.args.map((json) => JSON.parse(json) as unknown) }
+        : {}),
+      suggestion: first.tools.length === 1 ? 'dispatch' : 'tool_nodes',
+    });
+  }
+  return out;
 }

@@ -1,6 +1,6 @@
 /** Loads what the Graph Editor's reuse panel counts; see core/graph/reuseReport.ts. */
 
-import type { GraphReuseReport, RollupInput } from '@htn/shared';
+import { isTerminal, type GraphReuseReport, type RollupInput } from '@htn/shared';
 import { buildGraphReuseReport } from '../core/graph/reuseReport.js';
 import { nowIso } from '../lib/ids.js';
 import { store } from '../store/index.js';
@@ -11,9 +11,10 @@ const RECENT_RUNS = 20;
 export async function graphReuseReport(graphId: string): Promise<GraphReuseReport | null> {
   const graph = await store.getGraph(graphId);
   if (!graph) return null;
-  const runs = (await store.listRuns({ graphId, kind: 'graph', limit: RECENT_RUNS })).filter(
-    (run) => run.graphId === graphId,
-  );
+  // Newest first: a promotion needs an unbroken streak of recent verified runs.
+  const runs = (await store.listRuns({ graphId, kind: 'graph', limit: RECENT_RUNS }))
+    .filter((run) => run.graphId === graphId && isTerminal(run.status))
+    .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
   const inputs = await Promise.all(
     runs.map(async (run): Promise<RollupInput> => {
       const [steps, egress, scheduleDecisions, events] = await Promise.all([

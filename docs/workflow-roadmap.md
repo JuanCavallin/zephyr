@@ -303,19 +303,29 @@ execution; overlay status, measurements, scope/resource markers and expandable t
 traces. Do not replace logical nodes with unrelated runtime nodes or infer dependencies
 from event arrival order. Preserve selection and layout across updates.
 
-## Fewer Jev round trips (TODO, future)
+## Fewer Jev round trips
 
-Done: the model is chosen once per agent task; public reversible reads and pre-review
-browser checks use the deterministic policy; saved graphs freeze agent tool grants and
-tiers and fixed dispatch choices (`compiled`, see `apps/api/src/core/graph/compile.ts`,
-`GRAPH_COMPILE=off` to disable). Two further steps were proposed and are not built:
+Built:
 
-- **Cross-run browser target cache.** Target picks are cached per run and browser
-  session only, so a second run of the same graph asks Jev again on an identical page.
-  Key a persisted cache by graph node, page origin and path, goal and a fingerprint of
-  the numbered element table; before reusing a hit, require the existing role-and-label
-  identity check (`validateTargetScript`) and freshness/occlusion checks to pass, and
-  fall back to Jev on any mismatch. Never cache targets for non-public pages.
+- The model is chosen once per agent task; public reversible reads and pre-review
+  browser checks use the deterministic policy.
+- Saved graphs freeze agent tool grants and tiers and fixed dispatch choices
+  (`compiled`, `apps/api/src/core/graph/compile.ts`; `GRAPH_COMPILE=off` disables it).
+- Browser actions are approved by consequence, not Jev's confidence
+  (`core/tools/browserRisk.ts`): `submit` and clicks on buy/pay/send/delete-style labels
+  always ask; everything else follows Jev's pick at any confidence.
+- Cross-run target memory (`core/tools/targetMemory.ts`): per graph node, page template
+  and normalized goal, identity only, public pages only, never permission. Approval
+  cards let a person pick another element; that correction is remembered.
+- Reuse reporting: Jev calls and warm/cold per run (`packages/shared/src/reuse.ts`),
+  `GET /api/benchmarks?warmth=cold`, and the Graph Editor's Reuse panel with site-change
+  and blocked-site alerts and suggestions to turn stable agent nodes into fixed steps
+  (also fed to "Suggest an improvement").
+
+Still open:
+
+- **Ledger gap.** Jev browser target picks are not written to the egress ledger, so
+  their cost is missing from run totals; reuse stats count them from tool reviews.
 - **Keep the remaining run-time decisions live.** Judge verdicts, completion verdicts,
   dispatch goals with `{{refs}}` and browser picks on new pages judge evidence the run
   produces; do not freeze them. Revisit only with measurements showing which of these
