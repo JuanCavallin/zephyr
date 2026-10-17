@@ -5,6 +5,8 @@ import type {
   AgentGraph,
   AgentSessionState,
   Approval,
+  BrowserSiteBlock,
+  BrowserTargetMemory,
   Conversation,
   EgressEvent,
   McpConnection,
@@ -117,6 +119,22 @@ export function createSqliteStore(path: string): SqliteStore {
       PRIMARY KEY(run_id, seq)
     );
     CREATE INDEX IF NOT EXISTS events_run_seq ON events(run_id, seq);
+
+    CREATE TABLE IF NOT EXISTS target_memory (
+      key TEXT PRIMARY KEY,
+      scope TEXT NOT NULL,
+      last_seen TEXT NOT NULL,
+      body TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS target_memory_scope ON target_memory(scope, last_seen);
+
+    CREATE TABLE IF NOT EXISTS site_blocks (
+      origin TEXT NOT NULL,
+      reason TEXT NOT NULL,
+      last_at TEXT NOT NULL,
+      body TEXT NOT NULL,
+      PRIMARY KEY(origin, reason)
+    );
 
     CREATE TABLE IF NOT EXISTS mcp_connections (
       id TEXT PRIMARY KEY,
@@ -309,6 +327,49 @@ export function createSqliteStore(path: string): SqliteStore {
     },
     async deleteMcpConnection(id) {
       return Number(db.prepare('DELETE FROM mcp_connections WHERE id = ?').run(id).changes) > 0;
+    },
+
+    async getTargetMemory(key) {
+      return readOne<BrowserTargetMemory>(db, 'SELECT body FROM target_memory WHERE key = ?', key);
+    },
+    async putTargetMemory(entry) {
+      db.prepare(
+        `INSERT INTO target_memory(key, scope, last_seen, body) VALUES (?, ?, ?, ?)
+         ON CONFLICT(key) DO UPDATE SET scope=excluded.scope, last_seen=excluded.last_seen, body=excluded.body`,
+      ).run(entry.key, entry.scope, entry.lastSeen, encode(entry));
+    },
+    async deleteTargetMemory(key) {
+      db.prepare('DELETE FROM target_memory WHERE key = ?').run(key);
+    },
+    async listTargetMemory(scope) {
+      return readRows<BrowserTargetMemory>(
+        scope === undefined
+          ? db.prepare('SELECT body FROM target_memory ORDER BY last_seen DESC').all()
+          : db
+              .prepare('SELECT body FROM target_memory WHERE scope = ? ORDER BY last_seen DESC')
+              .all(scope),
+      );
+    },
+    async recordSiteBlock(origin, reason, at) {
+      const existing = readOne<BrowserSiteBlock>(
+        db,
+        'SELECT body FROM site_blocks WHERE origin = ? AND reason = ?',
+        origin,
+        reason,
+      );
+      const next: BrowserSiteBlock = existing
+        ? { ...existing, count: existing.count + 1, lastAt: at }
+        : { origin, reason, count: 1, firstAt: at, lastAt: at };
+      db.prepare(
+        `INSERT INTO site_blocks(origin, reason, last_at, body) VALUES (?, ?, ?, ?)
+         ON CONFLICT(origin, reason) DO UPDATE SET last_at=excluded.last_at, body=excluded.body`,
+      ).run(origin, reason, at, encode(next));
+      return clone(next);
+    },
+    async listSiteBlocks() {
+      return readRows<BrowserSiteBlock>(
+        db.prepare('SELECT body FROM site_blocks ORDER BY last_at DESC').all(),
+      );
     },
 
     async appendEgress(event) {

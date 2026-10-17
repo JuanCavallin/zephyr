@@ -354,6 +354,13 @@ export const api = {
       body: JSON.stringify(decision),
     }),
 
+  /** Use a different element on a pending browser-target review; remembered for later runs. */
+  correctBrowserTarget: (approvalId: string, index: number) =>
+    request<{ approval: Approval }>('/approvals/' + approvalId + '/browser-target', {
+      method: 'POST',
+      body: JSON.stringify({ index }),
+    }),
+
   /* ------------------------------------------------------------ Connections */
 
   listMcpConnections: () => request<{ connections: McpConnection[] }>('/mcp-connections'),

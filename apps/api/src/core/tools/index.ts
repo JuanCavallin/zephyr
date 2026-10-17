@@ -4,6 +4,7 @@ export * from './browserDescriptors.js';
 export * from './composeText.js';
 export * from './elementTable.js';
 export * from './registry.js';
+export * from './targetMemory.js';
 
 import type { BrowserAdapter, BrowserBackend } from '@htn/shared';
 import { config } from '../../config.js';
@@ -17,6 +18,7 @@ import {
   withResolutionCache,
 } from './browserDecision.js';
 import { browserToolRegistrations } from './browserDescriptors.js';
+import type { TargetMemory } from './targetMemory.js';
 import type { InMemoryToolExecutorRegistry } from './executors.js';
 import type { InMemoryToolRegistry } from './registry.js';
 
@@ -24,6 +26,10 @@ export interface RegisterBrowserToolsOptions {
   byId?(providerId: BrowserBackend): BrowserAdapter;
   provider(capability: 'browser' | 'browser.local'): BrowserAdapter;
   onSession?: BrowserExecutorDeps['onSession'];
+  /** Cross-run target memory; without it nothing is remembered past a run. */
+  targetMemory?: TargetMemory;
+  memoryScope?: BrowserExecutorDeps['memoryScope'];
+  onSiteBlocked?: BrowserExecutorDeps['onSiteBlocked'];
 }
 
 /** Register the teammate browser adapters inside AgentOS's trusted broker. */
@@ -61,7 +67,7 @@ export function registerBrowserTools(
 
   const deterministic = createDeterministicDecider();
   const jev = createJevBrowserDecider();
-  const decider = withResolutionCache(
+  const runScoped = withResolutionCache(
     jev
       ? withFallback(jev, deterministic, (error) =>
           console.warn(
@@ -72,6 +78,9 @@ export function registerBrowserTools(
       : deterministic,
     createResolutionCache(),
   );
+  // Remembered targets are checked first; a miss falls through to the
+  // run-level cache, then Jev (or the deterministic fallback).
+  const decider = options.targetMemory ? options.targetMemory.decider(runScoped) : runScoped;
 
   const executor = createBrowserExecutor({
     provider: options.provider,
@@ -79,6 +88,9 @@ export function registerBrowserTools(
     decide: decider,
     maxElements: config.browser.maxElements,
     onSession: options.onSession,
+    targetMemory: options.targetMemory,
+    memoryScope: options.memoryScope,
+    onSiteBlocked: options.onSiteBlocked,
   });
   executors.register(executor);
   return executor;

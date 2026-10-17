@@ -1,6 +1,11 @@
 import { Router } from 'express';
 import { approvalDecisionSchema, type ApprovalDecision } from '@htn/shared';
-import { decideApproval, getApproval } from '../services/approvals.service.js';
+import { z } from 'zod';
+import {
+  correctBrowserTarget,
+  decideApproval,
+  getApproval,
+} from '../services/approvals.service.js';
 import { HttpError, param, valid, validate } from './middleware/validate.js';
 import { assertRunAccess, requireLocalControl } from '../services/localControl.js';
 
@@ -27,6 +32,25 @@ approvalsRouter.post(
     if (!pending) throw new HttpError(404, 'NOT_FOUND', 'Approval not found');
     assertRunAccess(req, pending.runId);
     const approval = await decideApproval(param(req, 'id'), body);
+    res.json({ approval });
+  },
+);
+
+/**
+ * Use a different element for a pending browser-target review. The choice is
+ * remembered for later runs; the action is re-prepared and asks for approval
+ * of the corrected element. Never clicks anything itself.
+ */
+approvalsRouter.post(
+  '/approvals/:id/browser-target',
+  requireLocalControl,
+  validate(z.object({ index: z.number().int().min(1) })),
+  async (req, res) => {
+    const { index } = valid<{ index: number }>(req, 'body');
+    const pending = await getApproval(param(req, 'id'));
+    if (!pending) throw new HttpError(404, 'NOT_FOUND', 'Approval not found');
+    assertRunAccess(req, pending.runId);
+    const approval = await correctBrowserTarget(param(req, 'id'), index);
     res.json({ approval });
   },
 );

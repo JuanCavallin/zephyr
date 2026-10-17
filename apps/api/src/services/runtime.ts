@@ -25,7 +25,7 @@ import { registerBenchmarkFixture } from '../core/tools/benchmarkFixture.js';
 import { registerSearchTool } from '../core/tools/search.js';
 import { credentials } from './credentials.js';
 import { resolveBrowserSessionProvider } from '../providers/withBrowserOwnership.js';
-import { registerBrowserTools } from '../core/tools/index.js';
+import { createTargetMemory, registerBrowserTools } from '../core/tools/index.js';
 import { SessionStateService } from '../core/sessions/service.js';
 import { nowIso } from '../lib/ids.js';
 import { createProviderRegistry } from '../providers/registry.js';
@@ -82,6 +82,19 @@ registerSearchTool(toolRegistry, toolExecutors, {
   recordEgress,
 });
 export const browserTools = registerBrowserTools(toolRegistry, toolExecutors, {
+  targetMemory: createTargetMemory(store),
+  // Scope comes from the server's own run and step records: a graph node
+  // remembers its own pages; ad-hoc runs share one scope per run kind.
+  memoryScope: async ({ runId, stepId }) => {
+    const run = await store.getRun(runId);
+    if (!run) return undefined;
+    if (!run.graphId || run.kind !== 'graph') return 'adhoc:' + run.kind;
+    const step = stepId ? await store.getStep(stepId) : null;
+    return run.graphId + '|' + (step?.nodeId ?? 'run');
+  },
+  onSiteBlocked: async (origin, reason) => {
+    await store.recordSiteBlock(origin, reason, nowIso());
+  },
   provider: (capability) => providers.provider(capability),
   byId: (id) => providers.byId(id) as import('@htn/shared').BrowserAdapter,
   // Sessions an agent opens through its tools reach the run's browser panel

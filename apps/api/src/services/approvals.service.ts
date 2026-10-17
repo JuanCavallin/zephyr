@@ -17,7 +17,7 @@ import {
   actionForTrace,
   buildActionPreview,
 } from './actionEvidence.js';
-import { toolRegistry, toolExecutors } from './runtime.js';
+import { browserTools, toolRegistry, toolExecutors } from './runtime.js';
 import Ajv, { type AnySchema } from 'ajv';
 import { KeyedLock } from '../core/locks.js';
 import { prepareBrowserHandoffApproval } from '../providers/withBrowserOwnership.js';
@@ -61,6 +61,38 @@ export async function getApproval(id: string): Promise<Approval | null> {
  * Order matters: persist and emit BEFORE settling, so that by the time the run
  * resumes, any client watching has already seen the resolution.
  */
+/**
+ * A person picked a different element on a pending browser-target review.
+ *
+ * The choice is remembered for this graph node and page, then the approval is
+ * resolved as an unchanged revision, which makes the broker prepare the action
+ * again: that preparation resolves to the corrected element and asks for
+ * approval of IT. Nothing is clicked by this call.
+ */
+export async function correctBrowserTarget(id: string, index: number): Promise<Approval> {
+  const approval = await store.getApproval(id);
+  if (!approval) throw new ApprovalConflictError('Approval not found.');
+  if (approval.status !== 'pending')
+    throw new ApprovalConflictError('This approval was already decided.');
+  const proposed = approval.proposedAction;
+  const review = isRecord(proposed) && isRecord(proposed.review) ? proposed.review : undefined;
+  if (
+    !isRecord(proposed) ||
+    typeof proposed.actionId !== 'string' ||
+    review?.kind !== 'browser_target'
+  )
+    throw new ApprovalRevisionError('Only a pending browser-target review can be corrected.');
+  if (!(await browserTools.correctTarget(proposed.actionId, index)))
+    throw new ApprovalRevisionError(
+      'That element cannot be used for this action, or this page is not remembered (private data).',
+    );
+  return decideApproval(id, {
+    decision: 'revised',
+    revisedPayload: proposed,
+    note: 'Browser target corrected by a person to element [' + index.toString() + '].',
+  });
+}
+
 export async function decideApproval(id: string, body: ApprovalDecision): Promise<Approval> {
   const release = await approvalLocks.acquire(id);
   try {

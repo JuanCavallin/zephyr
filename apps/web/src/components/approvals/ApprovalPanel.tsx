@@ -122,6 +122,19 @@ export function ApprovalPanel({
     }
   };
 
+  const correctTarget = async (index: number) => {
+    setBusy(true);
+    setError(null);
+    try {
+      await api.correctBrowserTarget(approval.id, index);
+      setSubmitted(true);
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const submitRevision = async () => {
     let revisedPayload: unknown;
     try {
@@ -289,9 +302,37 @@ export function ApprovalPanel({
           <section className="mt-2" aria-label="Browser target review">
             <h3 className="text-sm font-medium">Prepared browser target</h3>
             <p className="text-xs text-slate-400">
-              Approve only this operation and target. The snapshot and target review are fixed; a
-              changed target requires a fresh decision.
+              {review.consequential
+                ? 'This click commits something (' +
+                  String(review.risk ?? 'consequential') +
+                  '), so it needs your approval at any confidence. '
+                : ''}
+              Approve only this operation and target; a changed target requires a fresh decision.
             </p>
+            {review.remembered === 'human' && (
+              <p className="mt-1 text-xs text-emerald-300">Remembered from your earlier choice.</p>
+            )}
+            {Array.isArray(review.candidates) && review.candidates.length > 1 && (
+              <ul className="mt-2 space-y-1" aria-label="Other elements on this page">
+                {review.candidates.slice(1).map((candidate) =>
+                  candidate && typeof candidate === 'object' && !Array.isArray(candidate) ? (
+                    <li key={String(candidate.index)} className="flex items-center gap-2 text-xs">
+                      <span className="text-slate-300">
+                        [{String(candidate.index)}] {String(candidate.role)} “
+                        {String(candidate.label)}”
+                      </span>
+                      <Button
+                        variant="ghost"
+                        disabled={busy || submitted}
+                        onClick={() => void correctTarget(Number(candidate.index))}
+                      >
+                        Use this instead
+                      </Button>
+                    </li>
+                  ) : null,
+                )}
+              </ul>
+            )}
             <pre className="mt-1 max-h-48 overflow-auto rounded bg-slate-950/70 px-3 py-2 text-[11px] text-slate-300">
               {JSON.stringify(redactCredentialFields(review), null, 2)}
             </pre>

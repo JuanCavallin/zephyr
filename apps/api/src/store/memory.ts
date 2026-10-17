@@ -11,6 +11,8 @@ import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 import type {
   AgentSessionState,
+  BrowserSiteBlock,
+  BrowserTargetMemory,
   Conversation,
   AgentGraph,
   Approval,
@@ -56,6 +58,10 @@ export function createMemoryStore(opts: { persistToDisk?: boolean } = {}): Store
   const events = new Map<string, StoredEvent[]>();
   const graphs = new Map<string, AgentGraph>();
   const conversations = new Map<string, Conversation>();
+  // Not part of the disk snapshot: browser memory is a cache, and a lost one
+  // only costs a target decision on the next visit.
+  const targetMemory = new Map<string, BrowserTargetMemory>();
+  const siteBlocks = new Map<string, BrowserSiteBlock>();
   /** Monotonic step counter per run, so Step.seq is stable and gap-free. */
   const stepSeq = new Map<string, number>();
 
@@ -259,6 +265,37 @@ export function createMemoryStore(opts: { persistToDisk?: boolean } = {}): Store
       const deleted = mcpConnections.delete(id);
       if (deleted) scheduleSave();
       return deleted;
+    },
+
+    async getTargetMemory(key) {
+      const entry = targetMemory.get(key);
+      return entry ? structuredClone(entry) : null;
+    },
+    async putTargetMemory(entry) {
+      targetMemory.set(entry.key, structuredClone(entry));
+    },
+    async deleteTargetMemory(key) {
+      targetMemory.delete(key);
+    },
+    async listTargetMemory(scope) {
+      return [...targetMemory.values()]
+        .filter((entry) => scope === undefined || entry.scope === scope)
+        .sort((a, b) => b.lastSeen.localeCompare(a.lastSeen))
+        .map((entry) => structuredClone(entry));
+    },
+    async recordSiteBlock(origin, reason, at) {
+      const key = origin + '|' + reason;
+      const existing = siteBlocks.get(key);
+      const next: BrowserSiteBlock = existing
+        ? { ...existing, count: existing.count + 1, lastAt: at }
+        : { origin, reason, count: 1, firstAt: at, lastAt: at };
+      siteBlocks.set(key, next);
+      return structuredClone(next);
+    },
+    async listSiteBlocks() {
+      return [...siteBlocks.values()]
+        .sort((a, b) => b.lastAt.localeCompare(a.lastAt))
+        .map((block) => structuredClone(block));
     },
 
     /* -------------------------------------------------------------- Egress */

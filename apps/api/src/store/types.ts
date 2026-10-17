@@ -15,6 +15,8 @@ import type {
   AgentSessionState,
   AgentGraph,
   Approval,
+  BrowserSiteBlock,
+  BrowserTargetMemory,
   Conversation,
   EgressEvent,
   McpConnection,
@@ -63,6 +65,20 @@ export interface Store {
 
   // User-configured upstream MCP servers. Secret values are environment refs,
   // never fields on this record.
+  // Cross-run browser memory (core/tools/targetMemory.ts). Public pages only,
+  // identity only; small and bounded per scope.
+  getTargetMemory(key: string): Promise<BrowserTargetMemory | null>;
+  putTargetMemory(entry: BrowserTargetMemory): Promise<void>;
+  deleteTargetMemory(key: string): Promise<void>;
+  /** Newest first; `scope` filters to one graph node or ad-hoc kind. */
+  listTargetMemory(scope?: string): Promise<BrowserTargetMemory[]>;
+  recordSiteBlock(
+    origin: string,
+    reason: BrowserSiteBlock['reason'],
+    at: string,
+  ): Promise<BrowserSiteBlock>;
+  listSiteBlocks(): Promise<BrowserSiteBlock[]>;
+
   saveMcpConnection(connection: McpConnection): Promise<McpConnection>;
   getMcpConnection(id: string): Promise<McpConnection | null>;
   listMcpConnections(): Promise<McpConnection[]>;

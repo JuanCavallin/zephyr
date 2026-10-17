@@ -3,6 +3,7 @@ import type {
   BrowserBackend,
   BrowserOperation,
   DataLabel,
+  ElementRow,
   ElementTable,
   Json,
   ProviderCallContext,
@@ -20,6 +21,7 @@ import {
 } from './executors.js';
 import { browserLocation } from '../../providers/browserSafety.js';
 import { consequentialBrowserAction } from './browserRisk.js';
+import { pageTemplate, targetMemoryKey, type TargetMemory } from './targetMemory.js';
 
 export const BROWSER_EXECUTOR_REF = 'native://browser';
 
@@ -45,6 +47,15 @@ export interface BrowserExecutorDeps {
    * invisible there. Sessions opened and closed inside one call are not sent.
    */
   onSession?(event: BrowserSessionEvent): void | Promise<void>;
+  /**
+   * Trusted cross-run memory scope for this call (`graphId|nodeId`), resolved
+   * from the run and step on the server, never from model arguments.
+   */
+  memoryScope?(ctx: ProviderCallContext): Promise<string | undefined>;
+  /** Records a person's target correction; see core/tools/targetMemory.ts. */
+  targetMemory?: TargetMemory;
+  /** A public page showed a challenge or no evidence to an automated read. */
+  onSiteBlocked?(origin: string, reason: 'empty_page' | 'browser_challenge'): Promise<void>;
 }
 
 export type BrowserSessionEvent =
@@ -61,6 +72,13 @@ export type BrowserSessionEvent =
 
 export interface BrowserToolExecutor extends ToolExecutor {
   closeRunSessions(runId: string, ctx: ProviderCallContext): Promise<void>;
+  /**
+   * A person chose a different element on a pending browser-target review.
+   * Remembered as a `human` entry for this node and page, so the re-prepared
+   * action (and later runs) resolve to it. Returns false when there is
+   * nothing to correct.
+   */
+  correctTarget(actionId: string, index: number): Promise<boolean>;
 }
 
 interface BrowserSession {
@@ -81,6 +99,8 @@ interface PreparedBrowserAction {
   decision?: BrowserDecision;
   result?: ToolExecutionOutput;
   manualAction?: boolean;
+  /** Cross-run memory key and scope of the target decision, when it had one. */
+  memory?: { key: string; scope: string };
 }
 
 class BrowserResearchBlockedError extends Error {
@@ -203,13 +223,22 @@ export function createBrowserExecutor(deps: BrowserExecutorDeps): BrowserToolExe
     const allowedOperations: BrowserOperation[] =
       operation === 'type' ? ['TYPE_TEXT', 'SELECT'] : ['CLICK'];
     const typedValue = optionalString(args, 'text');
+    const localOnly = action.dataLabels.some((label) => label !== 'public');
+    const goal = requiredString(args, 'goal');
+    const memoryScope = localOnly
+      ? undefined
+      : await deps.memoryScope?.(ctx).catch(() => undefined);
+    const memoryKey = memoryScope
+      ? targetMemoryKey({ scope: memoryScope, url: table.url, goal, operations: allowedOperations })
+      : undefined;
     const decision = await deps.decide({
       credentialRunId: ctx.runId,
       cacheScope: ctx.runId + ':' + providerId + ':' + sessionId,
-      localOnly: action.dataLabels.some((label) => label !== 'public'),
-      goal: requiredString(args, 'goal'),
+      localOnly,
+      goal,
       table,
       allowedOperations,
+      ...(memoryScope ? { memoryScope } : {}),
       ...(typedValue ? { typeText: typedValue } : {}),
       ...(ctx.signal ? { signal: ctx.signal } : {}),
     });
@@ -243,6 +272,7 @@ export function createBrowserExecutor(deps: BrowserExecutorDeps): BrowserToolExe
       table,
       decision: { ...decision, confidence },
       requiresApproval: risk !== null,
+      ...(memoryKey && memoryScope ? { memory: { key: memoryKey, scope: memoryScope } } : {}),
       review: {
         kind: 'browser_target',
         sessionId,
@@ -257,6 +287,10 @@ export function createBrowserExecutor(deps: BrowserExecutorDeps): BrowserToolExe
         pageUrl: browserLocation(table.url),
         consequential: risk !== null,
         ...(risk ? { risk } : {}),
+        ...(decision.remembered ? { remembered: decision.remembered } : {}),
+        // Alternatives a person may pick instead, public pages only: on a
+        // private page the labels themselves can be personal data.
+        ...(localOnly ? {} : { candidates: candidateRows(table, decision, target) }),
         lowConfidence: confidence < LOW_CONFIDENCE_THRESHOLD,
         reason: risk
           ? 'consequential_target'
@@ -359,6 +393,10 @@ export function createBrowserExecutor(deps: BrowserExecutorDeps): BrowserToolExe
       return value;
     } catch (error) {
       if (!(error instanceof BrowserResearchBlockedError)) throw error;
+      const blockedAt = sessions.get(error.sessionId)?.url ?? url;
+      const origin = blockedAt ? pageTemplate(blockedAt)?.origin : undefined;
+      if (origin && action.dataLabels.every((label) => label === 'public'))
+        await deps.onSiteBlocked?.(origin, error.reason).catch(() => undefined);
       return handoffReview(
         action,
         ctx,
@@ -582,9 +620,38 @@ export function createBrowserExecutor(deps: BrowserExecutorDeps): BrowserToolExe
     });
   }
 
+  async function correctTarget(actionId: string, index: number): Promise<boolean> {
+    const value = prepared.get(actionId);
+    if (value?.kind !== 'target' || !value.table || !value.decision || !value.memory) return false;
+    const row = value.table.rows.find((candidate) => candidate.index === index);
+    const operation = value.decision.operation;
+    if (
+      !row ||
+      !deps.targetMemory ||
+      !(operation === 'CLICK'
+        ? row.clickable
+        : operation === 'TYPE_TEXT'
+          ? row.editable
+          : row.selectable)
+    )
+      return false;
+    await deps.targetMemory.remember({
+      key: value.memory.key,
+      scope: value.memory.scope,
+      table: value.table,
+      row,
+      operation,
+      source: 'human',
+    });
+    // The next preparation must decide again, and will now hit the correction.
+    prepared.delete(actionId);
+    return true;
+  }
+
   return {
     ref: BROWSER_EXECUTOR_REF,
     prepareReview,
+    correctTarget,
     discardPrepared(actionId) {
       prepared.delete(actionId);
       researchBindings.delete(actionId);
@@ -813,6 +880,30 @@ async function researchOutput(
     publicOnly ? evidence : undefined,
     adapter.mode,
   );
+}
+
+const MAX_CANDIDATES = 6;
+
+/** The chosen row first, then Jev's next most likely rows, then other eligible rows. */
+function candidateRows(
+  table: ElementTable,
+  decision: BrowserDecision,
+  chosen: ElementRow,
+): { index: number; role: string; label: string }[] {
+  const eligible = table.rows.filter((row) =>
+    decision.operation === 'CLICK'
+      ? row.clickable
+      : decision.operation === 'TYPE_TEXT'
+        ? row.editable
+        : row.selectable,
+  );
+  const probability = (row: ElementRow) => decision.probabilities?.[String(row.index)] ?? -1;
+  const ranked = eligible
+    .filter((row) => row.index !== chosen.index)
+    .sort((a, b) => probability(b) - probability(a) || a.index - b.index);
+  return [chosen, ...ranked]
+    .slice(0, MAX_CANDIDATES)
+    .map((row) => ({ index: row.index, role: row.role, label: row.label }));
 }
 
 /** Challenge text is evidence of a blocked read, never a completed search. */

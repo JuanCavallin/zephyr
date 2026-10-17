@@ -48,6 +48,11 @@ export interface BrowserDecisionRequest {
   cacheScope?: string;
   /** Trusted privacy policy: even the numbered table must stay on the machine. */
   localOnly?: boolean;
+  /**
+   * Trusted `graphId|nodeId` (or `adhoc:<kind>`) for cross-run target memory.
+   * Absent means nothing is remembered beyond this run.
+   */
+  memoryScope?: string;
 }
 
 export interface BrowserDecision {
@@ -59,7 +64,9 @@ export interface BrowserDecision {
   /** Full distribution over the offered targets, when the source provides one. */
   probabilities?: Record<string, number>;
   /** Truthful labeling — the UI must not present a fallback as a model decision. */
-  source: 'jev' | 'deterministic' | 'cache';
+  source: 'jev' | 'deterministic' | 'cache' | 'memory';
+  /** For a `memory` hit: who originally chose this element. */
+  remembered?: 'jev' | 'deterministic' | 'human';
   /** Why, in one line. For the trace, not for the model. */
   rationale: string;
   /**

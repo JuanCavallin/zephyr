@@ -212,3 +212,44 @@ export interface BrowserSessionRecord {
   startUrl?: string;
   openedAt: Iso;
 }
+
+/* -------------------------------------------------------------------------- */
+/* Cross-run browser memory                                                   */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Which element a graph node used on a page, remembered across runs so a
+ * repeat visit needs no target decision. It records IDENTITY (role + label,
+ * plus which of several equal matches), never an index, never page text,
+ * typed values or query strings, and only for public pages. It remembers
+ * WHICH element, never permission: approval is decided afresh every time.
+ */
+export interface BrowserTargetMemory {
+  /** scope | operations | origin+path template | normalized goal. */
+  key: string;
+  /** `graphId|nodeId` for graph runs, `adhoc:<run kind>` otherwise. */
+  scope: string;
+  origin: string;
+  pathTemplate: string;
+  operation: BrowserOperation;
+  role: string;
+  label: string;
+  /** 0-based position among rows sharing this role and label. */
+  ordinal: number;
+  /** A person's correction outranks a model pick. */
+  source: 'jev' | 'deterministic' | 'human';
+  hits: number;
+  misses: number;
+  consecutiveMisses: number;
+  createdAt: Iso;
+  lastSeen: Iso;
+}
+
+/** An origin that showed a challenge, sign-in wall or empty page to an automated read. */
+export interface BrowserSiteBlock {
+  origin: string;
+  reason: 'empty_page' | 'browser_challenge';
+  count: number;
+  firstAt: Iso;
+  lastAt: Iso;
+}
