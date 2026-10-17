@@ -23,6 +23,7 @@ import {
   removeNode,
 } from '../services/graphs.service.js';
 import { optimizeGraph } from '../services/optimization.service.js';
+import { graphReuseReport } from '../services/reuse.service.js';
 import { HttpError, param, valid, validate } from './middleware/validate.js';
 
 export const graphsRouter: Router = Router();
@@ -63,6 +64,13 @@ graphsRouter.get('/graphs', async (_req, res) => {
 graphsRouter.post('/graphs', validate(createGraphSchema), async (req, res) => {
   const body = valid<z.infer<typeof createGraphSchema>>(req, 'body');
   res.status(201).json({ graph: await createGraph(body) });
+});
+
+/** Reuse across recent runs: frozen decisions, remembered targets, site alerts. */
+graphsRouter.get('/graphs/:id/reuse', async (req, res) => {
+  const report = await graphReuseReport(param(req, 'id'));
+  if (!report) throw new HttpError(404, 'NOT_FOUND', 'Graph not found');
+  res.json(report);
 });
 
 graphsRouter.get('/graphs/:id', async (req, res) => {

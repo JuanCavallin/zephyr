@@ -45,6 +45,7 @@ function savingLabel(value: number | null, noun = 'cheaper', opposite = 'more ex
 
 export function Benchmarks() {
   const [includeMock, setIncludeMock] = useState(false);
+  const [warmth, setWarmth] = useState<'all' | 'cold' | 'warm'>('all');
   const [report, setReport] = useState<BenchmarkReport | null>(null);
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(true);
@@ -53,13 +54,13 @@ export function Benchmarks() {
     setLoading(true);
     setError('');
     try {
-      setReport(await api.benchmarks(includeMock));
+      setReport(await api.benchmarks(includeMock, warmth));
     } catch (issue) {
       setError(issue instanceof Error ? issue.message : 'Could not load benchmarks.');
     } finally {
       setLoading(false);
     }
-  }, [includeMock]);
+  }, [includeMock, warmth]);
 
   useEffect(() => {
     void load();
@@ -103,6 +104,19 @@ export function Benchmarks() {
               onChange={(event) => setIncludeMock(event.target.checked)}
             />
             Include mock runs
+          </label>
+          <label className="flex items-center gap-2 text-slate-300">
+            Graph runs
+            <select
+              className="rounded-md border border-slate-700 bg-slate-900 px-1.5 py-1 text-slate-200"
+              value={warmth}
+              onChange={(event) => setWarmth(event.target.value as 'all' | 'cold' | 'warm')}
+              title="Warm runs reused frozen decisions or remembered browser targets; baselines never do."
+            >
+              <option value="all">all</option>
+              <option value="cold">cold only</option>
+              <option value="warm">warm only</option>
+            </select>
           </label>
           <button
             className="rounded-md border border-slate-700 px-2.5 py-1.5 text-slate-200 hover:border-slate-600"
@@ -304,6 +318,7 @@ function ArmTable({ arms }: { arms: Partial<Record<BenchmarkArm, ArmStats>> }) {
             <th className="py-1.5 pr-3 font-medium">Median cost</th>
             <th className="py-1.5 pr-3 font-medium">Median tokens</th>
             <th className="py-1.5 pr-3 font-medium">Active time p50 / p95</th>
+            <th className="py-1.5 pr-3 font-medium">Jev calls p50</th>
           </tr>
         </thead>
         <tbody>
@@ -361,6 +376,14 @@ function ArmTable({ arms }: { arms: Partial<Record<BenchmarkArm, ArmStats>> }) {
                 <td className="py-2 pr-3">{Math.round(row.medianTokens).toLocaleString()}</td>
                 <td className="py-2 pr-3">
                   {msLabel(row.medianWallMs)} / {msLabel(row.p95WallMs)}
+                </td>
+                <td className="py-2 pr-3">
+                  {Math.round(row.medianJevCalls ?? 0)}
+                  {row.arm === 'graph' && (row.warmRuns ?? 0) > 0 && (
+                    <div className="text-xs text-slate-500">
+                      {row.warmRuns} of {row.runs} warm
+                    </div>
+                  )}
                 </td>
               </tr>
             );

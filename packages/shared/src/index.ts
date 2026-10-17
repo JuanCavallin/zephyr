@@ -20,6 +20,7 @@ export * from './executors.js';
 export * from './mcp.js';
 export * from './policy.js';
 export * from './pricing.js';
+export * from './reuse.js';
 export * from './providers.js';
 export * from './scheduling.js';
 export * from './schemas/index.js';

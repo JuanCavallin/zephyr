@@ -28,6 +28,7 @@ import type {
   ActionPreview,
   BrowserViewer,
   BenchmarkReport,
+  GraphReuseReport,
   ToolLifecycleEvent,
 } from '@htn/shared';
 export type { BrowserViewer } from '@htn/shared';
@@ -245,8 +246,14 @@ export const api = {
     }),
 
   /** Graph vs baseline across every stored run. Mocked runs only when asked. */
-  benchmarks: (includeMock = false) =>
-    request<BenchmarkReport>('/benchmarks' + (includeMock ? '?includeMock=1' : '')),
+  benchmarks: (includeMock = false, warmth: 'all' | 'cold' | 'warm' = 'all') =>
+    request<BenchmarkReport>(
+      '/benchmarks?' +
+        new URLSearchParams({
+          ...(includeMock ? { includeMock: '1' } : {}),
+          ...(warmth !== 'all' ? { warmth } : {}),
+        }).toString(),
+    ),
 
   listRuns: (filter: { graphId?: string; kind?: string; status?: string; limit?: number } = {}) => {
     const params = new URLSearchParams();
@@ -353,6 +360,9 @@ export const api = {
       method: 'POST',
       body: JSON.stringify(decision),
     }),
+
+  graphReuse: (graphId: string) =>
+    request<GraphReuseReport>('/graphs/' + encodeURIComponent(graphId) + '/reuse'),
 
   /** Use a different element on a pending browser-target review; remembered for later runs. */
   correctBrowserTarget: (approvalId: string, index: number) =>

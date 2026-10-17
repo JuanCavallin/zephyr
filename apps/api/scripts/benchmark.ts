@@ -251,7 +251,11 @@ async function main(): Promise<void> {
                 '/' +
                 sample.assertionsTotal +
                 ' assertions' +
-                (sample.mocked ? ' (mock)' : '')
+                (sample.mocked ? ' (mock)' : '') +
+                ', ' +
+                (sample.jevCalls ?? 0) +
+                ' Jev call(s)' +
+                (sample.warm ? ', warm' : '')
               : ''),
         );
       }
@@ -259,6 +263,12 @@ async function main(): Promise<void> {
   }
 
   const report = buildBenchmarkReport(samples, graphNames, { includeMocked: true });
+  if (samples.some((sample) => sample.warm)) {
+    console.log(
+      '\nNOTE: warm graph runs reused frozen decisions or remembered targets; baselines never do. ' +
+        'Compare cold runs with GET /api/benchmarks?warmth=cold.',
+    );
+  }
   if (samples.some((sample) => sample.mocked)) {
     console.log('\nNOTE: some runs used mocked providers; their tokens and costs are not real.');
   }

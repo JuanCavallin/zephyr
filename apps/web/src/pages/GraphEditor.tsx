@@ -32,6 +32,7 @@ import { ChatPanel } from '../components/chat/ChatPanel';
 import { GraphCanvas } from '../components/graph/GraphCanvas';
 import { Legend } from '../components/graph/Legend';
 import { NodeInspector } from '../components/graph/NodeInspector';
+import { ReusePanel } from '../components/graph/ReusePanel';
 import { buildDefaultNode, defaultLabelFor } from '../components/graph/nodeDefaults';
 import { Badge } from '../components/ui/Badge';
 import { Button } from '../components/ui/Button';
@@ -518,6 +519,8 @@ export function GraphEditor() {
           </p>
         )}
       </Card>
+
+      {graph && <ReusePanel graph={graph} selectedNodeId={selectedNodeId} />}
     </div>
   );
 }

@@ -11,6 +11,7 @@ import {
   isTerminal,
   type AgentGraph,
   type BenchmarkReport,
+  type BenchmarkWarmth,
   type BenchmarkSample,
   type Run,
 } from '@htn/shared';
@@ -67,7 +68,10 @@ export async function loadBenchmarkSamples(): Promise<{
   return { samples, graphNames };
 }
 
-export async function benchmarkReport(includeMocked: boolean): Promise<BenchmarkReport> {
+export async function benchmarkReport(
+  includeMocked: boolean,
+  warmth: BenchmarkWarmth = 'all',
+): Promise<BenchmarkReport> {
   const { samples, graphNames } = await loadBenchmarkSamples();
-  return buildBenchmarkReport(samples, graphNames, { includeMocked });
+  return buildBenchmarkReport(samples, graphNames, { includeMocked, warmth });
 }

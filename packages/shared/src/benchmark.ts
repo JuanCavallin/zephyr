@@ -25,6 +25,7 @@
  */
 
 import { evaluateAssertions, rollup, type AssertionResult, type RollupInput } from './analytics.js';
+import { runReuse } from './reuse.js';
 import type { Approval, EgressEvent, Run } from './domain.js';
 import type { ActionEvidence } from './actionEvidence.js';
 import type { AgentGraph, GraphAssertion } from './schemas/graph.js';
@@ -225,6 +226,10 @@ export interface BenchmarkSample {
   completionVerified?: boolean;
   pipelineAssertionsPassed?: number;
   pipelineAssertionsTotal?: number;
+  /** Jev round trips this run made (see runReuse). */
+  jevCalls?: number;
+  /** Reused frozen graph decisions or remembered browser targets. */
+  warm?: boolean;
 }
 
 export function benchmarkSample(input: RollupInput): BenchmarkSample | null {
@@ -261,6 +266,7 @@ export function benchmarkSample(input: RollupInput): BenchmarkSample | null {
     analytics.totals.egress.mocked > 0 ||
     events.some((event) => event.evidence?.executionMode === 'mock');
   const completionVerified = benchmarkCompletionVerified(input);
+  const reuse = runReuse(input);
   return {
     runId: run.id,
     arm: run.kind,
@@ -289,6 +295,8 @@ export function benchmarkSample(input: RollupInput): BenchmarkSample | null {
     completionVerified,
     pipelineAssertionsPassed: pipelineResults.filter((result) => result.passed).length,
     pipelineAssertionsTotal: pipeline.length,
+    jevCalls: reuse.jevCalls,
+    warm: reuse.warm,
   };
 }
 
@@ -340,6 +348,9 @@ export interface ArmStats {
   p95WallMs: number;
   /** Any unpriced call in any run makes every cost figure for this arm a lower bound. */
   unpricedCalls: number;
+  medianJevCalls: number;
+  /** Runs that reused frozen decisions or remembered targets. */
+  warmRuns: number;
 }
 
 export interface PairedSaving {
@@ -368,8 +379,16 @@ export interface GraphBenchmark {
   experimentFingerprint?: string;
 }
 
+/**
+ * Which graph-arm runs a report includes. A warm run reused frozen decisions
+ * or remembered targets from earlier runs; report them apart, or a warm graph
+ * looks better than the baselines because of the cache, not the graph.
+ */
+export type BenchmarkWarmth = 'all' | 'cold' | 'warm';
+
 export interface BenchmarkReport {
   includeMocked: boolean;
+  warmth?: BenchmarkWarmth;
   mockedRunsExcluded: number;
   ineligibleRunsExcluded?: number;
   graphs: GraphBenchmark[];
@@ -396,6 +415,8 @@ export function armStats(arm: BenchmarkArm, samples: BenchmarkSample[]): ArmStat
       0.95,
     ),
     unpricedCalls: samples.reduce((sum, sample) => sum + sample.unpricedCalls, 0),
+    medianJevCalls: median(samples.map((sample) => sample.jevCalls ?? 0)),
+    warmRuns: samples.filter((sample) => sample.warm === true).length,
   };
 }
 
@@ -494,14 +515,19 @@ function savingsFor(samples: BenchmarkSample[]): PairedSaving[] {
 export function buildBenchmarkReport(
   allSamples: BenchmarkSample[],
   graphNames: Record<string, string>,
-  options: { includeMocked?: boolean } = {},
+  options: { includeMocked?: boolean; warmth?: BenchmarkWarmth } = {},
 ): BenchmarkReport {
   const includeMocked = options.includeMocked ?? false;
+  const warmth = options.warmth ?? 'all';
   const eligible = allSamples.filter(
     (sample) =>
       !!sample.experimentFingerprint &&
       sample.qualityEligible === true &&
-      sample.provenanceKnown === true,
+      sample.provenanceKnown === true &&
+      // Only the graph arm can be warm; baselines never reuse anything.
+      (warmth === 'all' ||
+        sample.arm !== 'graph' ||
+        (warmth === 'warm') === (sample.warm === true)),
   );
   const samples = includeMocked ? eligible : eligible.filter((sample) => !sample.mocked);
   const experimentKeys = [
@@ -534,6 +560,7 @@ export function buildBenchmarkReport(
   );
   return {
     includeMocked,
+    warmth,
     mockedRunsExcluded: includeMocked ? 0 : allSamples.filter((sample) => sample.mocked).length,
     ineligibleRunsExcluded: allSamples.length - eligible.length,
     graphs,

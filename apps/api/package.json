@@ -16,6 +16,7 @@
     "check:graphs": "tsx scripts/stored-graphs.check.ts",
     "check:analytics": "tsx scripts/analytics-parity.check.ts",
     "check:benchmark": "tsx scripts/benchmark.check.ts",
+    "check:reuse": "tsx scripts/reuse.check.ts",
     "benchmark": "tsx scripts/benchmark.ts",
     "check:jev:decisions": "tsx scripts/jev-decisions.check.ts",
     "check:agent-single-run": "tsx scripts/agent-single-run.check.ts",

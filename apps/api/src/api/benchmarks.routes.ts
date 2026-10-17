@@ -3,6 +3,7 @@
  *
  *   GET /api/benchmarks              live runs only
  *   GET /api/benchmarks?includeMock=1  mocked runs included (numbers not real)
+ *   GET /api/benchmarks?warmth=cold    graph runs that reused nothing (or =warm)
  */
 
 import { Router } from 'express';
@@ -12,5 +13,7 @@ export const benchmarksRouter: Router = Router();
 
 benchmarksRouter.get('/benchmarks', async (req, res) => {
   const includeMocked = /^(1|true|yes)$/i.test(String(req.query.includeMock ?? ''));
-  res.json(await benchmarkReport(includeMocked));
+  const warmth =
+    req.query.warmth === 'cold' || req.query.warmth === 'warm' ? req.query.warmth : 'all';
+  res.json(await benchmarkReport(includeMocked, warmth));
 });
