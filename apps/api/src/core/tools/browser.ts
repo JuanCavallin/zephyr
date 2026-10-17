@@ -19,8 +19,19 @@ import {
   type ToolExecutor,
 } from './executors.js';
 import { browserLocation } from '../../providers/browserSafety.js';
+import { consequentialBrowserAction } from './browserRisk.js';
 
 export const BROWSER_EXECUTOR_REF = 'native://browser';
+
+/** Adapter refusals meaning "the page moved since the snapshot"; nothing was clicked. */
+const STALE_TARGET = new Set([
+  'stale_snapshot',
+  'unknown_index',
+  'wrong_operation',
+  'detached',
+  'not_interactable',
+  'occluded',
+]);
 
 export interface BrowserExecutorDeps {
   byId?(providerId: BrowserBackend): BrowserAdapter;
@@ -222,14 +233,16 @@ export function createBrowserExecutor(deps: BrowserExecutorDeps): BrowserToolExe
     const confidence = Number.isFinite(decision.confidence)
       ? Math.max(0, Math.min(1, decision.confidence))
       : 0;
+    // Jev's pick is followed at any confidence; what the click DOES decides
+    // whether a person approves it. Jev's action policy sees this review too.
+    const risk = consequentialBrowserAction(operation ?? '', decision.operation, target);
     const value: PreparedBrowserAction = {
       kind: 'target',
       argumentsKey: JSON.stringify(action.arguments),
       sessionId,
       table,
       decision: { ...decision, confidence },
-      requiresApproval:
-        confidence < LOW_CONFIDENCE_THRESHOLD || (staleReviews.get(action.id) ?? 0) > 0,
+      requiresApproval: risk !== null,
       review: {
         kind: 'browser_target',
         sessionId,
@@ -242,12 +255,14 @@ export function createBrowserExecutor(deps: BrowserExecutorDeps): BrowserToolExe
         confidence,
         decisionSource: decision.source,
         pageUrl: browserLocation(table.url),
-        reason:
-          (staleReviews.get(action.id) ?? 0) > 0
+        consequential: risk !== null,
+        ...(risk ? { risk } : {}),
+        lowConfidence: confidence < LOW_CONFIDENCE_THRESHOLD,
+        reason: risk
+          ? 'consequential_target'
+          : (staleReviews.get(action.id) ?? 0) > 0
             ? 'reviewed_target_changed'
-            : confidence < LOW_CONFIDENCE_THRESHOLD
-              ? 'low_target_confidence'
-              : 'resolved_target',
+            : 'resolved_target',
       },
     };
     prepared.set(action.id, value);
@@ -440,30 +455,39 @@ export function createBrowserExecutor(deps: BrowserExecutorDeps): BrowserToolExe
     const target = table.rows.find((row) => row.index === decision.index)!;
     if (!adapter.perform) throw new Error('Browser backend lacks element-level execution.');
     ctx.signal?.throwIfAborted();
-    const performed = await adapter.perform(
-      {
-        sessionId: value.sessionId,
-        snapshotId: table.snapshotId,
-        operation: decision.operation,
-        index: decision.index,
-        ...(optionalString(asObject(action.arguments), 'text') !== undefined
-          ? { text: optionalString(asObject(action.arguments), 'text') }
-          : {}),
-      },
-      childContext(ctx, 'browser-reviewed-element-action'),
-    );
+    const typed = optionalString(asObject(action.arguments), 'text');
+    const performOn = (snapshotId: string, index: number) =>
+      adapter.perform!(
+        {
+          sessionId: value!.sessionId,
+          snapshotId,
+          operation: decision.operation,
+          index,
+          ...(typed !== undefined ? { text: typed } : {}),
+        },
+        childContext(ctx, 'browser-reviewed-element-action'),
+      );
+    let performed = await performOn(table.snapshotId, decision.index!);
+    // An APPROVED target whose page re-rendered (a new snapshot id, or the
+    // element moved) is the same element if exactly one control with the
+    // reviewed role and label is on the same page. The approval was for that
+    // element, so it is clicked without asking again; anything ambiguous is
+    // reviewed afresh below.
+    if (
+      !performed.ok &&
+      value.requiresApproval &&
+      approved &&
+      STALE_TARGET.has(performed.error.message)
+    ) {
+      const fresh = await snapshot(adapter, value.sessionId, deps.maxElements, ctx);
+      const same = fresh.rows.filter(
+        (row) => row.role === target.role && row.label === target.label,
+      );
+      if (same.length === 1 && browserLocation(fresh.url) === browserLocation(table.url))
+        performed = await performOn(fresh.snapshotId, same[0]!.index);
+    }
     if (!performed.ok) {
-      if (
-        performed.error.code === 'BAD_INPUT' &&
-        [
-          'stale_snapshot',
-          'unknown_index',
-          'wrong_operation',
-          'detached',
-          'not_interactable',
-          'occluded',
-        ].includes(performed.error.message)
-      ) {
+      if (performed.error.code === 'BAD_INPUT' && STALE_TARGET.has(performed.error.message)) {
         prepared.delete(action.id);
         staleReviews.set(action.id, (staleReviews.get(action.id) ?? 0) + 1);
         throw new PreparedActionReviewRequiredError(
@@ -493,7 +517,11 @@ export function createBrowserExecutor(deps: BrowserExecutorDeps): BrowserToolExe
         action.toolId.split('.').at(-1) +
         ' on reviewed browser target "' +
         target.label +
-        '".',
+        '"' +
+        (decision.confidence < LOW_CONFIDENCE_THRESHOLD
+          ? ' (a low-confidence pick, ' + decision.confidence.toFixed(2) + ': check the page)'
+          : '') +
+        '.',
       undefined,
       adapter.mode,
     );

@@ -399,10 +399,14 @@ export function createLiveJev(
   const recommendActionPolicy: DecisionAdapter['recommendActionPolicy'] = async (input, ctx) => {
     const startedAt = Date.now();
     try {
+      const target = browserTargetOf(input.action.review);
       const result = await evaluate({
         model: await modelFor(ctx),
         state: {
           operation: input.action.operation,
+          // The exact element a browser action will hit, so a confident click
+          // on "Place order" is judged as a purchase, not as "a click".
+          ...(target ? { target } : {}),
           destination: input.action.destination ?? null,
           dataLabels: input.action.dataLabels,
           tool: {
@@ -422,7 +426,8 @@ export function createLiveJev(
               auto: 'A reversible, read-only, low-impact action that may run automatically.',
               verify: 'An action that may run but requires deterministic result verification.',
               ask_user:
-                'An external side effect or consequential action requiring exact-action user approval.',
+                'An external side effect or consequential action requiring exact-action user approval, ' +
+                'including a browser target that buys, pays, sends, posts, deletes or confirms something.',
               deny: 'An unsafe, unknown, disallowed, or policy-incompatible action.',
             },
           },
@@ -773,5 +778,21 @@ export function createLiveJev(
     recommendActionPolicy,
     judgeCompletion,
     route,
+  };
+}
+
+/** The prepared browser target on an action's review, reduced to what the policy needs. */
+function browserTargetOf(
+  review: unknown,
+): { operation: string; role: string; label: string; page: string } | undefined {
+  if (!review || typeof review !== 'object' || Array.isArray(review)) return undefined;
+  const value = review as Record<string, unknown>;
+  if (value.kind !== 'browser_target') return undefined;
+  const text = (key: string) => (typeof value[key] === 'string' ? (value[key] as string) : '');
+  return {
+    operation: text('operation'),
+    role: text('role'),
+    label: text('label'),
+    page: text('pageUrl'),
   };
 }

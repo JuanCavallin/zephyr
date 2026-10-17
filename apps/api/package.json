@@ -33,6 +33,7 @@
     "check:browser-integration": "tsx scripts/browser-integration.check.ts",
     "check:browser-http": "tsx scripts/browser-http.check.ts",
     "check:browser-local-http": "tsx scripts/browser-http.check.ts --local",
+    "check:browser-identity-local": "tsx scripts/browser-identity.local-check.ts",
     "check:action-workspace": "tsx scripts/action-workspace.check.ts",
     "check:authoring-mock": "tsx scripts/authoring-mock.check.ts",
     "check:composio-readonly": "tsx --env-file-if-exists=../../.env scripts/composio-readonly-check.ts",

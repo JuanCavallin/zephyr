@@ -123,7 +123,7 @@ export function validateTargetScript(
        const tag = el.tagName.toLowerCase();
        const type = el.getAttribute('type');
        const inferred = tag === 'a' ? 'link' : tag === 'button' ? 'button' : tag === 'select' ? 'combobox' : tag === 'textarea' ? 'textbox' : tag === 'input' ? (type === 'checkbox' ? 'checkbox' : type === 'radio' ? 'radio' : ['submit','button','reset'].includes(type) ? 'button' : 'textbox') : tag || 'element';
-       const role = el.getAttribute('role') || inferred;
+       const role = el.getAttribute('role') ?? inferred;
        const name = (el.getAttribute('aria-label') || (el.innerText || '').trim() || el.getAttribute('placeholder') || el.getAttribute('title') || el.getAttribute('alt') || '').replace(/\\s+/g,' ').trim();
        const label = name.length > 80 ? name.slice(0,79)+'…' : name;
        if (role !== reviewed.role || label !== reviewed.label) return {exists:true,identityMatches:false};

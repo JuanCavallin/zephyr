@@ -495,7 +495,10 @@ export function createLiveLocalBrowser(
         }
 
         const state = await handle.page
-          .evaluate<TargetState | null, undefined>(validateTargetScript(domIndex), undefined)
+          .evaluate<TargetState | null, undefined>(
+            validateTargetScript(domIndex, { label: row.label, role: row.role }),
+            undefined,
+          )
           .catch(() => null);
 
         const rejection = rejectionFor(state);

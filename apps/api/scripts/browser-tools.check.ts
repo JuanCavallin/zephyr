@@ -7,6 +7,7 @@ import type {
   ToolAction,
 } from '@htn/shared';
 import { createBrowserExecutor } from '../src/core/tools/browser.js';
+import { consequentialBrowserAction } from '../src/core/tools/browserRisk.js';
 import {
   browserbaseDescriptorsAreSafe,
   browserToolRegistrations,
@@ -146,17 +147,100 @@ const uncertain = createBrowserExecutor({
     rationale: 'weak match',
   }),
 });
+{
+  const risk = (label: string, op: 'CLICK' | 'TYPE_TEXT' = 'CLICK', tool = 'click') =>
+    consequentialBrowserAction(tool, op, { label, role: 'button' });
+  for (const harmless of ['Apply filters', 'Add to bag', 'Sign in', 'Next page', 'Posts', 'Share'])
+    assert.equal(risk(harmless), null, harmless + ' is reversible');
+  for (const committing of ['Checkout', 'Place your order', 'Send message', 'Delete', 'Pay now'])
+    assert.equal(risk(committing), 'consequential_label', committing + ' commits something');
+  assert.equal(risk('Send message', 'TYPE_TEXT', 'type'), null, 'typing is gated at its submit');
+  assert.equal(risk('Continue', 'CLICK', 'submit'), 'submit_operation');
+}
+
+// Jev's pick is followed at any confidence: a low-confidence click on a
+// harmless control runs at once, and the trace says it was a weak pick.
 const uncertainAction = action('localbrowser.click', { sessionId: 'session_1' });
 const preparation = await uncertain.prepareReview!(uncertainAction, context);
-assert.equal(preparation.requiresApproval, true);
-await assert.rejects(uncertain.execute(uncertainAction, context), /requires human review/);
-assert.equal(calls.performed, 1, 'an uncertain target never executes before review');
-const lowPick = await uncertain.execute(
-  { ...uncertainAction, review: preparation.review },
-  { ...context, policyRule: 'human-approved-exact-tool-action' },
-);
-assert.equal(calls.performed, 2, 'the same prepared target executes once after approval');
-assert.match(lowPick.summary, /reviewed browser target/);
+assert.equal(preparation.requiresApproval, false, 'confidence alone never asks a person');
+const lowPick = await uncertain.execute(uncertainAction, context);
+assert.equal(calls.performed, 2, 'a low-confidence pick on a harmless target executes');
+assert.match(lowPick.summary, /low-confidence pick, 0\.40/);
+
+// What the click DOES decides approval: a confident "Place order" waits.
+{
+  const orderTable: ElementTable = {
+    ...table,
+    snapshotId: 'snap_order',
+    rows: [{ ...table.rows[0]!, label: 'Place order' }],
+  };
+  let snapshots = 0;
+  let failFirst = true;
+  const orderAdapter: BrowserAdapter = {
+    ...adapter,
+    async snapshot(input) {
+      snapshots += 1;
+      // The page re-renders after review: same element, new snapshot id.
+      return {
+        ok: true,
+        data: { ...orderTable, sessionId: input.sessionId, snapshotId: 'snap_order_' + snapshots },
+        meta: meta('snapshot'),
+      };
+    },
+    async perform(input) {
+      calls.performed += 1;
+      if (failFirst) {
+        failFirst = false;
+        return {
+          ok: false,
+          error: { ...failure('stale_snapshot'), code: 'BAD_INPUT' },
+          meta: meta('perform'),
+        };
+      }
+      return {
+        ok: true,
+        data: {
+          operation: input.operation,
+          index: input.index,
+          url: 'about:blank',
+          navigated: false,
+        },
+        meta: meta('perform'),
+      };
+    },
+  };
+  const ordering = createBrowserExecutor({
+    provider: () => orderAdapter,
+    decide: async () => ({
+      operation: 'CLICK',
+      index: 1,
+      confidence: 0.99,
+      source: 'jev',
+      rationale: 'exact',
+    }),
+  });
+  const order = action('localbrowser.click', { sessionId: 'session_1' });
+  const review = await ordering.prepareReview!(order, context);
+  assert.equal(
+    review.requiresApproval,
+    true,
+    'a confident consequential click still needs approval',
+  );
+  assert.equal((review.review as { risk?: string }).risk, 'consequential_label');
+  const performedBefore = calls.performed;
+  await assert.rejects(ordering.execute(order, context), /requires human review/);
+  assert.equal(calls.performed, performedBefore, 'nothing is clicked before approval');
+  const done = await ordering.execute(
+    { ...order, review: review.review },
+    { ...context, policyRule: 'human-approved-exact-tool-action' },
+  );
+  assert.equal(
+    calls.performed,
+    performedBefore + 2,
+    'a re-rendered approved element is clicked by identity',
+  );
+  assert.match(done.summary, /Place order/);
+}
 assert.equal(calls.closed, 0, 'bound sessions are not closed by an action');
 
 assert.equal(calls.closed, 0, 'an explicitly opened session stays available during the run');
