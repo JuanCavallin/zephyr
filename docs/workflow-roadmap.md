@@ -324,8 +324,6 @@ Built:
 
 Still open:
 
-- **Ledger gap.** Jev browser target picks are not written to the egress ledger, so
-  their cost is missing from run totals; reuse stats count them from tool reviews.
 - **Keep the remaining run-time decisions live.** Judge verdicts, completion verdicts,
   dispatch goals with `{{refs}}` and browser picks on new pages judge evidence the run
   produces; do not freeze them. Revisit only with measurements showing which of these

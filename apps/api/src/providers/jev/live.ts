@@ -73,7 +73,7 @@ const JEV_MODEL_ID = 'typesafe-ai/jev';
  * MODEL_PRICES_JSON rate for 'typesafe-ai/jev' applies, and failing both the
  * call stays UNPRICED (undefined) rather than reading as free.
  */
-function jevCostCents(
+export function jevCostCents(
   usage: { inputTokens?: number; outputTokens?: number } | undefined,
   providerMetadata: unknown,
 ): number | undefined {

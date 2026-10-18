@@ -11,6 +11,8 @@ import type {
 } from '@htn/shared';
 import { BROWSERBASE_API_DESTINATION, LOCAL_BROWSER_DESTINATION } from '@htn/shared';
 import { config } from '../../config.js';
+import { newId } from '../../lib/ids.js';
+import type { RecordEgress } from '../../providers/withEgress.js';
 import type { BrowserDecider } from './browserDecision.js';
 import type { BrowserDecision } from './browserDecision.js';
 import { LOW_CONFIDENCE_THRESHOLD } from './browserDecision.js';
@@ -56,6 +58,12 @@ export interface BrowserExecutorDeps {
   targetMemory?: TargetMemory;
   /** A public page showed a challenge or no evidence to an automated read. */
   onSiteBlocked?(origin: string, reason: 'empty_page' | 'browser_challenge'): Promise<void>;
+  /**
+   * Ledger writer for Jev target picks. The decider is not a provider adapter,
+   * so withEgress never sees its calls; without this their tokens and cost are
+   * missing from run totals.
+   */
+  recordEgress?: RecordEgress;
 }
 
 export type BrowserSessionEvent =
@@ -242,6 +250,28 @@ export function createBrowserExecutor(deps: BrowserExecutorDeps): BrowserToolExe
       ...(typedValue ? { typeText: typedValue } : {}),
       ...(ctx.signal ? { signal: ctx.signal } : {}),
     });
+    if (decision.source === 'jev' && decision.usage) {
+      await deps
+        .recordEgress?.({
+          id: newId('egr'),
+          runId: ctx.runId,
+          stepId: ctx.stepId,
+          providerId: 'jev',
+          op: 'browser_target',
+          destination: decision.usage.destination,
+          dataSpans: ctx.redactions ?? [],
+          policyRule: 'browser-target-decision',
+          latencyMs: decision.usage.latencyMs,
+          tokensIn: decision.usage.tokensIn,
+          tokensOut: decision.usage.tokensOut,
+          estimatedCostCents: decision.usage.estimatedCostCents,
+          model: decision.usage.model,
+        })
+        // Never fail a browser step because the ledger write failed.
+        .catch((error: unknown) =>
+          console.error('[egress] failed to record browser pick:', (error as Error).message),
+        );
+    }
     const target = table.rows.find((row) => row.index === decision.index);
     if (
       !target ||

@@ -83,6 +83,22 @@ export interface BrowserDecision {
    * Defaults to `confidence >= LOW_CONFIDENCE_THRESHOLD` when omitted.
    */
   cacheable?: boolean;
+  /**
+   * What the model call cost, for the egress ledger. Only a decision that
+   * actually asked a model carries it; cache, memory, single-target and
+   * deterministic answers made no call and leave it out.
+   */
+  usage?: BrowserDecisionUsage;
+}
+
+export interface BrowserDecisionUsage {
+  destination: string;
+  model: string;
+  latencyMs: number;
+  tokensIn?: number;
+  tokensOut?: number;
+  /** Undefined when the call could not be priced, never 0 for "unknown". */
+  estimatedCostCents?: number;
 }
 
 export type BrowserDecider = (request: BrowserDecisionRequest) => Promise<BrowserDecision>;

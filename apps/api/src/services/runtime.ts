@@ -82,6 +82,7 @@ registerSearchTool(toolRegistry, toolExecutors, {
   recordEgress,
 });
 export const browserTools = registerBrowserTools(toolRegistry, toolExecutors, {
+  recordEgress,
   targetMemory: createTargetMemory(store),
   // Scope comes from the server's own run and step records: a graph node
   // remembers its own pages; ad-hoc runs share one scope per run kind.

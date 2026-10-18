@@ -216,6 +216,8 @@ export interface BenchmarkSample {
   costCents: number;
   unpricedCalls: number;
   tokens: number;
+  tokensIn?: number;
+  tokensOut?: number;
   llmCalls: number;
   wallMs: number;
   humanWaitMs: number;
@@ -231,6 +233,8 @@ export interface BenchmarkSample {
   /** Reused frozen graph decisions or remembered browser targets. */
   warm?: boolean;
 }
+
+const SESSION_BOOKKEEPING = new Set(['releaseRun', 'setOwnership']);
 
 export function benchmarkSample(input: RollupInput): BenchmarkSample | null {
   const { run } = input;
@@ -262,9 +266,13 @@ export function benchmarkSample(input: RollupInput): BenchmarkSample | null {
             other.action.id === event.action.id && other.evidence?.executionMode !== undefined,
         ),
     );
+  // Session bookkeeping returns no results, so a mock row for it simulates
+  // nothing: every run releases every browser backend, used or not. A run
+  // that really used a mock backend still has mock open/read rows.
   const mocked =
-    analytics.totals.egress.mocked > 0 ||
-    events.some((event) => event.evidence?.executionMode === 'mock');
+    input.egress.some(
+      (row) => row.destination.startsWith('mock://') && !SESSION_BOOKKEEPING.has(row.op),
+    ) || events.some((event) => event.evidence?.executionMode === 'mock');
   const completionVerified = benchmarkCompletionVerified(input);
   const reuse = runReuse(input);
   return {
@@ -285,6 +293,8 @@ export function benchmarkSample(input: RollupInput): BenchmarkSample | null {
     costCents: analytics.totals.estimatedCostCents,
     unpricedCalls: analytics.totals.unpricedCalls,
     tokens: analytics.totals.tokensIn + analytics.totals.tokensOut,
+    tokensIn: analytics.totals.tokensIn,
+    tokensOut: analytics.totals.tokensOut,
     llmCalls: analytics.totals.llmCalls,
     wallMs: analytics.totals.wallMs,
     humanWaitMs: analytics.totals.humanWaitMs,
@@ -344,6 +354,9 @@ export interface ArmStats {
   costPerSuccessCents: number | null;
   medianCostCents: number;
   medianTokens: number;
+  medianTokensIn?: number;
+  medianTokensOut?: number;
+  medianLlmCalls?: number;
   medianWallMs: number;
   p95WallMs: number;
   /** Any unpriced call in any run makes every cost figure for this arm a lower bound. */
@@ -363,7 +376,9 @@ export interface PairedSaving {
   medianCostSaving: number | null;
   costSavingCi: [number, number] | null;
   medianTokenSaving: number | null;
+  tokenSavingCi?: [number, number] | null;
   medianWallSaving: number | null;
+  wallSavingCi?: [number, number] | null;
   /** Pairs where the graph succeeded and this baseline did not, and vice versa. */
   graphOnlyWins: number;
   baselineOnlyWins: number;
@@ -409,6 +424,9 @@ export function armStats(arm: BenchmarkArm, samples: BenchmarkSample[]): ArmStat
     costPerSuccessCents: successes > 0 ? totalCostCents / successes : null,
     medianCostCents: median(samples.map((sample) => sample.costCents)),
     medianTokens: median(samples.map((sample) => sample.tokens)),
+    medianTokensIn: median(samples.map((sample) => sample.tokensIn ?? 0)),
+    medianTokensOut: median(samples.map((sample) => sample.tokensOut ?? 0)),
+    medianLlmCalls: median(samples.map((sample) => sample.llmCalls)),
     medianWallMs: median(samples.map((sample) => sample.wallMs)),
     p95WallMs: quantile(
       samples.map((sample) => sample.wallMs),
@@ -482,7 +500,9 @@ export function pairedSaving(
     costSavingCi: bootstrapMedianCi(cost),
     unpricedPairs: both.length - priced.length,
     medianTokenSaving: tokens.length > 0 ? median(tokens) : null,
+    tokenSavingCi: bootstrapMedianCi(tokens),
     medianWallSaving: wall.length > 0 ? median(wall) : null,
+    wallSavingCi: bootstrapMedianCi(wall),
     graphOnlyWins: pairs.filter(([graph, baseline]) => graph.success && !baseline.success).length,
     baselineOnlyWins: pairs.filter(([graph, baseline]) => !graph.success && baseline.success)
       .length,

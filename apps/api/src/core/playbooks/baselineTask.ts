@@ -172,6 +172,19 @@ function hash(value: unknown): string {
   return createHash('sha256').update(canonical(value)).digest('hex');
 }
 
+/**
+ * The graph as its author wrote it. `compiled` is a server-owned cache a run may
+ * rewrite (learned decisions) without a version bump, and timestamps change with
+ * it; hashing either would give every warm run a new experiment, so it could no
+ * longer pair with the baselines launched for the same task.
+ */
+function authoredGraph(
+  graph: AgentGraph,
+): Omit<AgentGraph, 'compiled' | 'createdAt' | 'updatedAt'> {
+  const { compiled: _compiled, createdAt: _createdAt, updatedAt: _updatedAt, ...authored } = graph;
+  return authored;
+}
+
 /** configuration must contain non-secret effective modes/models/tool versions/budgets only. */
 export function buildBenchmarkExperiment(args: {
   graph: AgentGraph;
@@ -185,7 +198,7 @@ export function buildBenchmarkExperiment(args: {
   const components = {
     protocol: BENCHMARK_PROTOCOL,
     taskHash: hash(task.prompt),
-    graphHash: hash(args.graph),
+    graphHash: hash(authoredGraph(args.graph)),
     configHash: hash(args.configuration),
     inputsHash: hash(args.variables),
     assertionsHash: hash(outcomeAssertions),

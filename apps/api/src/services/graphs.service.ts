@@ -74,6 +74,7 @@ export async function createGraph(input: {
   description?: string;
   nodes?: unknown[];
   edges?: unknown[];
+  assertions?: unknown[];
 }): Promise<AgentGraph> {
   const at = nowIso();
   return saveGraphOwned(
@@ -83,6 +84,7 @@ export async function createGraph(input: {
       description: input.description,
       nodes: input.nodes ?? [],
       edges: input.edges ?? [],
+      ...(input.assertions ? { assertions: input.assertions } : {}),
       version: 1,
       createdAt: at,
       updatedAt: at,

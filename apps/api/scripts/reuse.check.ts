@@ -113,6 +113,12 @@ check('a run counts frozen vs live decisions and remembered vs decided targets p
   assert.equal(reuse.byNode.pick?.liveDecisions, 1);
 });
 
+check('a Jev target pick written to the ledger is not counted twice', () => {
+  const pickRow: EgressEvent = { ...jevRow, id: 'e_pick', stepId: 's_agent', op: 'browser_target' };
+  const reuse = runReuse({ ...input, egress: [jevRow, pickRow] });
+  assert.equal(reuse.jevCalls, 2, 'the pick is counted once, from its tool review');
+});
+
 check('a run that reused nothing is cold', () => {
   assert.equal(runReuse({ run, steps: [], egress: [] }).warm, false);
 });

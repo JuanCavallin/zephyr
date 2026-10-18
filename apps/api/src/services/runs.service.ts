@@ -183,14 +183,17 @@ export async function createRun(args: {
 async function resolveBaselineInput(
   requested: BaselineInput,
 ): Promise<{ input: BaselineInput; graphName?: string }> {
-  // Older callers sent only `target`, which is the demo graph's one variable.
-  const variables =
-    Object.keys(requested.variables).length > 0
-      ? requested.variables
-      : { target: requested.target };
   if (!requested.graphId) {
+    // Older callers sent only `target`, which is the demo graph's one variable.
+    const variables =
+      Object.keys(requested.variables).length > 0
+        ? requested.variables
+        : { target: requested.target };
     return { input: { ...requested, variables, promptSource: 'legacy_case_file' } };
   }
+  // Exactly the graph run's variables, even none: inventing `target` here would
+  // change the inputs hash, and the baseline could never pair with its graph run.
+  const variables = requested.variables;
   const graph = await store.getGraph(requested.graphId);
   if (!graph) throw new GraphNotFoundError(requested.graphId);
   const { task, experiment } = await experimentForGraph(graph, variables);

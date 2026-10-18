@@ -129,6 +129,12 @@ export function validateTargetScript(
        if (role !== reviewed.role || label !== reviewed.label) return {exists:true,identityMatches:false};
      }
 
+     // elementFromPoint only sees the viewport: a control below the fold would
+     // read as occluded forever. Bring it into view first, as the click will.
+     const before = el.getBoundingClientRect();
+     if (before.bottom < 0 || before.top > window.innerHeight ||
+         before.right < 0 || before.left > window.innerWidth)
+       el.scrollIntoView({ block: 'center', inline: 'nearest' });
      const rect = el.getBoundingClientRect();
      const style = window.getComputedStyle(el);
      const visible =

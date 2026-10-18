@@ -8,7 +8,7 @@
  */
 
 import { Router } from 'express';
-import { graphEdgeSchema, graphNodeSchema } from '@htn/shared';
+import { graphAssertionSchema, graphEdgeSchema, graphNodeSchema } from '@htn/shared';
 import { z } from 'zod';
 import {
   addEdge,
@@ -33,6 +33,8 @@ const createGraphSchema = z.object({
   description: z.string().max(2000).optional(),
   nodes: z.array(z.unknown()).optional(),
   edges: z.array(z.unknown()).optional(),
+  /** Post-run checks; these are what a benchmark grades every arm by. */
+  assertions: z.array(graphAssertionSchema).optional(),
 });
 
 /** Optimistic concurrency. Omit to force the write through. */
@@ -43,6 +45,8 @@ const putGraphSchema = z.object({
   description: z.string().max(2000).optional(),
   nodes: z.array(z.unknown()),
   edges: z.array(z.unknown()),
+  /** Omit to keep the graph's current assertions. */
+  assertions: z.array(graphAssertionSchema).optional(),
   version: z.number().int().min(1).optional(),
 });
 
@@ -87,6 +91,7 @@ graphsRouter.put('/graphs/:id', validate(putGraphSchema), async (req, res) => {
     description: body.description ?? current.description,
     nodes: body.nodes as typeof current.nodes,
     edges: body.edges as typeof current.edges,
+    assertions: body.assertions ?? current.assertions,
   }));
   res.json({ graph });
 });

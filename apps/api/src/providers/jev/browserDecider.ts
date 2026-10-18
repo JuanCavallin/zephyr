@@ -54,6 +54,7 @@ import { eligibleRows, toCriteria, toState } from '../../core/tools/elementTable
 import { config } from '../../config.js';
 import { credentials } from '../../services/credentials.js';
 import { createDeterministicDecider } from '../../core/tools/browserDecision.js';
+import { jevCostCents } from './live.js';
 
 /** Same model id and gateway root Person 2's adapter uses. Keep them in step. */
 const MODEL_ID = 'typesafe-ai/jev';
@@ -269,6 +270,7 @@ export function createJevBrowserDecider(
     const onAbort = (): void => controller.abort();
     signal?.addEventListener('abort', onAbort, { once: true });
 
+    const startedAt = Date.now();
     try {
       const result = await evaluate({
         model,
@@ -339,6 +341,14 @@ export function createJevBrowserDecider(
         confidence,
         ...(probabilities ? { probabilities } : {}),
         source: 'jev',
+        usage: {
+          destination: (cfg.baseUrl ?? DEFAULT_BASE_URL) + '/evaluation-model',
+          model: MODEL_ID,
+          latencyMs: Date.now() - startedAt,
+          tokensIn: result.usage?.inputTokens,
+          tokensOut: result.usage?.outputTokens,
+          estimatedCostCents: jevCostCents(result.usage, result.providerMetadata),
+        },
         rationale:
           'Jev chose ' +
           operation +

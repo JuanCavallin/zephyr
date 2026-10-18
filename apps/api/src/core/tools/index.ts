@@ -30,6 +30,7 @@ export interface RegisterBrowserToolsOptions {
   targetMemory?: TargetMemory;
   memoryScope?: BrowserExecutorDeps['memoryScope'];
   onSiteBlocked?: BrowserExecutorDeps['onSiteBlocked'];
+  recordEgress?: BrowserExecutorDeps['recordEgress'];
 }
 
 /** Register the teammate browser adapters inside AgentOS's trusted broker. */
@@ -91,6 +92,7 @@ export function registerBrowserTools(
     targetMemory: options.targetMemory,
     memoryScope: options.memoryScope,
     onSiteBlocked: options.onSiteBlocked,
+    recordEgress: options.recordEgress,
   });
   executors.register(executor);
   return executor;

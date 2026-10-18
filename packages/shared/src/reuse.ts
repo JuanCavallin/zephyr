@@ -25,7 +25,7 @@ export interface ReuseCounts {
 export interface RunReuse extends ReuseCounts {
   /**
    * Jev round trips: decision-provider rows in the ledger plus browser target
-   * picks, which the browser decider does not write to the ledger.
+   * picks, counted from tool reviews (their ledger rows are skipped, not added).
    */
   jevCalls: number;
   warm: boolean;
@@ -75,8 +75,13 @@ export function runReuse(input: RollupInput): RunReuse {
         : 'decidedTargets',
     );
   }
+  // Browser picks also land in the ledger (op 'browser_target'); they are
+  // counted from the tool reviews below, which also see picks made without one.
   const ledgerJev = input.egress.filter(
-    (row) => row.providerId === 'jev' && !row.destination.startsWith('hermes-internal://'),
+    (row) =>
+      row.providerId === 'jev' &&
+      row.op !== 'browser_target' &&
+      !row.destination.startsWith('hermes-internal://'),
   ).length;
   const jevTargetPicks = (input.toolLifecycle ?? []).filter(
     (event) =>

@@ -30,6 +30,7 @@ import {
 import {
   answerContract,
   buildBaselineTask,
+  buildBenchmarkExperiment,
   parseBaselineReply,
 } from '../src/core/playbooks/baselineTask.js';
 import { buildDemoGraph } from '../src/core/graph/demo.graph.js';
@@ -230,6 +231,24 @@ const baselineSample = benchmarkSample({
   egress: [egress({ runId: 'b1', tokensIn: 10, tokensOut: 10, estimatedCostCents: 2 })],
   toolLifecycle: [],
 });
+{
+  const release = (op: string, providerId: EgressEvent['providerId']) =>
+    egress({ runId: 'b1', op, providerId, destination: 'mock://' + providerId });
+  const input = (rows: EgressEvent[]) => ({
+    run: run({ id: 'b1', kind: 'baseline' }),
+    steps: [],
+    egress: [egress({ runId: 'b1', tokensIn: 10, tokensOut: 10 }), ...rows],
+    toolLifecycle: [],
+  });
+  check(
+    'releasing an unused mock browser does not mark a live run as mocked',
+    benchmarkSample(input([release('releaseRun', 'browserless')]))?.mocked === false,
+  );
+  check(
+    'a run that read through a mock browser is still mocked',
+    benchmarkSample(input([release('extract', 'browserless')]))?.mocked === true,
+  );
+}
 check(
   'baseline success is judged only by shared outcome assertions',
   baselineSample?.success === true && baselineSample.assertionsTotal === 1,
@@ -428,6 +447,34 @@ check(
   check(
     'runs without an experiment snapshot are excluded and counted',
     withLegacy.ineligibleRunsExcluded === 1 && withLegacy.overall.graph?.runs === 3,
+  );
+}
+
+{
+  // A run that learns a decision rewrites `compiled` (and updatedAt) without a
+  // version bump; the experiment must not change, or later baselines never pair.
+  const graph = buildDemoGraph('2026-10-17T00:00:00.000Z');
+  const args = { requests: [], variables: {}, configuration: { mockAll: false }, toolIds: [] };
+  const before = buildBenchmarkExperiment({ ...args, graph }).experiment;
+  const learned = buildBenchmarkExperiment({
+    ...args,
+    graph: {
+      ...graph,
+      updatedAt: '2026-10-17T01:00:00.000Z',
+      compiled: { protocol: 'agentos-graph-compile-v1', nodes: {} },
+    },
+  }).experiment;
+  check(
+    'learned decisions keep the experiment fingerprint',
+    before.fingerprint === learned.fingerprint,
+  );
+  const edited = buildBenchmarkExperiment({
+    ...args,
+    graph: { ...graph, description: 'A different task' },
+  }).experiment;
+  check(
+    'an authored edit changes the experiment fingerprint',
+    before.fingerprint !== edited.fingerprint,
   );
 }
 
