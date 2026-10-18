@@ -28,6 +28,8 @@
  *   --on-approval <mode>     wait (default): a person decides in the UI. cancel: cancel the run,
  *                            which counts as a failure; for unattended suites with no approvals
  *   --report <file.md>       also write the report as Markdown
+ *   --report-only            launch nothing: rebuild the report from the benchmark rounds already
+ *                            stored for these graphs (pairIds this CLI wrote; warm-ups excluded)
  *   --timeout-min <n>        give up on one run after this long (default 15)
  *   --approve                auto-approve a pending approval ONLY when the server reports
  *                            MOCK_ALL with every provider mocked AND the pending action's own
@@ -84,6 +86,7 @@ const outFile = flag('out');
 const reportFile = flag('report');
 const warmup = Math.max(0, Number(flag('warmup') ?? (suite ? 1 : 0)));
 const sequential = has('sequential');
+const reportOnly = has('report-only');
 const onApproval = flag('on-approval') ?? 'wait';
 if (onApproval !== 'wait' && onApproval !== 'cancel')
   throw new Error('--on-approval must be wait or cancel');
@@ -353,10 +356,12 @@ function markdownReport(report: BenchmarkReport, samples: BenchmarkSample[]): st
       '. Arms: ' +
       arms.join(', ') +
       '; ' +
-      repeats +
-      ' measured round(s) per task' +
-      (warmup ? ' after ' + warmup + ' uncounted warm-up graph run(s)' : '') +
-      (sequential ? '; arms run one at a time in shuffled order' : '; arms run concurrently') +
+      (reportOnly
+        ? samples.length + ' stored benchmark runs (rebuilt with --report-only)'
+        : repeats +
+          ' measured round(s) per task' +
+          (warmup ? ' after ' + warmup + ' uncounted warm-up graph run(s)' : '') +
+          (sequential ? '; arms run one at a time in shuffled order' : '; arms run concurrently')) +
       '.',
     '',
     'Savings are medians of per-pair `1 - graph / baseline`, counted only where both runs passed ' +
@@ -404,6 +409,36 @@ function markdownReport(report: BenchmarkReport, samples: BenchmarkSample[]): st
   return sections.join('\n') + '\n';
 }
 
+/** Every finished benchmark round already stored for these graphs. */
+async function loadStored(
+  graphIds: string[],
+  samples: BenchmarkSample[],
+  graphNames: Record<string, string>,
+): Promise<void> {
+  const wanted = new Set(graphIds);
+  for (const arm of arms) {
+    const { runs } = await api<{ runs: Run[] }>('/api/runs?kind=' + arm + '&limit=200');
+    const mine = runs.filter((run) => {
+      const pairId = (run.input as { pairId?: unknown } | null)?.pairId;
+      return (
+        !!run.graphId &&
+        wanted.has(run.graphId) &&
+        isTerminal(run.status) &&
+        typeof pairId === 'string' &&
+        pairId.startsWith('bench_')
+      );
+    });
+    for (const run of mine) {
+      const detail = await api<Detail>('/api/runs/' + run.id);
+      const sample = benchmarkSample(detail);
+      if (sample) samples.push(sample);
+      const snapshot = (detail.run.input as { graphSnapshot?: { name?: string } }).graphSnapshot;
+      if (snapshot?.name && run.graphId) graphNames[run.graphId] = snapshot.name;
+    }
+  }
+  console.log('Rebuilt from ' + samples.length + ' stored benchmark run(s).');
+}
+
 function describe(detail: Detail, sample: BenchmarkSample | null): string {
   return (
     '    ' +
@@ -442,65 +477,74 @@ async function main(): Promise<void> {
         .split(',')
         .filter(Boolean)
         .map((graphId) => ({ graphId, variables: defaultVariables }));
-  console.log(
-    '\nBenchmark against ' +
-      BASE +
-      ': ' +
-      targets.map((target) => target.graphId).join(', ') +
-      ' x ' +
-      repeats +
-      ' round(s), arms ' +
-      arms.join(', ') +
-      (warmup ? ', ' + warmup + ' warm-up run(s) each' : '') +
-      (sequential ? ', sequential' : '') +
-      '\n',
-  );
   const samples: BenchmarkSample[] = [];
   const graphNames: Record<string, string> = {};
+  if (reportOnly) {
+    await loadStored(
+      targets.map((target) => target.graphId),
+      samples,
+      graphNames,
+    );
+  } else {
+    console.log(
+      '\nBenchmark against ' +
+        BASE +
+        ': ' +
+        targets.map((target) => target.graphId).join(', ') +
+        ' x ' +
+        repeats +
+        ' round(s), arms ' +
+        arms.join(', ') +
+        (warmup ? ', ' + warmup + ' warm-up run(s) each' : '') +
+        (sequential ? ', sequential' : '') +
+        '\n',
+    );
 
-  for (const { graphId, variables } of targets) {
-    for (let index = 1; index <= warmup; index += 1) {
-      // Not paired and not counted: it only lets later runs reuse what it froze.
-      const { run } = await launch(
-        'graph',
-        graphId,
-        'warmup_' + Date.now().toString(36),
-        variables,
-      );
-      console.log('  ' + graphId + ' warm-up ' + index + ': ' + run.id);
-      const detail = await settle(run.id);
-      console.log(describe(detail, benchmarkSample(detail)));
-    }
-    for (let round = 1; round <= repeats; round += 1) {
-      const pairId = 'bench_' + Date.now().toString(36) + '_' + round;
-      let details: Detail[];
-      if (sequential) {
-        // One at a time, in a fresh order each round, so no arm always runs
-        // first (rate-limit headroom) or shares the machine with another.
-        details = [];
-        const order = shuffled(arms);
-        console.log('  ' + graphId + ' round ' + round + ' (' + order.join(' -> ') + ')');
-        for (const arm of order) {
-          const { run } = await launch(arm as BenchmarkArm, graphId, pairId, variables);
-          details.push(await settle(run.id));
-        }
-      } else {
-        // Arms in one round run concurrently, like the UI's compare button;
-        // rounds run one after another so rate limits don't skew later rounds.
-        const runs = await Promise.all(
-          arms.map((arm) => launch(arm as BenchmarkArm, graphId, pairId, variables)),
+    for (const { graphId, variables } of targets) {
+      for (let index = 1; index <= warmup; index += 1) {
+        // Not paired and not counted: it only lets later runs reuse what it froze.
+        const { run } = await launch(
+          'graph',
+          graphId,
+          'warmup_' + Date.now().toString(36),
+          variables,
         );
-        console.log(
-          '  ' + graphId + ' round ' + round + ': ' + runs.map((r) => r.run.id).join(', '),
-        );
-        details = await Promise.all(runs.map((r) => settle(r.run.id)));
+        console.log('  ' + graphId + ' warm-up ' + index + ': ' + run.id);
+        const detail = await settle(run.id);
+        console.log(describe(detail, benchmarkSample(detail)));
       }
-      for (const detail of details) {
-        const sample = benchmarkSample(detail);
-        if (sample) samples.push(sample);
-        const snapshot = (detail.run.input as { graphSnapshot?: { name?: string } }).graphSnapshot;
-        if (snapshot?.name) graphNames[graphId] = snapshot.name;
-        console.log(describe(detail, sample));
+      for (let round = 1; round <= repeats; round += 1) {
+        const pairId = 'bench_' + Date.now().toString(36) + '_' + round;
+        let details: Detail[];
+        if (sequential) {
+          // One at a time, in a fresh order each round, so no arm always runs
+          // first (rate-limit headroom) or shares the machine with another.
+          details = [];
+          const order = shuffled(arms);
+          console.log('  ' + graphId + ' round ' + round + ' (' + order.join(' -> ') + ')');
+          for (const arm of order) {
+            const { run } = await launch(arm as BenchmarkArm, graphId, pairId, variables);
+            details.push(await settle(run.id));
+          }
+        } else {
+          // Arms in one round run concurrently, like the UI's compare button;
+          // rounds run one after another so rate limits don't skew later rounds.
+          const runs = await Promise.all(
+            arms.map((arm) => launch(arm as BenchmarkArm, graphId, pairId, variables)),
+          );
+          console.log(
+            '  ' + graphId + ' round ' + round + ': ' + runs.map((r) => r.run.id).join(', '),
+          );
+          details = await Promise.all(runs.map((r) => settle(r.run.id)));
+        }
+        for (const detail of details) {
+          const sample = benchmarkSample(detail);
+          if (sample) samples.push(sample);
+          const snapshot = (detail.run.input as { graphSnapshot?: { name?: string } })
+            .graphSnapshot;
+          if (snapshot?.name) graphNames[graphId] = snapshot.name;
+          console.log(describe(detail, sample));
+        }
       }
     }
   }

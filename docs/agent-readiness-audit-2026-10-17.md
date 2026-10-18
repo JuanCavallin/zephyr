@@ -4,7 +4,7 @@ The implementation foundation exists, but a passing mock demo is not sufficient 
 
 ## Resolution status (later on 2026-10-17)
 
-The P0/P1 findings below are fixed in code with offline regression coverage. No paid model call, live ACP task, hosted browser session or live Composio action was run to verify them, and no benchmark result has been produced since.
+The P0/P1 findings below are fixed in code with offline regression coverage. No paid model call, live ACP task, hosted browser session or live Composio action was run to verify them at the time. A live repeat-run benchmark was produced later that evening; see [End-to-end benchmark](#end-to-end-benchmark-hot-graph-vs-cold-standalone-agent).
 
 | Finding                               | Change                                                                                                                                                                                                                                                                                                                                                        | Regression                                                                                     |
 | ------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
@@ -179,6 +179,87 @@ are single manual runs, not benchmarks.
 - **Browser sessions can leak.** The default cap is two; a graph that opens a session and never closes it can starve a parallel branch.
 - **Browserbase quota is exhausted**; the local browser is the working live backend on this machine.
 
+## End-to-end benchmark: hot graph vs cold standalone agent
+
+**Status: interim, 24 of 75 measured runs (tasks 1–2 of 5).** The suite is still running; this
+section is replaced with the full results when it finishes.
+
+### Setup
+
+- **Arms.** Graph: the orchestrated workflow, deterministic tool nodes plus Jev for choices.
+  **B1, the standalone agent:** one Hermes agent on Claude Opus 5 with every eligible tool and no
+  Jev routing; this is the headline comparison. B0: one Claude Opus 5 call with no tools.
+- **Hot vs cold.** Each graph ran once before measuring (not counted), so measured graph runs reuse
+  what earlier runs froze or remembered: dispatch choices and browser targets. Baselines have no
+  graph to reuse. This is deliberate: a graph is meant to make repeat runs cheap. One caveat makes
+  the comparison more favourable to B1, not less: ad-hoc runs share one target-memory scope per
+  run kind, so B1 also reused browser targets remembered by earlier B1 runs (2 of 3 quotes runs).
+- **Tasks.** [benchmarkSuite.ts](../apps/api/scripts/benchmarkSuite.ts): five tasks with
+  ground-truth answers read off the live pages on 2026-10-17, and no step that needs approval.
+  Bookstore pages (four pages, three questions), quotes pagination (a Jev-picked click), a pizza
+  form typed but not submitted, an order dataset via a dispatch node, and a case note redacted
+  before Jev sees it. Sites are scraping sandboxes (books/quotes.toscrape.com, httpbin.org).
+- **Grading.** A run succeeds only if every outcome assertion passes and, for B1, Jev verified the
+  agent's completion. Savings are medians of per-pair `1 - graph / baseline` over pairs where both
+  runs succeeded, with 95% bootstrap intervals.
+- **Running.** Isolated API on port 8911 with its own SQLite file; live Jev, Anthropic and Hermes;
+  headless local Chrome. Each round runs the three arms one at a time in shuffled order. A run that
+  asks for approval is cancelled and counts as a failure (`--on-approval cancel`).
+
+```powershell
+pnpm --filter @htn/api benchmark -- --suite --arms graph,baseline,baseline_agent --repeats 5 --warmup 1 --sequential --on-approval cancel --report bench.md --out bench.json
+# rebuild the report from stored rounds at any point:
+pnpm --filter @htn/api benchmark -- --suite --report-only --arms graph,baseline,baseline_agent --report bench.md
+```
+
+### Interim results (bookstore and quotes, 24 runs)
+
+| Arm | Runs | Success | Median tokens | In / out | Model calls | Jev calls | Active p50 | Cost/success |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Graph (hot) | 8 | 100% | 4,224 | 4,066 / 158 | 3 | 3 | 9.3 s | 0.013¢ |
+| B1 · one agent, all tools | 8 | 63% | 159,048 | 157,984 / 1,064 | 7 | 1 | 36.2 s | 44.0¢ |
+| B0 · one call, no tools | 8 | 100% | 1,506 | 380 / 1,159 | 1 | 0 | 14.6 s | 3.0¢ |
+
+- **vs B1:** 5 of 8 pairs both succeeded. Median token saving **97%** (95% CI 97–97%), active
+  time **76%** (65–78%), cost **~100%**. The graph succeeded and B1 failed in the other 3 pairs.
+- **vs B0:** 8 of 8 pairs both succeeded. The graph used **more** tokens (median −152%) but was
+  45% faster and ~100% cheaper, because Jev tokens cost far less than Opus tokens.
+
+Per task:
+
+- **Bookstore (5 rounds):** graph 4,224 tokens, 9.4 s; B1 159,350 tokens, 38.8 s, 29.9¢ per
+  success. All three arms passed every round. B1 spent 156K input tokens over six Opus calls to
+  make three `localbrowser.read` calls.
+- **Quotes (3 rounds so far):** graph 1,731 tokens, 5.0 s; B1 failed all three. Each time it reached
+  the `Next →` click, Jev's action policy recommended `auto` at 0.65 confidence, the
+  low-confidence escalation turned that into `ask_user`, and the run was cancelled. The graph's
+  identical click is a fixed tool node and ran without approval.
+
+What these numbers do and do not show:
+
+- **B0 passing is real, not a harness error.** books.toscrape.com and quotes.toscrape.com are
+  well-known sandboxes, so Opus answered from training data without opening a page. B0 is cheaper
+  in tokens on these tasks; it is not a fair test of browsing.
+- **B1's failures are platform behaviour.** The approval came from AgentOS's own safety gate on an
+  agent tool call, not from the benchmark. An `agent_task` node inside a graph would hit the same
+  gate; these graphs avoid it by using fixed tool nodes.
+- **The graphs were hand-written for this suite** in the product's intended style. Authoring time,
+  whether by hand or by synthesis, is not measured.
+- **Token counts compare different models.** Jev and Claude use different tokenizers; cost is the
+  comparable figure across models.
+
+### Measurement fixes made to produce these numbers
+
+All are in commit `288b41a`, each with a regression check where one was practical.
+
+| Problem | Effect on results | Fix |
+| --- | --- | --- |
+| The experiment fingerprint hashed the server-owned `compiled` cache and timestamps | A warm graph run became a new experiment and could never pair with its baselines | Hash only the authored graph ([baselineTask.ts](../apps/api/src/core/playbooks/baselineTask.ts)) |
+| Baselines invented a `target` variable when a graph had none | Inputs hash differed, so no pairs | Use the graph run's variables exactly ([runs.service.ts](../apps/api/src/services/runs.service.ts)) |
+| In-process calls on live adapters (`releaseRun`, `setOwnership`, `cancelTask`) were logged as `mock://` | Every live run was flagged mocked and dropped from live reports | Logged as `local://` on live adapters; releasing an unused mock backend no longer flags a run ([withEgress.ts](../apps/api/src/providers/withEgress.ts), [benchmark.ts](../packages/shared/src/benchmark.ts)) |
+| Jev browser target picks were missing from the ledger | Graph tokens and cost undercounted, in the graph's favour | The decider returns usage and the browser executor records it, without double-counting Jev calls ([browser.ts](../apps/api/src/core/tools/browser.ts)) |
+| The pre-action check called `elementFromPoint` on off-screen controls | Any click below the fold read as occluded and fell back to a human handoff | Scroll the target into view first ([browserPage.ts](../apps/api/src/providers/browserPage.ts)) |
+
 ## What can be claimed (resume and essays)
 
 Rule used here: a claim is listed as safe only if a number or behaviour was reproduced from a file in
@@ -199,7 +280,7 @@ your own role and share of the work; this file does not know who built what.
 
 ### Do not claim
 
-- **Any end-to-end token, cost or latency saving.** The audit states no benchmark result has been produced since the fixes, and `graph_demo` is not a fair quality fixture. Only per-step input size is measured.
+- **An end-to-end saving without its conditions.** The [benchmark above](#end-to-end-benchmark-hot-graph-vs-cold-standalone-agent) measures hot graph runs against a cold standalone agent on five hand-written sandbox tasks. Quote it with those conditions, and only for pairs where both arms succeeded. It does not show savings on arbitrary tasks, on synthesised graphs, or on a graph's first run.
 - **"98.5% fewer tokens" as a headline.** It is against raw DOM, which no real browser agent sends to a model. It is accurate but easy to read as a strawman.
 - **Accuracy.** Jev sees at most 60 elements per page; on Wikipedia that is 60 of 2,235. The benchmark measures prompt size and does not report how often the right target is in the table.
 - **"Agents that get cheaper"** ([DEVPOST.md](DEVPOST.md)). No number backs it.
