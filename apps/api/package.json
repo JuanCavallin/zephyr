@@ -18,6 +18,7 @@
     "check:benchmark": "tsx scripts/benchmark.check.ts",
     "check:reuse": "tsx scripts/reuse.check.ts",
     "benchmark": "tsx scripts/benchmark.ts",
+    "clear-db": "tsx --env-file-if-exists=../../.env scripts/clear-db.ts",
     "check:jev:decisions": "tsx scripts/jev-decisions.check.ts",
     "check:agent-single-run": "tsx scripts/agent-single-run.check.ts",
     "check:model-gateway": "tsx scripts/model-gateway.check.ts",

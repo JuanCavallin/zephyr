@@ -138,7 +138,9 @@ export async function synthesiseGraph(
         // Simple direct plans do not need the frontier route. Adaptive plans
         // retain the larger budget because subagent goals and bounds need detail.
         tier: modeHint === 'direct' ? 'standard' : 'frontier',
-        maxTokens: modeHint === 'direct' ? 3072 : 4096,
+        // Thinking-capable models spend part of this budget before emitting any
+        // JSON: a 3072 cap produced ~1.5-3k chars cut off mid-document.
+        maxTokens: modeHint === 'direct' ? 8192 : 12288,
         json: true,
       },
       {
@@ -189,7 +191,12 @@ export async function synthesiseGraph(
         '\n  raw reply:',
         preview(completion.data.text),
       );
-      repairHint = 'Your reply was not valid JSON. Return ONLY the JSON object.';
+      // tokensOut at the cap means the reply was cut off, not malformed.
+      const cap = modeHint === 'direct' ? 8192 : 12288;
+      repairHint =
+        completion.data.tokensOut >= cap
+          ? 'Your reply was cut off before the JSON ended. Return a shorter document: fewer nodes, terse labels, no prose.'
+          : 'Your reply was not valid JSON. Return ONLY the JSON object.';
       continue;
     }
 

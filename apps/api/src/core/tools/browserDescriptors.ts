@@ -26,6 +26,15 @@ const sessionProperty = { type: 'string', minLength: 1 } as const;
 const urlProperty = { type: 'string', minLength: 1 } as const;
 const textProperty = { type: 'string', minLength: 1 } as const;
 
+/** "Args: sessionId*, goal*, text*" -- the exact field names, required ones starred. */
+function argsSummary(schema: Json): string {
+  const s = schema as { properties?: Record<string, unknown>; required?: string[] };
+  const names = Object.keys(s.properties ?? {});
+  if (names.length === 0) return 'Args: none.';
+  const required = new Set(s.required ?? []);
+  return 'Args: ' + names.map((n) => n + (required.has(n) ? '*' : '')).join(', ') + ' (* required).';
+}
+
 const OPERATIONS: readonly OperationSpec[] = [
   {
     operation: 'open',
@@ -156,7 +165,7 @@ function build(
         providerId,
         family: 'browser',
         interactionMode: spec.interactionMode,
-        description: spec.description,
+        description: spec.description + ' ' + argsSummary(spec.schema),
         inputSchemaRef: 'agentos://schemas/' + id + '/2',
         transport: providerId === 'localbrowser' ? 'local' : 'http',
         baselineEffect: spec.effect,
