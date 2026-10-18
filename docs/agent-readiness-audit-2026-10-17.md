@@ -181,30 +181,37 @@ are single manual runs, not benchmarks.
 
 ## End-to-end benchmark: hot graph vs cold standalone agent
 
-**Status: interim, 24 of 75 measured runs (tasks 1–2 of 5).** The suite is still running; this
-section is replaced with the full results when it finishes.
+Run on the evening of 2026-10-17: 75 measured runs (5 tasks × 3 arms × 5 rounds) plus 5 uncounted
+warm-up graph runs. Every run was live: no mocked provider, no unpriced model call. Raw samples and
+the generated report are in [agent-benchmark-2026-10-17.json](metrics/agent-benchmark-2026-10-17.json)
+and [agent-benchmark-2026-10-17.md](metrics/agent-benchmark-2026-10-17.md).
 
 ### Setup
 
 - **Arms.** Graph: the orchestrated workflow, deterministic tool nodes plus Jev for choices.
   **B1, the standalone agent:** one Hermes agent on Claude Opus 5 with every eligible tool and no
-  Jev routing; this is the headline comparison. B0: one Claude Opus 5 call with no tools.
+  Jev routing. This is the headline comparison. B0: one Claude Opus 5 call with no tools.
 - **Hot vs cold.** Each graph ran once before measuring (not counted), so measured graph runs reuse
   what earlier runs froze or remembered: dispatch choices and browser targets. Baselines have no
-  graph to reuse. This is deliberate: a graph is meant to make repeat runs cheap. One caveat makes
-  the comparison more favourable to B1, not less: ad-hoc runs share one target-memory scope per
-  run kind, so B1 also reused browser targets remembered by earlier B1 runs (2 of 3 quotes runs).
+  graph to reuse. This is deliberate, because a graph is meant to make repeat runs cheap. One
+  caveat makes the comparison more favourable to B1, not less: ad-hoc runs share one target-memory
+  scope per run kind, so B1 also reused browser targets remembered by earlier B1 runs (6 of 25 B1
+  runs were warm).
 - **Tasks.** [benchmarkSuite.ts](../apps/api/scripts/benchmarkSuite.ts): five tasks with
   ground-truth answers read off the live pages on 2026-10-17, and no step that needs approval.
-  Bookstore pages (four pages, three questions), quotes pagination (a Jev-picked click), a pizza
-  form typed but not submitted, an order dataset via a dispatch node, and a case note redacted
-  before Jev sees it. Sites are scraping sandboxes (books/quotes.toscrape.com, httpbin.org).
+  - Bookstore: four pages, three questions.
+  - Quotes pagination: a Jev-picked click.
+  - A pizza form, typed but not submitted.
+  - An order dataset read through a dispatch node.
+  - A case note redacted before Jev sees it.
+
+  Sites are scraping sandboxes (books/quotes.toscrape.com, httpbin.org).
 - **Grading.** A run succeeds only if every outcome assertion passes and, for B1, Jev verified the
   agent's completion. Savings are medians of per-pair `1 - graph / baseline` over pairs where both
   runs succeeded, with 95% bootstrap intervals.
-- **Running.** Isolated API on port 8911 with its own SQLite file; live Jev, Anthropic and Hermes;
-  headless local Chrome. Each round runs the three arms one at a time in shuffled order. A run that
-  asks for approval is cancelled and counts as a failure (`--on-approval cancel`).
+- **Running.** An isolated API on port 8911 with its own SQLite file; live Jev, Anthropic and
+  Hermes; headless local Chrome. Each round ran the three arms one at a time in shuffled order. A
+  run that asked for approval was cancelled and counted as a failure (`--on-approval cancel`).
 
 ```powershell
 pnpm --filter @htn/api benchmark -- --suite --arms graph,baseline,baseline_agent --repeats 5 --warmup 1 --sequential --on-approval cancel --report bench.md --out bench.json
@@ -212,41 +219,93 @@ pnpm --filter @htn/api benchmark -- --suite --arms graph,baseline,baseline_agent
 pnpm --filter @htn/api benchmark -- --suite --report-only --arms graph,baseline,baseline_agent --report bench.md
 ```
 
-### Interim results (bookstore and quotes, 24 runs)
+### Results, all tasks pooled
 
-| Arm | Runs | Success | Median tokens | In / out | Model calls | Jev calls | Active p50 | Cost/success |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| Graph (hot) | 8 | 100% | 4,224 | 4,066 / 158 | 3 | 3 | 9.3 s | 0.013¢ |
-| B1 · one agent, all tools | 8 | 63% | 159,048 | 157,984 / 1,064 | 7 | 1 | 36.2 s | 44.0¢ |
-| B0 · one call, no tools | 8 | 100% | 1,506 | 380 / 1,159 | 1 | 0 | 14.6 s | 3.0¢ |
+| Arm | Runs | Success | Median tokens | In / out | Model calls | Jev calls | Active p50 | Active p95 | Cost/success |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Graph (hot) | 25 | **100%** | 1,458 | 1,331 / 109 | 2 | 2 | 1.2 s | 9.4 s | 0.0074¢ |
+| B1 · one agent, all tools | 25 | 40% | 92,405 | 92,017 / 435 | 5 | 1 | 22.6 s | 40.8 s | 53.5¢ |
+| B0 · one call, no tools | 25 | 64% | 1,279 | 336 / 986 | 1 | 0 | 14.0 s | 18.3 s | 3.8¢ |
 
-- **vs B1:** 5 of 8 pairs both succeeded. Median token saving **97%** (95% CI 97–97%), active
-  time **76%** (65–78%), cost **~100%**. The graph succeeded and B1 failed in the other 3 pairs.
-- **vs B0:** 8 of 8 pairs both succeeded. The graph used **more** tokens (median −152%) but was
-  45% faster and ~100% cheaper, because Jev tokens cost far less than Opus tokens.
+Paired savings, counted only where both runs succeeded:
 
-Per task:
+| Versus | Pairs both passed | Token saving | Active-time saving | Cost saving | Graph-only wins | Baseline-only wins |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| **B1 (standalone agent)** | 10 / 25 | **98%** (CI 97–99%) | **88%** (CI 76–98%) | ~100% (CI 100–100%) | 15 | 0 |
+| B0 (one call, no tools) | 16 / 25 | −33% (CI −132 to −20%) | 67% (CI 49–95%) | ~100% (CI 100–100%) | 9 | 0 |
 
-- **Bookstore (5 rounds):** graph 4,224 tokens, 9.4 s; B1 159,350 tokens, 38.8 s, 29.9¢ per
-  success. All three arms passed every round. B1 spent 156K input tokens over six Opus calls to
-  make three `localbrowser.read` calls.
-- **Quotes (3 rounds so far):** graph 1,731 tokens, 5.0 s; B1 failed all three. Each time it reached
-  the `Next →` click, Jev's action policy recommended `auto` at 0.65 confidence, the
-  low-confidence escalation turned that into `ask_user`, and the run was cancelled. The graph's
-  identical click is a fixed tool node and ran without approval.
+Total spend across the 25 runs per arm: graph $0.0019 (47K tokens, 84 s active), B1 $5.35
+(2.34M tokens, 616 s), B0 $0.62 (31K tokens, 325 s). "~100%" cost saving means the graph's cost
+rounds to zero next to the baseline's: its only model is Jev, at well under 0.01¢ per call.
 
-What these numbers do and do not show:
+### Results per task
 
-- **B0 passing is real, not a harness error.** books.toscrape.com and quotes.toscrape.com are
-  well-known sandboxes, so Opus answered from training data without opening a page. B0 is cheaper
-  in tokens on these tasks; it is not a fair test of browsing.
-- **B1's failures are platform behaviour.** The approval came from AgentOS's own safety gate on an
-  agent tool call, not from the benchmark. An `agent_task` node inside a graph would hit the same
-  gate; these graphs avoid it by using fixed tool nodes.
-- **The graphs were hand-written for this suite** in the product's intended style. Authoring time,
-  whether by hand or by synthesis, is not measured.
-- **Token counts compare different models.** Jev and Claude use different tokenizers; cost is the
+| Task | Graph | B1 | B0 | Graph vs B1, where both passed |
+| --- | --- | --- | --- | --- |
+| Bookstore | 5/5 · 4,224 tok · 9.4 s | 5/5 · 159,350 tok · 38.8 s · 29.9¢ | 5/5 · 1,542 tok · 14.8 s | 5 pairs: tokens −97%, time −76% |
+| Quotes pagination | 5/5 · 1,731 tok · 5.0 s | 0/5 (approval gate) | 5/5 · 1,447 tok · 14.6 s | no pair |
+| Pizza form | 5/5 · 1,458 tok · 1.2 s | 0/5 (approval gate) | 0/5 | no pair |
+| Order dataset | 5/5 · 1,098 tok · 0.3 s | 5/5 · 73,201 tok · 20.9 s · 25.3¢ | 1/5 | 5 pairs: tokens −99%, time −98% |
+| Case note | 5/5 · 909 tok · 0.2 s | 0/5 (privacy stop) | 5/5 · 733 tok · 5.8 s | no pair |
+
+All figures are medians over five runs.
+
+**Hot vs cold graph runs** (the warm-up run is the cold one):
+
+| Task | Cold run | Hot runs |
+| --- | --- | --- |
+| Quotes | 4,060 tokens, 3 Jev calls | 1,731 tokens, 2 Jev calls (−57%) |
+| Pizza form | 2,775 tokens, 4 Jev calls, 1.7 s | 1,458 tokens, 2 Jev calls, 1.2 s (−47%) |
+
+The browser target picks were replayed from memory. The order dataset's dispatch choice was
+already frozen when the graph was saved, so even its first run was warm. The bookstore and the
+case note have nothing to reuse.
+
+### Why the baselines failed
+
+- **B1, quotes and form (10 runs): stopped by AgentOS's own approval gate.** An agent's tool call
+  also goes through Jev's semantic action policy
+  ([decisions/service.ts](../apps/api/src/core/decisions/service.ts)). For B1's `Next →` click and
+  its first `type`, Jev recommended `auto` at 0.65 confidence, and the low-confidence escalation
+  turned that into `ask_user`. The graph's identical steps are fixed tool nodes, which are
+  authorized by the deterministic local policy (`verify`, allowed). An `agent_task` node inside a
+  graph would hit the same gate as B1.
+- **B1, case note (5 runs): stopped by the privacy fix (P0 above).** The note carries a SIN, a phone
+  number and an email, so the session was labelled private and no cloud model may see it: "Only a
+  local model may continue a task like this." The graph succeeds because the redact node pins the
+  PII locally and Jev only sees placeholders.
+- **B0, form and dataset:** it cannot fill a form or read a dataset it was never given. It got
+  one of the two dataset answers right in four runs, and both in one.
+- **B0 passing the bookstore and quotes tasks is real, not a harness error.** Both sites are
+  well-known scraping sandboxes, so Opus answered from training data without opening a page.
+
+### What these numbers do and do not show
+
+- They show that, on these five tasks, a hot graph completed every run while the standalone agent
+  completed 40%. Where both succeeded, the graph used 98% fewer tokens and 88% less active time,
+  at a cost that rounds to zero.
+- They do not show savings on arbitrary tasks, on synthesised graphs or on a graph's first run.
+  The graphs were hand-written for this suite in the product's intended style: fixed tool nodes
+  for fetching and Jev only for choices. Authoring time is not measured.
+- Token counts compare different models with different tokenizers (Jev vs Claude). Cost is the
   comparable figure across models.
+- B1 lost 10 runs to an approval policy that the graph's tool nodes do not go through. That is how
+  the platform behaves today, not a property of agents in general. A B1 with that gate relaxed
+  would likely pass more often and would still spend about 92–160K tokens per run.
+- Five rounds per task is small. The intervals are bootstrap intervals over the paired runs, and
+  only bookstore and the order dataset contribute B1 pairs.
+
+### Issues found by the benchmark (open)
+
+- **A stopped agent run was judged "done, verified".** All five privacy-stopped B1 case-note runs
+  recorded `completion: {status: "done", verified: true}` with the stop message as the answer. The
+  benchmark still failed them on outcome assertions, but completion verification should not pass
+  a run that AgentOS itself stopped.
+- **Agent tool calls and graph tool nodes are gated differently.** The same click on a public page
+  needs approval when an agent proposes it at Jev confidence 0.65, and none as a graph tool node.
+  Decide whether that asymmetry is intended.
+- **Ad-hoc runs share browser target memory across runs** (one scope per run kind). That is useful,
+  but it means "cold" baselines are not fully cold.
 
 ### Measurement fixes made to produce these numbers
 
@@ -276,6 +335,9 @@ your own role and share of the work; this file does not know who built what.
 | Diagnosed and fixed a token-budget truncation in the workflow synthesizer from the token logs | Logs in the addendum above | "found that reasoning tokens exhausted the output cap; raised the budget and gave the retry a specific repair hint" |
 | Found and closed a model-privacy bypass: a pinned model route skipped the data-label eligibility check | Audit P0, with a six-case offline reproduction and `check:model-gateway` regression | Say it was found by audit and closed with offline tests. No live egress occurred. |
 | Exact-action approval on irreversible tools (for example `GMAIL_SEND_EMAIL`), failing closed on 14 broker error codes | [metrics.md](metrics.md) "Read from the code" table | A design property read from code, not a measured outcome |
+| On five sandbox tasks, a hot graph completed 25 of 25 runs; a standalone Opus 5 agent with every tool completed 10 of 25 | [End-to-end benchmark](#end-to-end-benchmark-hot-graph-vs-cold-standalone-agent), [raw samples](metrics/agent-benchmark-2026-10-17.json) | "on five hand-written sandbox tasks, 5 runs each; the agent's failures were the platform's approval and privacy gates" |
+| Where both succeeded, the hot graph used 98% fewer tokens (CI 97–99%) and 88% less active time (CI 76–98%) than the standalone agent | same, 10 paired runs | Always with "hot graph runs, hand-written graphs, 10 pairs on two tasks". Cost: $0.0019 for all 25 graph runs vs $5.35 for the agent's 25. |
+| Repeat runs of the same graph got cheaper: 57% fewer tokens on pagination, 47% on a form, from remembered browser targets | warm-up vs measured runs, same section | "measured on two tasks; tasks with nothing to reuse do not change" |
 | 942 test assertions across 29 files | [metrics.md](metrics.md) with the `grep` command given there | Re-run the command before quoting the number. It was not re-run for this audit. |
 
 ### Do not claim
@@ -283,8 +345,8 @@ your own role and share of the work; this file does not know who built what.
 - **An end-to-end saving without its conditions.** The [benchmark above](#end-to-end-benchmark-hot-graph-vs-cold-standalone-agent) measures hot graph runs against a cold standalone agent on five hand-written sandbox tasks. Quote it with those conditions, and only for pairs where both arms succeeded. It does not show savings on arbitrary tasks, on synthesised graphs, or on a graph's first run.
 - **"98.5% fewer tokens" as a headline.** It is against raw DOM, which no real browser agent sends to a model. It is accurate but easy to read as a strawman.
 - **Accuracy.** Jev sees at most 60 elements per page; on Wikipedia that is 60 of 2,235. The benchmark measures prompt size and does not report how often the right target is in the table.
-- **"Agents that get cheaper"** ([DEVPOST.md](DEVPOST.md)). No number backs it.
-- **A working Hermes agent end to end.** Hermes ran as mock on the machine used here, so no agent result from it has been observed. The adapter code is complete and was verified against a real install by its author, per its header, but that was not reproduced here.
+- **"Agents that get cheaper" in general** ([DEVPOST.md](DEVPOST.md)). Only two tasks had anything to reuse (−57% and −47% tokens from the first run to later runs). Say "repeat runs of a graph", with those numbers.
+- **A reliable Hermes agent.** Hermes ran live as the B1 baseline and completed 10 of 25 runs with verified answers. The other 15 stopped at AgentOS's approval and privacy gates, so the evidence is "it works end to end when nothing needs a person", not "it is reliable".
 - **Tool narrowing as a token saving** ("at most 8 of 1,000+ tools"). It is a code constant, not a measurement.
 - **Live Composio or hosted-browser reliability.** Not rehearsed; Browserbase quota is exhausted.
 
@@ -301,5 +363,6 @@ your own role and share of the work; this file does not know who built what.
 - Reduced the per-step browser-agent decision input to about 1.5K tokens (median), 82% below a full accessibility-tree snapshot across 13 live sites, by giving a classifier model an indexed element table instead of the page.
 - Diagnosed workflow-generation failures from token logs (output pinned at the 3,072-token cap), fixed the budget and retry hint, and derived tool-argument docs from the schema so generated graphs pass validation.
 - Audited an agent platform's benchmarking and privacy controls; reproduced and closed a model-routing privacy bypass and measurement-validity gaps with offline regression checks.
+- Built a paired, assertion-graded benchmark (75 live runs) in which reusable agent workflows used 98% fewer tokens and 88% less time than a frontier-model agent with every tool, where both succeeded, and completed 25/25 runs to the agent's 10/25.
 
-Do not put a cost-saving percentage on a resume until the repeat-run benchmark in the previous section has produced one.
+Quote the end-to-end percentages only with their conditions: hot graph runs, five hand-written sandbox tasks, savings over the 10 pairs where both arms succeeded.
