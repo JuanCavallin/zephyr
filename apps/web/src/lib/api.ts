@@ -24,7 +24,30 @@ import type {
   ProviderStatus,
   Capability,
   ProviderId,
+  ActionEvidence,
+  ActionPreview,
+  BrowserViewer,
+  BenchmarkReport,
+  GraphReuseReport,
+  ToolLifecycleEvent,
 } from '@htn/shared';
+export type { BrowserViewer } from '@htn/shared';
+
+export interface CredentialStatus {
+  providerId: string;
+  purpose: string;
+  configured: boolean;
+  source: string;
+  version?: number;
+  metadata?: { projectId?: string };
+}
+
+export interface CredentialConfiguration {
+  source: 'operator' | 'user';
+  browserSource: 'operator' | 'user';
+  lifetime: 'process';
+  providers: CredentialStatus[];
+}
 
 export interface RunDetail {
   run: Run;
@@ -32,6 +55,7 @@ export interface RunDetail {
   approvals: Approval[];
   egress: EgressEvent[];
   piiSpans: PiiSpan[];
+  toolLifecycle?: ToolLifecycleEvent[];
 }
 
 export class ApiError extends Error {
@@ -44,13 +68,27 @@ export class ApiError extends Error {
   }
 }
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
+let credentialSession: Promise<unknown> | undefined;
+async function ensureLocalSession(): Promise<void> {
+  credentialSession ??= request('/credentials/session', { method: 'POST' }).catch((error) => {
+    credentialSession = undefined;
+    throw error;
+  });
+  await credentialSession;
+}
+
+async function request<T>(path: string, init?: RequestInit, retrySession = true): Promise<T> {
+  if (path !== '/credentials/session') await ensureLocalSession();
   const res = await fetch('/api' + path, {
     ...init,
     headers: { 'content-type': 'application/json', ...(init?.headers ?? {}) },
   });
 
   if (!res.ok) {
+    if (res.status === 401 && retrySession && path !== '/credentials/session') {
+      credentialSession = undefined;
+      return request<T>(path, init, false);
+    }
     const body = (await res.json().catch(() => null)) as {
       error?: { code?: string; message?: string };
     } | null;
@@ -64,6 +102,10 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return (await res.json()) as T;
 }
 
+async function credentialRequest<T>(path: string, init?: RequestInit): Promise<T> {
+  return request<T>(path, init);
+}
+
 /**
  * One reviewed tool. `name` is the AgentOS id (`mail.send`), never a vendor slug. The
  * provider fields are additive and optional so an older API still parses; without them a
@@ -73,11 +115,13 @@ export interface ToolCatalogEntry {
   name: string;
   description: string;
   availability?: 'available' | 'unavailable' | 'requires_connection';
-  /** Who executes it: 'composio', 'browserbase', 'localbrowser', 'mcp', ... */
+  /** Who executes it: 'composio', 'browserbase', 'browserless', 'localbrowser', 'mcp', ... */
   providerId?: string;
   family?: string;
   effect?: 'read' | 'write' | 'destructive' | 'unknown';
   reversibility?: string;
+  /** 'mock' when its backend is simulated. Absent when the API does not say. */
+  executionMode?: 'live' | 'mock';
 }
 
 export const api = {
@@ -192,11 +236,24 @@ export const api = {
     }>('/graphs/' + graphId + '/optimize', { method: 'POST' }),
 
   /** Launch a run of a graph. The run snapshots the graph as it is right now. */
-  runGraph: (graphId: string, variables: Record<string, unknown> = {}) =>
+  runGraph: (graphId: string, variables: Record<string, unknown> = {}, pairId?: string) =>
     request<{ run: Run }>('/runs', {
       method: 'POST',
-      body: JSON.stringify({ kind: 'graph', input: { graphId, variables } }),
+      body: JSON.stringify({
+        kind: 'graph',
+        input: { graphId, variables, ...(pairId ? { pairId } : {}) },
+      }),
     }),
+
+  /** Graph vs baseline across every stored run. Mocked runs only when asked. */
+  benchmarks: (includeMock = false, warmth: 'all' | 'cold' | 'warm' = 'all') =>
+    request<BenchmarkReport>(
+      '/benchmarks?' +
+        new URLSearchParams({
+          ...(includeMock ? { includeMock: '1' } : {}),
+          ...(warmth !== 'all' ? { warmth } : {}),
+        }).toString(),
+    ),
 
   listRuns: (filter: { graphId?: string; kind?: string; status?: string; limit?: number } = {}) => {
     const params = new URLSearchParams();
@@ -237,9 +294,53 @@ export const api = {
    * opened renders a blank, uninteractive page by the time anyone follows it.
    */
   browserLiveView: (runId: string, sessionId: string) =>
-    request<{ liveViewUrl: string | null; pageUrl: string | null; interactive: boolean }>(
-      '/runs/' + runId + '/browser/' + sessionId + '/live-view',
+    request<BrowserViewer>('/runs/' + runId + '/browser/' + sessionId + '/live-view'),
+
+  browserTakeControl: (runId: string, sessionId: string, revision: number) =>
+    request<BrowserViewer>('/runs/' + runId + '/browser/' + sessionId + '/take-control', {
+      method: 'POST',
+      body: JSON.stringify({ revision, idempotencyKey: crypto.randomUUID() }),
+    }),
+
+  browserReleaseControl: (runId: string, sessionId: string, revision: number) =>
+    request<BrowserViewer>('/runs/' + runId + '/browser/' + sessionId + '/release-control', {
+      method: 'POST',
+      body: JSON.stringify({ revision, idempotencyKey: crypto.randomUUID() }),
+    }),
+
+  browserInput: (
+    runId: string,
+    sessionId: string,
+    revision: number,
+    input:
+      | { type: 'click'; x: number; y: number }
+      | { type: 'key'; key: string }
+      | { type: 'text'; text: string }
+      | { type: 'scroll'; deltaX: number; deltaY: number },
+  ) =>
+    request<{ ok: boolean }>('/runs/' + runId + '/browser/' + sessionId + '/input', {
+      method: 'POST',
+      body: JSON.stringify({ revision, input }),
+    }),
+
+  actionEvidence: (runId: string, actionId: string) =>
+    request<{ evidence: ActionEvidence[] }>(
+      '/runs/' + runId + '/actions/' + actionId + '/evidence',
     ),
+
+  actionPreview: (runId: string, previewRef: string) =>
+    request<{ preview: ActionPreview }>('/runs/' + runId + '/previews/' + previewRef),
+
+  credentials: () => credentialRequest<CredentialConfiguration>('/credentials'),
+  saveCredential: (providerId: string, secret: string, metadata?: { projectId: string }) =>
+    credentialRequest<{ provider: CredentialStatus }>('/credentials/' + providerId, {
+      method: 'PUT',
+      body: JSON.stringify({ secret, ...(metadata ? { metadata } : {}) }),
+    }),
+  removeCredential: (providerId: string) =>
+    credentialRequest<{ provider: CredentialStatus }>('/credentials/' + providerId, {
+      method: 'DELETE',
+    }),
 
   /**
    * Pause is cooperative: this resolves once the server has accepted the
@@ -258,6 +359,16 @@ export const api = {
     request<{ approval: Approval }>('/approvals/' + approvalId + '/decide', {
       method: 'POST',
       body: JSON.stringify(decision),
+    }),
+
+  graphReuse: (graphId: string) =>
+    request<GraphReuseReport>('/graphs/' + encodeURIComponent(graphId) + '/reuse'),
+
+  /** Use a different element on a pending browser-target review; remembered for later runs. */
+  correctBrowserTarget: (approvalId: string, index: number) =>
+    request<{ approval: Approval }>('/approvals/' + approvalId + '/browser-target', {
+      method: 'POST',
+      body: JSON.stringify({ index }),
     }),
 
   /* ------------------------------------------------------------ Connections */

@@ -27,11 +27,13 @@ const AUTO_RECOMMENDATION: ActionPolicyRecommendation = {
   reasonCodes: ['check-recommends-auto'],
 };
 
+let policyCalls = 0;
 const decisionAdapter = {
   id: 'jev',
   mode: 'mock',
   capabilities: ['decision'],
   async recommendActionPolicy() {
+    policyCalls += 1;
     return {
       ok: true,
       data: AUTO_RECOMMENDATION,
@@ -284,10 +286,81 @@ async function main(): Promise<void> {
   assert.equal(executionCount, 1, 'secret remote action must never reach the executor');
 
   await checkConcreteApprovalGate(args);
+  await checkJevPolicyRoundTrips();
 
   console.log(
     'PASS: tool broker enforces trusted selection, pinned versions, schemas, privacy, approval, and exact-action execution.',
   );
+}
+
+/** Jev is asked only where it can change the outcome, and at most once per action. */
+async function checkJevPolicyRoundTrips(): Promise<void> {
+  const READ: ToolDescriptor = {
+    ...MAIL_SEND,
+    id: 'page.read',
+    version: '1',
+    family: 'browser',
+    description: 'Read one public page.',
+    inputSchemaRef: 'agentos://schemas/page.read/1',
+    baselineEffect: 'read',
+    reversibility: 'reversible',
+    requiredScopes: [],
+    executorRef: 'check://page.read',
+  };
+  const CLICK: ToolDescriptor = {
+    ...READ,
+    id: 'page.click',
+    description: 'Click one element.',
+    inputSchemaRef: 'agentos://schemas/page.click/1',
+    baselineEffect: 'write',
+    reversibility: 'recoverable',
+    executorRef: 'check://page.click',
+  };
+  const schema: Json = { type: 'object', properties: {}, additionalProperties: false };
+  registry.register({ descriptor: READ, inputSchema: schema });
+  registry.register({ descriptor: CLICK, inputSchema: schema });
+  const done = {
+    output: { ok: true },
+    summary: 'done',
+    sanitizedSummary: 'done',
+    dataLabels: ['public' as const],
+    verified: true,
+  };
+  let prepared = 0;
+  executors.register({
+    ref: READ.executorRef,
+    destinationFor: () => 'https://example.com',
+    execute: async () => done,
+  });
+  executors.register({
+    ref: CLICK.executorRef,
+    destinationFor: () => 'https://example.com',
+    async prepareReview() {
+      prepared += 1;
+      return { review: { kind: 'browser_target', index: 1 }, requiresApproval: false };
+    },
+    execute: async () => done,
+  });
+  const session = await createSession('tool_broker_policy_calls');
+  await sessions.grantToolExposure(session.id, {
+    modelCallId: 'chatcmpl_policy_calls',
+    selectedToolVersions: { [READ.id]: READ.version, [CLICK.id]: CLICK.version },
+  });
+
+  const beforeRead = policyCalls;
+  const read = await broker.execute({ sessionStateId: session.id, toolId: READ.id, arguments: {} });
+  assert.equal(read.authorization.finalPolicy, 'auto');
+  assert.equal(policyCalls, beforeRead, 'a public reversible read needs no Jev policy call');
+
+  const beforeClick = policyCalls;
+  const click = await broker.execute({
+    sessionStateId: session.id,
+    toolId: CLICK.id,
+    arguments: {},
+  });
+  assert.equal(prepared, 1);
+  assert.ok(click.authorization.allowed);
+  assert.equal(policyCalls - beforeClick, 1, 'a prepared action is authorized by Jev exactly once');
 }
 
 async function checkConcreteApprovalGate(args: Json): Promise<void> {

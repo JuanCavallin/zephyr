@@ -7,6 +7,8 @@
  */
 
 import assert from 'node:assert/strict';
+import type { TextModelAdapter } from '@htn/shared';
+import { isBoundTextRoute, modelRoutesFor } from '../src/core/modelGateway/catalog.js';
 import type { ChatModelBackendInput, OpenAiMessage } from '../src/core/modelGateway/service.js';
 import {
   anthropicModelRoutes,
@@ -154,6 +156,50 @@ const input = {
     assert.equal(result.toolCalls?.[0]?.function.name, 'mail_send');
     assert.equal(result.tokensIn, 12);
     assert.equal(result.tokensOut, 8);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+}
+
+// When Anthropic is also the bound text model, the bound routes carry
+// providerId 'anthropic' with a placeholder modelId. They must reach the bound
+// adapter, never the Messages API (which 404s on 'model: bound-cheap').
+{
+  const originalFetch = globalThis.fetch;
+  let fetched = false;
+  globalThis.fetch = async () => {
+    fetched = true;
+    return new Response('{}', { status: 404 });
+  };
+  try {
+    const [boundRoute] = modelRoutesFor({
+      id: 'anthropic',
+      mode: 'live',
+    } as unknown as TextModelAdapter);
+    assert.ok(boundRoute && isBoundTextRoute(boundRoute));
+    let fellBack = false;
+    const backend = createAnthropicBackend(
+      {
+        mode: 'live',
+        apiKey: 'test-key',
+        keyVar: 'ANTHROPIC_API_KEY',
+        models: { cheap: 'haiku', frontier: 'opus' },
+      },
+      async () => undefined,
+      {
+        complete: async () => {
+          fellBack = true;
+          return { text: 'bound', tokensIn: 0, tokensOut: 0 };
+        },
+      },
+    );
+    const result = await backend.complete(
+      { ...input, route: boundRoute, tools: [], messages: [{ role: 'user', content: 'hi' }] },
+      { runId: 'run_test', stepId: 'step_test', policyRule: 'test' },
+    );
+    assert.ok(fellBack, 'bound route must use the bound text adapter');
+    assert.ok(!fetched, 'bound route must not call the Messages API');
+    assert.equal(result.text, 'bound');
   } finally {
     globalThis.fetch = originalFetch;
   }

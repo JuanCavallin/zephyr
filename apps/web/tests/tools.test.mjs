@@ -237,7 +237,8 @@ test('a tool the catalog does not know is never presented as Composio', () => {
   assert.equal(node.tool.providerId, undefined);
   assert.doesNotMatch(node.route, /Composio/);
   assert.doesNotMatch(toolActivity(node), /Composio/);
-  assert.equal(providerLabel('localbrowser'), 'Local browser');
+  assert.equal(providerLabel('localbrowser'), 'Local browser (Playwright)');
+  assert.equal(providerLabel('browserless'), 'Browserless');
   assert.equal(toolGlyph({ id: 'x.y', providerId: 'composio' }), '🔌');
   assert.equal(toolGlyph({ id: 'x.y' }), '🔧');
 });

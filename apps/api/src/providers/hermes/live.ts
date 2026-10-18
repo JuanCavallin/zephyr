@@ -23,15 +23,12 @@
  *      Calls to configured AgentOS MCP tools are intercepted by the trusted
  *      registry, exact-action broker, and registered local/provider executor.
  *
- *   2. Permission requests are DENIED BY DEFAULT, not routed to our own
- *      approval gate. Hermes's ACP server asks the client for permission
- *      before some tool calls; the correct integration is to route that
- *      callback through core/risk.ts's classify() and, when it lands on
- *      ask_human, the real Approval flow (waitForApproval). That wiring does
- *      not exist yet. Auto-approving in the meantime would violate the
- *      stated invariant "irreversible tools never enter an unattended
- *      harness allowlist" — denying by default is the safe placeholder.
- *      Fixing this is the next real step, not a nice-to-have.
+ *   2. Unmapped native ACP permission requests fail closed. They do not carry
+ *      a trusted AgentOS descriptor/destination/exact ToolAction and cannot
+ *      safely grant execution from a tool title. AgentOS MCP tools already
+ *      pass through the exact-action broker and its real approval flow. A
+ *      future native-tool mapping must construct that same trusted contract
+ *      before this callback may allow anything.
  *
  * `startTask`/`pollTask` bridge ACP's session+event model onto this
  * interface's start/poll/cancel shape: startTask opens a session and returns
@@ -45,7 +42,8 @@
 
 import { spawn, type ChildProcess } from 'node:child_process';
 import { mkdir, writeFile } from 'node:fs/promises';
-import { resolve } from 'node:path';
+import { tmpdir } from 'node:os';
+import { basename, resolve } from 'node:path';
 import { Readable, Writable } from 'node:stream';
 import * as acp from '@agentclientprotocol/sdk';
 import type { AgentRuntimeAdapter, ProviderErrorCode, ProviderResult } from '@htn/shared';
@@ -56,8 +54,20 @@ interface TaskRecord {
   log: string[];
   toolCalls: { tool: string; args?: unknown; at: string }[];
   result?: unknown;
+  /** The latest assistant message while the run is still going. */
+  partialText?: string;
   error?: string;
   session: Awaited<ReturnType<acp.SessionBuilder['start']>>;
+}
+
+/** Denial cannot fall back to the last option, which may be an allow option. */
+export function denyUnmappedHermesPermission(
+  options: readonly { optionId: string; kind?: string }[],
+): { outcome: 'selected'; optionId: string } | { outcome: 'cancelled' } {
+  const reject =
+    options.find((option) => option.kind === 'reject_once') ??
+    options.find((option) => option.kind === 'reject_always');
+  return reject ? { outcome: 'selected', optionId: reject.optionId } : { outcome: 'cancelled' };
 }
 
 function meta(op: string, started: number, destination: string | null) {
@@ -151,6 +161,12 @@ export function createLiveHermes(cfg: ProviderConfig): AgentRuntimeAdapter {
   };
 }
 
+/** The Hermes profile directory: explicit, or derived from the gateway URL (see prepareProfile). */
+function profileDirFor(cfg: ProviderConfig): string {
+  const profileKey = (cfg.baseUrl ?? '').replace(/[^a-zA-Z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+  return cfg.profileDir ?? resolve(process.cwd(), '.data/hermes-agentos-' + profileKey);
+}
+
 function createHermesProcess(cfg: ProviderConfig): AgentRuntimeAdapter {
   const tasks = new Map<string, TaskRecord>();
   let connection: acp.ClientConnection | null = null;
@@ -183,9 +199,7 @@ function createHermesProcess(cfg: ProviderConfig): AgentRuntimeAdapter {
     // Deriving the directory from the gateway URL makes that collision
     // impossible instead of merely unlikely. An explicit HERMES_PROFILE_DIR
     // still wins, for anyone who wants one shared profile on purpose.
-    const profileKey = cfg.baseUrl.replace(/[^a-zA-Z0-9]+/g, '-').replace(/^-+|-+$/g, '');
-    const profileDir =
-      cfg.profileDir ?? resolve(process.cwd(), '.data/hermes-agentos-' + profileKey);
+    const profileDir = profileDirFor(cfg);
     await mkdir(profileDir, { recursive: true });
     const configYaml = [
       'model:',
@@ -304,23 +318,16 @@ function createHermesProcess(cfg: ProviderConfig): AgentRuntimeAdapter {
         .client({ name: 'htn-agentos' })
         .onRequest(acp.methods.client.session.requestPermission, (ctx) => {
           // FAIL CLOSED — see the file header. Never silently approve here.
-          const options = ctx.params.options;
           console.warn(
-            '[hermes:live] DENYING permission request (approval-gate wiring not built yet): ' +
-              ctx.params.toolCall.title,
+            '[hermes:live] denied unmapped native permission; use AgentOS broker tools.',
           );
-          const deny = options.find((o) => o.optionId === 'deny') ?? options[options.length - 1];
-          return Promise.resolve({
-            outcome: { outcome: 'selected' as const, optionId: deny.optionId },
-          });
+          return Promise.resolve({ outcome: denyUnmappedHermesPermission(ctx.params.options) });
         })
-        .onRequest(acp.methods.client.fs.writeTextFile, async () => ({}))
-        .onRequest(acp.methods.client.fs.readTextFile, async () => ({ content: '' }))
         .connect(stream);
 
       await conn.agent.request(acp.methods.agent.initialize, {
         protocolVersion: acp.PROTOCOL_VERSION,
-        clientCapabilities: { fs: { readTextFile: true, writeTextFile: true } },
+        clientCapabilities: { fs: { readTextFile: false, writeTextFile: false } },
       });
 
       connection = conn;
@@ -337,23 +344,52 @@ function createHermesProcess(cfg: ProviderConfig): AgentRuntimeAdapter {
 
   /** Runs in the background from startTask; pollTask only ever reads `record`. */
   async function drain(record: TaskRecord): Promise<void> {
-    const chunks: string[] = [];
+    // Hermes streams EVERY assistant message of a turn as agent_message_chunk:
+    // the "Let me search for X" narration before each tool call, then the final
+    // answer. Joined into one string, the turn's "result" opened with narration,
+    // and the completion judge -- which sees a 1500-char excerpt -- was judging
+    // the plan instead of the answer, so it kept asking for another turn. A new
+    // messageId, or a tool call in between, starts a new message; the result is
+    // the last one.
+    const messages: string[] = [];
+    let messageId: string | null = null;
+    let toolCallSinceText = false;
+    // ACP announces a call with `tool_call`, then reports progress on the same
+    // toolCallId with `tool_call_update`. Recording both counted every call
+    // twice (a turn of 8 calls reported toolCallCount 16).
+    const seenToolCallIds = new Set<string>();
     try {
       for (;;) {
         const message = await record.session.nextUpdate();
         if (message.kind === 'stop') {
-          record.result = { text: chunks.join('') };
+          record.result = { text: (messages.at(-1) ?? '').trim() };
           record.log.push('stop: ' + message.stopReason);
           record.status = 'done';
           return;
         }
         const update = message.notification.update;
         if (update.sessionUpdate === 'agent_message_chunk' && update.content.type === 'text') {
-          chunks.push(update.content.text);
+          const chunkMessageId = update.messageId ?? null;
+          if (
+            messages.length === 0 ||
+            toolCallSinceText ||
+            (chunkMessageId !== null && chunkMessageId !== messageId)
+          ) {
+            messages.push('');
+          }
+          messageId = chunkMessageId;
+          toolCallSinceText = false;
+          messages[messages.length - 1] += update.content.text;
+          record.partialText = messages[messages.length - 1];
         } else if (
           update.sessionUpdate === 'tool_call' ||
           update.sessionUpdate === 'tool_call_update'
         ) {
+          // Only a NEW call ends the message before it; a late progress update
+          // for an earlier call must not split the final answer.
+          if (seenToolCallIds.has(update.toolCallId)) continue;
+          seenToolCallIds.add(update.toolCallId);
+          toolCallSinceText = true;
           record.toolCalls.push({
             tool: 'title' in update ? (update.title ?? update.toolCallId) : update.toolCallId,
             at: new Date().toISOString(),
@@ -411,7 +447,15 @@ function createHermesProcess(cfg: ProviderConfig): AgentRuntimeAdapter {
 
         // Best-effort only — see file header limit #1. Never treat this as
         // an enforced boundary.
-        const request = conn.agent.buildSession(cfg.cwd as string).toRequest();
+        // The SESSION cwd is an empty directory outside any git repo, not the
+        // Hermes checkout. Hermes injects AGENTS.md/CLAUDE.md from the git root
+        // down to the session cwd into EVERY model call: with the checkout as
+        // cwd that was Hermes's own 31k-char developer guide, ~8k tokens per
+        // call that no AgentOS task needs. The process still starts in
+        // cfg.cwd, which `uv run` requires.
+        const workDir = resolve(tmpdir(), 'agentos-hermes-work', basename(profileDirFor(cfg)));
+        await mkdir(workDir, { recursive: true });
+        const request = conn.agent.buildSession(workDir).toRequest();
         request._meta = { enabled_toolsets: requestedTools };
         const session = await conn.agent.buildSession(request).start();
 
@@ -442,9 +486,17 @@ function createHermesProcess(cfg: ProviderConfig): AgentRuntimeAdapter {
       if (!record) return failure('pollTask', started, 'BAD_INPUT', 'Unknown taskId: ' + taskId);
 
       if (record.status === 'running') {
+        // What it has said and done so far: a run that a budget stops still
+        // hands its findings on instead of nothing.
+        const partial = record.partialText?.trim();
         return {
           ok: true,
-          data: { status: 'running', log: record.log },
+          data: {
+            status: 'running',
+            log: record.log,
+            ...(partial ? { partial: { text: partial } } : {}),
+            toolCalls: [...record.toolCalls],
+          },
           meta: meta('pollTask', started, 'hermes-acp://local'),
         };
       }
@@ -472,6 +524,7 @@ function createHermesProcess(cfg: ProviderConfig): AgentRuntimeAdapter {
       try {
         record.status = 'running';
         record.result = undefined;
+        record.partialText = undefined;
         record.error = undefined;
         record.toolCalls = [];
         record.log.push('continued');

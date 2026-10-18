@@ -19,12 +19,21 @@ type SessionLike = BrowserSessionRecord & { closedAt?: Iso };
 interface HandoffPayload {
   kind?: unknown;
   sessionId?: unknown;
+  review?: unknown;
 }
 
 function payloadOf(approval: Approval): HandoffPayload | null {
   const action = approval.proposedAction;
   if (!action || typeof action !== 'object' || Array.isArray(action)) return null;
-  return action as HandoffPayload;
+  const payload = action as HandoffPayload;
+  if (
+    payload.review &&
+    typeof payload.review === 'object' &&
+    !Array.isArray(payload.review) &&
+    (payload.review as HandoffPayload).kind === 'browser_handoff'
+  )
+    return { ...(payload.review as HandoffPayload), kind: 'human_handoff' };
+  return payload;
 }
 
 /** True when this approval is a handoff rather than an ordinary risk gate. */
@@ -47,7 +56,9 @@ export function handoffSessionIdFor(
   approval: Approval,
   sessions: readonly SessionLike[],
 ): string | undefined {
-  const sessionId = payloadOf(approval)?.sessionId;
+  const payload = payloadOf(approval);
+  if (payload?.kind !== 'human_handoff') return undefined;
+  const sessionId = payload.sessionId;
   if (typeof sessionId !== 'string') return undefined;
 
   const session = sessions.find((candidate) => candidate.sessionId === sessionId);

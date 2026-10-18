@@ -7,6 +7,7 @@ import type {
   GatewayToolCall,
   OpenAiMessage,
 } from '../../core/modelGateway/service.js';
+import { isBoundTextRoute } from '../../core/modelGateway/catalog.js';
 import { newId } from '../../lib/ids.js';
 import type { RecordEgress } from '../withEgress.js';
 
@@ -27,7 +28,9 @@ export function createOllamaBackend(
 ): ChatModelBackend {
   return {
     async complete(input, ctx) {
-      if (input.route.providerId !== 'ollama') return fallback.complete(input, ctx);
+      if (input.route.providerId !== 'ollama' || isBoundTextRoute(input.route)) {
+        return fallback.complete(input, ctx);
+      }
       if (cfg.mode !== 'live')
         throw new Error('Ollama route selected while OLLAMA_MODE is not live.');
       return completeLocal(cfg, input, ctx, recordEgress);
@@ -61,7 +64,7 @@ async function completeLocal(
   recordEgress: RecordEgress,
 ): Promise<ChatModelBackendResult> {
   const started = Date.now();
-  const endpoint = (cfg.baseUrl ?? 'http://127.0.0.1:11434').replace(/\/$/, '') + '/api/chat';
+  const endpoint = localOllamaEndpoint(cfg.baseUrl) + '/api/chat';
   let tokensIn: number | undefined;
   let tokensOut: number | undefined;
   try {
@@ -71,7 +74,8 @@ async function completeLocal(
       body: JSON.stringify({
         model: input.route.modelId,
         messages: toOllamaMessages(input.messages),
-        ...(input.tools.length > 0 ? { tools: input.tools } : {}),
+        // Ollama's /api/chat has no tool_choice; 'none' drops the tools.
+        ...(input.tools.length > 0 && input.toolChoice !== 'none' ? { tools: input.tools } : {}),
         ...(input.maxTokens ? { options: { num_predict: input.maxTokens } } : {}),
         stream: false,
         // AgentOS needs the answer/tool call, not an unobserved local reasoning trace.
@@ -106,6 +110,7 @@ async function completeLocal(
       tokensIn,
       tokensOut,
       estimatedCostCents: 0,
+      model: input.route.modelId,
     }).catch((error: unknown) => {
       console.error(
         '[egress] failed to record Ollama call:',
@@ -113,6 +118,22 @@ async function completeLocal(
       );
     });
   }
+}
+
+/** A route advertised as local may never send private context to a remote URL. */
+export function localOllamaEndpoint(baseUrl = 'http://127.0.0.1:11434'): string {
+  const url = new URL(baseUrl);
+  if (
+    !['http:', 'https:'].includes(url.protocol) ||
+    !['localhost', '127.0.0.1', '[::1]'].includes(url.hostname) ||
+    url.username ||
+    url.password ||
+    url.search ||
+    url.hash
+  ) {
+    throw new Error('Ollama local routes require an approved loopback endpoint.');
+  }
+  return url.toString().replace(/\/$/, '');
 }
 
 function toOllamaMessages(messages: OpenAiMessage[]): Record<string, unknown>[] {

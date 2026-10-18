@@ -9,6 +9,7 @@ import type {
   ToolDescriptor,
 } from '@htn/shared';
 import { DecisionService } from '../src/core/decisions/service.js';
+import { eligibleModelRoutes } from '../src/core/decisions/eligibility.js';
 import { decisionStateFromSession } from '../src/core/sessions/decisionState.js';
 import { create } from '../src/providers/jev/index.js';
 
@@ -310,13 +311,69 @@ async function main(): Promise<void> {
       };
     },
   };
-  const guardedCompletion = await new DecisionService(alwaysDoneAdapter).judgeCompletion(
+  // Jev's verdict is never rewritten: a failed deterministic check is reported
+  // beside it (verified: false), it does not turn `done` into another turn.
+  const unverifiedCompletion = await new DecisionService(alwaysDoneAdapter).judgeCompletion(
     checkpoint({ pendingApprovalIds: ['approval_1'] }),
     ctx,
   );
-  assert.equal(guardedCompletion.status, 'blocked');
-  assert.equal(guardedCompletion.verified, false);
-  assert.ok(guardedCompletion.verificationFailures.includes('pending-approval'));
+  assert.equal(unverifiedCompletion.status, 'done');
+  assert.equal(unverifiedCompletion.verified, false);
+  assert.ok(unverifiedCompletion.verificationFailures.includes('pending-approval'));
+  assert.ok(unverifiedCompletion.reasonCodes.includes('done-unverified'));
+
+  // ...and it stands at any confidence. A 0.41 `done` used to become
+  // `continue`, which re-ran an agent turn that had already finished.
+  const unsureDoneAdapter: DecisionAdapter = {
+    ...alwaysDoneAdapter,
+    async judgeCompletion() {
+      return {
+        ok: true,
+        data: {
+          status: 'done',
+          confidence: 0.41,
+          probabilities: { done: 0.41, continue: 0.33, blocked: 0.26 },
+          reasonCodes: ['synthetic-unsure-done'],
+        },
+        meta: {
+          provider: 'jev',
+          op: 'judge_completion',
+          mode: 'mock',
+          latencyMs: 0,
+          destination: 'mock://jev',
+        },
+      };
+    },
+    async selectModel(input) {
+      const pick = input.candidates.at(-1)!;
+      return {
+        ok: true,
+        data: {
+          selectedRouteId: pick.id,
+          confidence: 0.35,
+          probabilities: { [pick.id]: 0.35 },
+          reasonCodes: ['synthetic-unsure-route'],
+        },
+        meta: {
+          provider: 'jev',
+          op: 'select_model',
+          mode: 'mock',
+          latencyMs: 0,
+          destination: 'mock://jev',
+        },
+      };
+    },
+  };
+  const unsureService = new DecisionService(unsureDoneAdapter);
+  const unsureDone = await unsureService.judgeCompletion(checkpoint(), ctx);
+  assert.equal(unsureDone.status, 'done');
+  assert.equal(unsureDone.verified, true);
+  const unsureRoute = await unsureService.selectModel(publicState, MODEL_ROUTE_FIXTURES, ctx);
+  assert.equal(
+    unsureRoute.selectedRouteId,
+    eligibleModelRoutes(publicState, MODEL_ROUTE_FIXTURES).at(-1)?.id,
+    'an eligible low-confidence route pick is followed, not swapped for a fallback',
+  );
 
   const completed = await service.judgeCompletion(checkpoint(), ctx);
   assert.equal(completed.status, 'done');

@@ -32,6 +32,7 @@ import { graphAncestorIds } from '@htn/shared';
 import type { PlaybookContext, PlaybookOutcome } from '../playbooks/types.js';
 import { collectRefs, lookup, resolveRefs, type RefScope } from './refs.js';
 import { toolRisk, UNKNOWN_TOOL_ACTION_KIND } from './toolRisk.js';
+import { isStaticDispatch, nodeHash, usableDispatch } from './compile.js';
 
 /* -------------------------------------------------------------------------- */
 /* Node outcomes                                                              */
@@ -191,6 +192,19 @@ export async function runGraph(
           }
           return provider;
         },
+        browserForSession: ctx.browserForSession
+          ? (sessionId) => {
+              const browser = ctx.browserForSession!(sessionId);
+              if (
+                browser.mode === 'live' &&
+                browser.id !== 'localbrowser' &&
+                [...labels].some((label) => label === 'local_only' || label === 'secret')
+              ) {
+                throw new Error('Local-only graph context cannot use this remote browser session.');
+              }
+              return browser;
+            }
+          : undefined,
       };
       const result = await executeNode(labeled, node, scope, graph, lease);
       const ran: Ran = {
@@ -308,7 +322,7 @@ async function executeNode(
     case 'tool':
       return runTool(ctx, node, scope, lease);
     case 'dispatch':
-      return runDispatch(ctx, node, scope, lease);
+      return runDispatch(ctx, node, scope, lease, graph);
     case 'judge':
       return runJudge(ctx, node, scope);
     case 'agent_task':
@@ -475,29 +489,16 @@ async function callToolGated(
   // concrete action itself; gating here as well asks a person twice for one
   // call. That is the same rule the old tool routes stated as `gatesItself`.
   //
-  // AN EXPLICIT `submit` NODE IS THE ONE EXCEPTION. "Always stop for a human"
-  // is the author's decision and must not depend on how the registry happens
-  // to classify the tool -- a submit node naming a reversible tool still stops.
-  // So it gates here FIRST and is then executed through the broker like
-  // anything else, rather than being pushed down the toolbox path where its
-  // name would not resolve.
-  if (args.forceApproval) {
-    await ctx.requireApproval(args.stepId, {
-      kind: risk.kind,
-      description: args.description,
-      amountCents: args.amountCents,
-      reversibility: 'irreversible',
-      payload: { tool: args.tool, args: args.toolArgs } as Json,
-    });
-  }
-
+  // An explicit submit forces the broker's single exact-action approval,
+  // including for reversible tools. Revisions are validated by that broker.
   const brokered = await ctx.callBrokeredTool({
     stepId: args.stepId,
     toolId: args.tool,
     args: args.toolArgs,
+    forceApproval: args.forceApproval,
   });
-  // null means the registry does not know this tool, which is the normal
-  // answer for a Composio name -- fall through to the toolbox below.
+  // Standalone interpreter test contexts can omit a broker. Production's
+  // context throws for unregistered tools; it never reaches this fallback.
   if (brokered) {
     await holdOpenedSession(ctx, args.stepId, brokered.output, args.toolArgs, args.lease);
     if (args.tool.endsWith('.close')) {
@@ -505,17 +506,6 @@ async function callToolGated(
       if (typeof closed === 'string') args.lease?.release(closed);
     }
     return brokered.output;
-  }
-
-  // Already gated above; do not ask again on the toolbox path either.
-  if (args.forceApproval) {
-    const toolbox = ctx.provider('toolbox');
-    const res = await toolbox.callTool(
-      { name: args.tool, args: args.toolArgs },
-      ctx.callContext({ stepId: args.stepId, policyRule: 'graph-node-submit' }),
-    );
-    if (!res.ok) throw new Error('Tool ' + args.tool + ' failed: ' + res.error.message);
-    return res.data;
   }
 
   if (risk.unknown) {
@@ -665,6 +655,7 @@ async function runDispatch(
   node: Extract<GraphNode, { type: 'dispatch' }>,
   scope: RefScope,
   lease: SessionLease,
+  graph: AgentGraph,
 ): Promise<NodeResult> {
   const cfg = resolveRefs(node.config, scope);
 
@@ -707,14 +698,39 @@ async function runDispatch(
       }
 
       const decider = ctx.provider('decision');
-      const decision = await decider.decide(
-        {
-          question: cfg.goal,
+      // A goal with no {{refs}} asks the same question every run, so the
+      // choice frozen at save time is reused while the options are unchanged.
+      const staticGoal = isStaticDispatch(node);
+      const hash = staticGoal ? nodeHash(node) : '';
+      const frozen = staticGoal
+        ? usableDispatch(graph.compiled?.nodes[node.id], {
+            nodeHash: hash,
+            decisionMode: decider.mode,
+            options,
+          })
+        : undefined;
+      const decision = frozen
+        ? { ok: true as const, data: { choice: frozen.choice, confidence: frozen.confidence } }
+        : await decider.decide(
+            {
+              question: cfg.goal,
+              options,
+              evidence: cfg.evidence,
+            },
+            ctx.callContext({ stepId: step.id, policyRule: 'graph-node-tool-selection' }),
+          );
+      if (staticGoal && !frozen && decision.ok && options.includes(decision.data.choice)) {
+        await ctx.recordCompiledDecision?.(graph.id, node.id, {
+          kind: 'dispatch',
+          nodeHash: hash,
+          decisionMode: decider.mode,
           options,
-          evidence: cfg.evidence,
-        },
-        ctx.callContext({ stepId: step.id, policyRule: 'graph-node-tool-selection' }),
-      );
+          choice: decision.data.choice,
+          confidence: decision.data.confidence,
+          source: 'run',
+          at: new Date().toISOString(),
+        });
+      }
 
       // Fail closed, exactly as runAgentTask does: a decision-layer outage must
       // not widen what can be called. With no choice there is nothing to run.
@@ -740,7 +756,7 @@ async function runDispatch(
         availableTools: cfg.candidateTools,
         exposedTools: [tool],
         confidence: decision.data.confidence,
-        rule: 'dispatch-selected-single-tool',
+        rule: frozen ? 'dispatch-compiled-single-tool' : 'dispatch-selected-single-tool',
       });
 
       const toolArgs = await dispatchArgs(ctx, cfg, tool, step.id);
@@ -826,8 +842,7 @@ async function runAgentTaskNode(
     context: agentContext(node, scope, graph),
     availableTools: cfg.availableTools,
     toolCeiling: cfg.toolCeiling,
-    resourceBindings:
-      browserSession !== undefined ? { browserSession } : undefined,
+    resourceBindings: browserSession !== undefined ? { browserSession } : undefined,
     contextScope: cfg.contextScope,
     dataLabels: cfg.dataLabels,
     contextProvenance:
@@ -839,6 +854,11 @@ async function runAgentTaskNode(
     maxTurns: cfg.maxTurns,
     maxDurationMs: cfg.maxDurationMs,
     maxFailedToolCalls: cfg.maxFailedToolCalls,
+    compiledRoute: {
+      graphId: graph.id,
+      nodeHash: nodeHash(node),
+      entry: graph.compiled?.nodes[node.id],
+    },
   });
 
   return {
@@ -1030,9 +1050,10 @@ async function releaseHeldSessions(ctx: PlaybookContext, held: Set<string>): Pro
   await Promise.all(
     [...held].map(async (sessionId) => {
       try {
-        await ctx
-          .provider('browser')
-          .closeSession(sessionId, ctx.callContext({ policyRule: 'run-teardown-session-release' }));
+        await (ctx.browserForSession?.(sessionId) ?? ctx.provider('browser')).closeSession(
+          sessionId,
+          ctx.callContext({ policyRule: 'run-teardown-session-release' }),
+        );
         await ctx.releaseBrowserSession(sessionId);
       } catch (err) {
         await ctx
@@ -1087,13 +1108,9 @@ async function withHandoffTimeout<T>(work: Promise<T>, ms: number, label: string
  * run's AbortSignal, and already surfaces in the UI. A second way to block a
  * run would be a second way to get cancellation wrong.
  *
- * WHY THE SESSION IS OPENED THROUGH THE CAPABILITY AND NOT THE TOOL BROKER:
- * the broker authorizes a tool call against an agent session's exposure grant
- * (see core/tools/broker.ts, assertSelected). A graph node has no such grant --
- * it is not a harness turn. The call still goes through the `browser`
- * capability, so withEgress ledgers it and the privacy story is unchanged; and
- * this node blocks for a human by construction, which is a stricter gate than
- * the `read_page` classification an open would otherwise get.
+ * A new browser opens through the exact-action broker, with a one-call graph
+ * grant. This registers the same resource for downstream agent tools as well
+ * as the human viewer. Standalone test contexts can supply a direct mock.
  *
  * NO CREDENTIAL PASSES THROUGH HERE. There is nothing in this function that
  * reads a secret, and `output` carries only the instruction, the session id and
@@ -1131,29 +1148,47 @@ async function runHandoff(
       }
 
       if (!inherited) {
-        const opened = await ctx
-          .provider('browser')
-          .openSession(
-            { ...(cfg.url ? { startUrl: cfg.url } : {}) },
-            ctx.callContext({ stepId: step.id, policyRule: 'handoff-open-for-human' }),
-          );
-        if (!opened.ok) {
-          throw new Error(
-            'Handoff "' +
-              node.label +
-              '" could not open a browser to hand over: ' +
-              opened.error.message,
-          );
+        const brokered = await ctx.callBrokeredTool({
+          stepId: step.id,
+          toolId: ctx.provider('browser').id + '.open',
+          args: { url: cfg.url! },
+        });
+        if (brokered) {
+          const resource = brokered.output;
+          if (
+            !resource ||
+            typeof resource !== 'object' ||
+            Array.isArray(resource) ||
+            typeof resource.sessionId !== 'string'
+          )
+            throw new Error('Broker did not return the opened browser resource.');
+          sessionId = resource.sessionId;
+          interactive = resource.interactive === true;
+        } else {
+          const opened = await ctx
+            .provider('browser')
+            .openSession(
+              { ...(cfg.url ? { startUrl: cfg.url } : {}) },
+              ctx.callContext({ stepId: step.id, policyRule: 'handoff-open-for-human' }),
+            );
+          if (!opened.ok) {
+            throw new Error(
+              'Handoff "' +
+                node.label +
+                '" could not open a browser to hand over: ' +
+                opened.error.message,
+            );
+          }
+          sessionId = opened.data.sessionId;
+          interactive = opened.data.interactive === true;
         }
-        sessionId = opened.data.sessionId;
-        interactive = opened.data.interactive === true;
 
         // Held for the REST OF THE RUN, not this step: downstream nodes inherit
         // the authenticated session. runGraph's drain is what gives it back.
         lease.hold(sessionId);
       }
 
-      const browser = ctx.provider('browser');
+      const browser = ctx.browserForSession?.(sessionId as string) ?? ctx.provider('browser');
       if (!browser.setOwnership)
         throw new Error('Browser backend cannot safely transfer session ownership.');
       await browser.setOwnership(

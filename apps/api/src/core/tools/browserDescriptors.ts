@@ -2,7 +2,7 @@ import type { DataLabel, Json, ToolDescriptor } from '@htn/shared';
 import { BROWSER_EXECUTOR_REF } from './browser.js';
 import type { ToolRegistration } from './registry.js';
 
-type BrowserProviderId = 'localbrowser' | 'browserbase';
+type BrowserProviderId = 'localbrowser' | 'browserbase' | 'browserless';
 type BrowserOperation =
   'open' | 'search' | 'read' | 'extract' | 'inspect' | 'click' | 'type' | 'submit' | 'close';
 
@@ -25,6 +25,15 @@ const objectSchema = (properties: Record<string, Json>, required: string[] = [])
 const sessionProperty = { type: 'string', minLength: 1 } as const;
 const urlProperty = { type: 'string', minLength: 1 } as const;
 const textProperty = { type: 'string', minLength: 1 } as const;
+
+/** "Args: sessionId*, goal*, text*" -- the exact field names, required ones starred. */
+function argsSummary(schema: Json): string {
+  const s = schema as { properties?: Record<string, unknown>; required?: string[] };
+  const names = Object.keys(s.properties ?? {});
+  if (names.length === 0) return 'Args: none.';
+  const required = new Set(s.required ?? []);
+  return 'Args: ' + names.map((n) => n + (required.has(n) ? '*' : '')).join(', ') + ' (* required).';
+}
 
 const OPERATIONS: readonly OperationSpec[] = [
   {
@@ -115,12 +124,29 @@ const OPERATIONS: readonly OperationSpec[] = [
 export interface BrowserDescriptorOptions {
   localAvailable: boolean;
   browserbaseAvailable: boolean;
+  browserlessAvailable?: boolean;
+  /** Each backend's effective mode, recorded as its descriptors' `executionMode`. */
+  modes?: Partial<Record<BrowserProviderId, 'live' | 'mock'>>;
 }
 
 export function browserToolRegistrations(options: BrowserDescriptorOptions): ToolRegistration[] {
+  const modes = options.modes ?? {};
   return [
-    ...build('localbrowser', ['public', 'private', 'secret', 'local_only'], options.localAvailable),
-    ...build('browserbase', ['public', 'private'], options.browserbaseAvailable),
+    ...build(
+      'localbrowser',
+      ['public', 'private', 'secret', 'local_only'],
+      options.localAvailable,
+      modes.localbrowser,
+    ),
+    ...build('browserbase', ['public', 'private'], options.browserbaseAvailable, modes.browserbase),
+    ...(options.browserlessAvailable === undefined
+      ? []
+      : build(
+          'browserless',
+          ['public', 'private'],
+          options.browserlessAvailable,
+          modes.browserless,
+        )),
   ];
 }
 
@@ -128,6 +154,7 @@ function build(
   providerId: BrowserProviderId,
   allowedDataLabels: DataLabel[],
   available: boolean,
+  executionMode: 'live' | 'mock' | undefined,
 ): ToolRegistration[] {
   return OPERATIONS.map((spec) => {
     const id = providerId + '.' + spec.operation;
@@ -138,7 +165,7 @@ function build(
         providerId,
         family: 'browser',
         interactionMode: spec.interactionMode,
-        description: spec.description,
+        description: spec.description + ' ' + argsSummary(spec.schema),
         inputSchemaRef: 'agentos://schemas/' + id + '/2',
         transport: providerId === 'localbrowser' ? 'local' : 'http',
         baselineEffect: spec.effect,
@@ -147,7 +174,10 @@ function build(
         allowedDataLabels,
         availability: available ? 'available' : 'unavailable',
         executorRef: BROWSER_EXECUTOR_REF,
-        ...(providerId === 'browserbase' ? { credentialRef: 'BROWSERBASE_API_KEY' } : {}),
+        ...(providerId !== 'localbrowser'
+          ? { credentialRef: providerId.toUpperCase() + '_API_KEY' }
+          : {}),
+        ...(executionMode ? { executionMode } : {}),
       },
       wireName: providerId + '_' + spec.operation,
       inputSchema: spec.schema,

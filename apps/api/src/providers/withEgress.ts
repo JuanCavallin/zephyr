@@ -71,7 +71,13 @@ export function withEgress(
             stepId: ctx.stepId,
             providerId: target.id,
             op: String(prop),
-            destination: result?.meta?.destination ?? null,
+            destination:
+              result?.meta?.destination ??
+              // No network destination: in-process work on the adapter (session
+              // ownership, run release, task cancel). On a live adapter that is
+              // local, not a mock; the ledger default would label it mock://,
+              // which marks the whole run as mocked.
+              (target.mode === 'live' ? 'local://' + target.id : null),
             dataSpans: ctx.redactions ?? [],
             policyRule: ctx.policyRule,
             latencyMs: result?.meta?.latencyMs,
@@ -80,6 +86,9 @@ export function withEgress(
             tokensIn: result?.meta?.tokensIn,
             tokensOut: result?.meta?.tokensOut,
             estimatedCostCents: result?.meta?.estimatedCostCents,
+            model: result?.meta?.model,
+            cacheReadTokens: result?.meta?.cacheReadTokens,
+            cacheWriteTokens: result?.meta?.cacheWriteTokens,
           };
           // Same numbers on the span and in the ledger, from one source, so the
           // two can never disagree about what a call cost or where it went.

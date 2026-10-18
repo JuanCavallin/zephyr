@@ -3,6 +3,8 @@ import type { Approval, ApprovalDecision } from '@htn/shared';
 import { api } from '../../lib/api';
 import { Badge } from '../ui/Badge';
 import { Button } from '../ui/Button';
+import { redactCredentialFields } from '../../lib/actions';
+import { isHandoffApproval } from '../../lib/handoff';
 
 /**
  * The human half of the risk gate.
@@ -32,6 +34,9 @@ import { Button } from '../ui/Button';
 export function ApprovalPanel({
   approval,
   handoffSessionId,
+  decisionsDisabled = false,
+  approvalDisabled = false,
+  compact = false,
 }: {
   approval: Approval;
   /**
@@ -44,19 +49,28 @@ export function ApprovalPanel({
    * click. Undefined is normal (local and mocked browsers have no viewer).
    */
   handoffSessionId?: string;
+  decisionsDisabled?: boolean;
+  approvalDisabled?: boolean;
+  compact?: boolean;
 }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [opening, setOpening] = useState(false);
+  const [submitted, setSubmitted] = useState(false);
 
   /**
    * Mint a viewer URL and open it. The window is opened FIRST, synchronously,
    * because a popup opened inside an await is a popup the browser blocks.
+   *
+   * No 'noopener' feature here: with it, window.open returns null, so the
+   * pre-opened tab could never be navigated and the fallback below opened a
+   * SECOND window. Severing the opener by hand gives the same isolation.
    */
   const openLiveView = async () => {
     setOpening(true);
     setError(null);
-    const tab = window.open('', '_blank', 'noopener,noreferrer');
+    const tab = window.open('about:blank', '_blank');
+    if (tab) tab.opener = null;
     try {
       const { liveViewUrl, pageUrl } = await api.browserLiveView(
         approval.runId,
@@ -90,11 +104,9 @@ export function ApprovalPanel({
   // presence of a URL keeps the handoff wording correct even when no viewable
   // session exists -- the person still has to go and do the thing.
   const action = approval.proposedAction;
-  const isHandoff =
-    !!action &&
-    typeof action === 'object' &&
-    !Array.isArray(action) &&
-    (action as Record<string, unknown>).kind === 'human_handoff';
+  const isHandoff = isHandoffApproval(approval);
+  const review =
+    action && typeof action === 'object' && !Array.isArray(action) ? action.review : undefined;
   const [draft, setDraft] = useState<string | null>(null);
 
   const submit = async (decision: ApprovalDecision) => {
@@ -102,6 +114,20 @@ export function ApprovalPanel({
     setError(null);
     try {
       await api.decide(approval.id, decision);
+      setSubmitted(true);
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const correctTarget = async (index: number) => {
+    setBusy(true);
+    setError(null);
+    try {
+      await api.correctBrowserTarget(approval.id, index);
+      setSubmitted(true);
     } catch (err) {
       setError((err as Error).message);
     } finally {
@@ -121,6 +147,41 @@ export function ApprovalPanel({
     }
     await submit({ decision: 'revised', revisedPayload });
   };
+
+  const startRevision = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      let payload = approval.proposedAction;
+      if (payload && typeof payload === 'object' && !Array.isArray(payload)) {
+        const exact = payload as Record<string, unknown>;
+        const args = exact.arguments;
+        if (
+          args &&
+          typeof args === 'object' &&
+          !Array.isArray(args) &&
+          typeof (args as Record<string, unknown>).previewRef === 'string'
+        ) {
+          const { preview } = await api.actionPreview(
+            approval.runId,
+            (args as Record<string, unknown>).previewRef as string,
+          );
+          payload = { ...exact, arguments: preview.arguments };
+        }
+      }
+      setDraft(JSON.stringify(payload, null, 2));
+    } catch (issue) {
+      setError(
+        issue instanceof Error
+          ? issue.message
+          : 'The exact payload could not be loaded for revision.',
+      );
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const disabled = busy || submitted || decisionsDisabled;
 
   if (approval.status !== 'pending') {
     return (
@@ -142,7 +203,7 @@ export function ApprovalPanel({
             <div>
               <p className="text-[11px] uppercase tracking-wide text-slate-500">Proposed</p>
               <pre className="mt-1 max-h-40 overflow-auto rounded bg-slate-950/70 px-3 py-2 text-[11px] leading-relaxed text-slate-500">
-                {JSON.stringify(approval.proposedAction, null, 2)}
+                {JSON.stringify(redactCredentialFields(approval.proposedAction), null, 2)}
               </pre>
             </div>
             <div>
@@ -151,7 +212,7 @@ export function ApprovalPanel({
                 {approval.reauthorizedRule ? ': ' + approval.reauthorizedRule : ''})
               </p>
               <pre className="mt-1 max-h-40 overflow-auto rounded bg-slate-950/70 px-3 py-2 text-[11px] leading-relaxed text-slate-300">
-                {JSON.stringify(approval.revisedAction, null, 2)}
+                {JSON.stringify(redactCredentialFields(approval.revisedAction), null, 2)}
               </pre>
             </div>
           </div>
@@ -193,8 +254,8 @@ export function ApprovalPanel({
         )}
 
         <p className="mt-2 text-xs leading-relaxed text-slate-500">
-          Nothing you enter passes through this system — it is not read, not logged, and not sent to
-          a model.
+          Manual input is sent only to this browser session. Agent actions stay blocked during
+          handoff. After you continue, the agent may inspect the resulting page.
         </p>
 
         {error && <p className="mt-2 text-xs text-rose-400">{error}</p>}
@@ -207,13 +268,13 @@ export function ApprovalPanel({
           Skipping fails the run — the agent will not attempt this itself.
         </p>
         <div className="mt-2 flex gap-2">
-          <Button onClick={() => void submit({ decision: 'approved' })} disabled={busy}>
+          <Button onClick={() => void submit({ decision: 'approved' })} disabled={disabled}>
             I&rsquo;m done
           </Button>
           <Button
             variant="danger"
             onClick={() => void submit({ decision: 'rejected' })}
-            disabled={busy}
+            disabled={disabled}
           >
             Skip
           </Button>
@@ -234,9 +295,55 @@ export function ApprovalPanel({
 
       <p className="mt-2 text-sm text-slate-100">{approval.question}</p>
 
-      <p className="mt-1 text-xs text-slate-500">
-        This stopped because the action cannot be undone — not because a model was unsure.
-      </p>
+      {review &&
+        typeof review === 'object' &&
+        !Array.isArray(review) &&
+        review.kind === 'browser_target' && (
+          <section className="mt-2" aria-label="Browser target review">
+            <h3 className="text-sm font-medium">Prepared browser target</h3>
+            <p className="text-xs text-slate-400">
+              {review.consequential
+                ? 'This click commits something (' +
+                  String(review.risk ?? 'consequential') +
+                  '), so it needs your approval at any confidence. '
+                : ''}
+              Approve only this operation and target; a changed target requires a fresh decision.
+            </p>
+            {review.remembered === 'human' && (
+              <p className="mt-1 text-xs text-emerald-300">Remembered from your earlier choice.</p>
+            )}
+            {Array.isArray(review.candidates) && review.candidates.length > 1 && (
+              <ul className="mt-2 space-y-1" aria-label="Other elements on this page">
+                {review.candidates.slice(1).map((candidate) =>
+                  candidate && typeof candidate === 'object' && !Array.isArray(candidate) ? (
+                    <li key={String(candidate.index)} className="flex items-center gap-2 text-xs">
+                      <span className="text-slate-300">
+                        [{String(candidate.index)}] {String(candidate.role)} “
+                        {String(candidate.label)}”
+                      </span>
+                      <Button
+                        variant="ghost"
+                        disabled={busy || submitted}
+                        onClick={() => void correctTarget(Number(candidate.index))}
+                      >
+                        Use this instead
+                      </Button>
+                    </li>
+                  ) : null,
+                )}
+              </ul>
+            )}
+            <pre className="mt-1 max-h-48 overflow-auto rounded bg-slate-950/70 px-3 py-2 text-[11px] text-slate-300">
+              {JSON.stringify(redactCredentialFields(review), null, 2)}
+            </pre>
+          </section>
+        )}
+
+      {!compact && (
+        <p className="mt-1 text-xs text-slate-500">
+          The policy gate requires your decision before executing this exact action.
+        </p>
+      )}
 
       {revising ? (
         <>
@@ -245,47 +352,70 @@ export function ApprovalPanel({
             value={draft}
             spellCheck={false}
             onChange={(e) => setDraft(e.target.value)}
-            disabled={busy}
+            aria-label="Revised exact action payload"
+            disabled={disabled}
           />
           <p className="mt-1 text-xs text-slate-500">
             The edit goes back through the risk gate. It may narrow the action; a revision that
             makes it riskier is refused and the action stays pending.
           </p>
         </>
-      ) : (
+      ) : !compact ? (
         <pre className="mt-2 max-h-48 overflow-auto rounded bg-slate-950/70 px-3 py-2 text-[11px] leading-relaxed text-slate-400">
-          {JSON.stringify(approval.proposedAction, null, 2)}
+          {JSON.stringify(redactCredentialFields(approval.proposedAction), null, 2)}
         </pre>
+      ) : (
+        <details className="mt-2">
+          <summary className="cursor-pointer text-xs text-slate-400">Exact proposed action</summary>
+          <pre className="mt-1 max-h-32 overflow-auto rounded bg-slate-950/70 px-3 py-2 text-[11px] text-slate-400">
+            {JSON.stringify(redactCredentialFields(approval.proposedAction), null, 2)}
+          </pre>
+        </details>
       )}
 
       {error && <p className="mt-2 text-xs text-rose-400">{error}</p>}
+      {submitted && (
+        <p className="mt-2 text-xs text-slate-400" role="status">
+          Decision recorded. Waiting for the current run state…
+        </p>
+      )}
 
       <div className="mt-3 flex flex-wrap gap-2">
         {revising ? (
           <>
-            <Button onClick={() => void submitRevision()} disabled={busy}>
+            <Button onClick={() => void submitRevision()} disabled={disabled || approvalDisabled}>
               Send revised payload
             </Button>
-            <Button variant="ghost" onClick={() => setDraft(null)} disabled={busy}>
+            <Button variant="ghost" onClick={() => setDraft(null)} disabled={disabled}>
               Cancel edit
-            </Button>
-          </>
-        ) : (
-          <>
-            <Button onClick={() => void submit({ decision: 'approved' })} disabled={busy}>
-              Approve and continue
-            </Button>
-            <Button
-              variant="ghost"
-              onClick={() => setDraft(JSON.stringify(approval.proposedAction, null, 2))}
-              disabled={busy}
-            >
-              Revise payload
             </Button>
             <Button
               variant="danger"
               onClick={() => void submit({ decision: 'rejected' })}
-              disabled={busy}
+              disabled={disabled}
+            >
+              Reject
+            </Button>
+          </>
+        ) : (
+          <>
+            <Button
+              onClick={() => void submit({ decision: 'approved' })}
+              disabled={disabled || approvalDisabled}
+            >
+              {compact ? 'Approve changes' : 'Approve and continue'}
+            </Button>
+            <Button
+              variant="ghost"
+              onClick={() => void startRevision()}
+              disabled={disabled || approvalDisabled}
+            >
+              {compact ? 'Revise' : 'Revise payload'}
+            </Button>
+            <Button
+              variant="danger"
+              onClick={() => void submit({ decision: 'rejected' })}
+              disabled={disabled}
             >
               Reject
             </Button>

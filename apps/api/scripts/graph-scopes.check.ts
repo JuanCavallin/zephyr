@@ -48,6 +48,7 @@ async function execute(graph: AgentGraph, cancel = false) {
   const jev = createJev({ mode: 'mock', keyVar: 'UNUSED' });
   const started: Parameters<AgentRuntimeAdapter['startTask']>[0][] = [];
   const continued: string[] = [];
+  let cancelRun: (() => void) | undefined;
   const closed: string[] = [];
   const cleanup: string[] = [];
   const meta = {
@@ -73,6 +74,9 @@ async function execute(graph: AgentGraph, cancel = false) {
       return { ok: true, data: { taskId: 'task-' + started.length }, meta };
     },
     async pollTask() {
+      // Cancel once the agent is actually running. A fixed timer raced the
+      // mock Jev's latency, and a run cancelled before launch starts no agent.
+      if (cancel) setTimeout(() => cancelRun?.(), 0);
       return {
         ok: true,
         data: { status: cancel ? 'running' : 'done', result: { text: 'SYNTHETIC_RESULT' } },
@@ -113,9 +117,8 @@ async function execute(graph: AgentGraph, cancel = false) {
     input: { graphId: graph.id, graphSnapshot: graph as unknown as Json },
   };
   await store.createRun(run);
-  const executing = (orchestrator as unknown as { execute(run: Run): Promise<void> }).execute(run);
-  if (cancel) setTimeout(() => orchestrator.cancel(run.id), 500);
-  await executing;
+  cancelRun = () => orchestrator.cancel(run.id);
+  await (orchestrator as unknown as { execute(run: Run): Promise<void> }).execute(run);
   return {
     store,
     started,

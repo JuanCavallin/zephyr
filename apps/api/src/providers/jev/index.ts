@@ -11,11 +11,12 @@ import type {
 import type { ProviderConfig } from '../../config.js';
 import { mockBase, mockCall } from '../_mock.js';
 import { createLiveJev } from './live.js';
+import { credentials } from '../../services/credentials.js';
 
 const CAPABILITIES: readonly Capability[] = ['decision'];
 
 export function create(cfg: ProviderConfig): DecisionAdapter {
-  if (cfg.mode === 'live') return createLiveJev(cfg);
+  if (cfg.mode === 'live') return createLiveJev(cfg, credentials);
   return createMock(cfg);
 }
 

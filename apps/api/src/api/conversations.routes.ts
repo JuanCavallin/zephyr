@@ -17,6 +17,7 @@ import type { Conversation, ConversationMessage } from '@htn/shared';
 import { newId, nowIso } from '../lib/ids.js';
 import { store } from '../store/index.js';
 import { mutateGraph } from '../services/graphs.service.js';
+import { saveGraphOwned } from '../services/graphCompile.service.js';
 import { synthesiseGraph } from '../services/synthesis.service.js';
 import { HttpError, param, valid, validate } from './middleware/validate.js';
 
@@ -94,7 +95,7 @@ conversationsRouter.post(
     // writer uses, so a chat edit cannot bypass the cycle and reference checks.
     const saved = currentGraph
       ? await mutateGraph(currentGraph.id, currentGraph.version, () => result.graph)
-      : await store.saveGraph(result.graph);
+      : await saveGraphOwned(result.graph);
 
     const at = nowIso();
     const userMessage: ConversationMessage = {

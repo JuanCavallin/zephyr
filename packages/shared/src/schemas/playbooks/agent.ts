@@ -9,6 +9,7 @@ export const agentInputSchema = z.object({
     .array(z.enum(['public', 'private', 'secret', 'local_only']))
     .min(1)
     .optional(),
+  /** Accepted for older clients and ignored: an agent task is one Hermes run. */
   maxTurns: z.number().int().min(1).max(5).default(3),
 });
 

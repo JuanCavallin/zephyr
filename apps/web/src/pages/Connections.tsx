@@ -1,14 +1,16 @@
 /**
  * Truthful connections screen: what AgentOS is actually wired to, not what a demo
  * script claims. Every fact here comes straight from a live route response — no
- * secrets are ever held in state, only the env-var NAMES the backend reads them
- * from. See docs/frontend-handoff.md, "Tool connections UI".
+ * credential status never returns secret values. User API-key inputs live only
+ * in the setup form until saved to the local API process. See docs/frontend-handoff.md.
  */
 
 import { useCallback, useEffect, useRef, useState } from 'react';
-import type { McpConnection, ProviderStatus } from '@htn/shared';
+import type { Capability, McpConnection, ProviderId, ProviderStatus } from '@htn/shared';
 import { api, ApiError, type ToolCatalogEntry } from '../lib/api';
 import { Icon } from '../components/ui/Icon';
+import { CredentialsPanel } from '../components/connections/CredentialsPanel';
+import { SupervisionExamples } from '../components/actions/SupervisionExamples';
 
 type ComposioTool = { name: string; toolkit?: string; version?: string; connected: boolean };
 
@@ -115,6 +117,9 @@ export function Connections() {
       </header>
 
       <ProvidersSection state={providers} />
+      <BrowserBackendsSection providers={providers} tools={tools} />
+      <CredentialsPanel />
+      <SupervisionExamples />
       <ToolSourcesSection composio={composio} mcp={mcp} />
       <ToolInventorySection state={tools} />
     </div>
@@ -126,7 +131,9 @@ export function Connections() {
 function ProvidersSection({
   state,
 }: {
-  state: ReturnType<typeof useAsync<{ providers: ProviderStatus[] }>>;
+  state: ReturnType<
+    typeof useAsync<{ providers: ProviderStatus[]; bindings: Record<Capability, ProviderId> }>
+  >;
 }) {
   return (
     <section className="surface-section">
@@ -153,7 +160,15 @@ function ProvidersSection({
             </div>
             {state.data.providers.map((provider) => (
               <div className="connections-table-row" key={provider.id}>
-                <strong>{provider.id}</strong>
+                <span>
+                  <strong>{provider.id}</strong>
+                  {provider.id === 'browserbase' && (
+                    <small>
+                      Deprecated · compatibility backend. Switch to Browserless after hosted
+                      validation.
+                    </small>
+                  )}
+                </span>
                 <span className="connections-caps">{provider.capabilities.join(', ')}</span>
                 <span>{modeChip(provider.mode)}</span>
                 <span>
@@ -163,6 +178,155 @@ function ProvidersSection({
               </div>
             ))}
           </div>
+        )}
+      </div>
+    </section>
+  );
+}
+
+/* ------------------------------------------------------------ Browser backends */
+
+/**
+ * The three browser backends, side by side: which one new browser sessions use
+ * (`bindings.browser`, from BROWSER_BACKEND), which one serves local-only work
+ * (`bindings['browser.local']`), and whether each is live, mocked or off. Facts
+ * come from /providers and /tools; the copy only explains them.
+ */
+const BROWSER_BACKENDS: {
+  id: ProviderId;
+  name: string;
+  where: string;
+  about: string;
+  enable: string;
+}[] = [
+  {
+    id: 'localbrowser',
+    name: 'Local browser (Playwright)',
+    where: 'This machine',
+    about:
+      'Your installed Chrome, driven by Playwright. No browser-service charge; some sites block automated Chrome.',
+    enable: 'BROWSER_BACKEND=localbrowser, LOCALBROWSER_MODE=live, LOCALBROWSER_CHANNEL=chrome',
+  },
+  {
+    id: 'browserless',
+    name: 'Browserless',
+    where: 'Cloud',
+    about:
+      'Hosted Chrome over CDP with a revocable live viewer. Needs a Browserless API key; the free plan ends sessions after 2 minutes.',
+    enable: 'BROWSER_BACKEND=browserless, BROWSERLESS_MODE=live, BROWSERLESS_API_KEY',
+  },
+  {
+    id: 'browserbase',
+    name: 'Browserbase',
+    where: 'Cloud',
+    about: 'Deprecated compatibility backend. Existing browserbase.* tools keep working.',
+    enable: 'BROWSER_BACKEND=browserbase, BROWSERBASE_MODE=live, BROWSERBASE_API_KEY',
+  },
+];
+
+function BrowserBackendsSection({
+  providers,
+  tools,
+}: {
+  providers: ReturnType<
+    typeof useAsync<{ providers: ProviderStatus[]; bindings: Record<Capability, ProviderId> }>
+  >;
+  tools: ReturnType<typeof useAsync<{ tools: ToolCatalogEntry[] }>>;
+}) {
+  const statusOf = (id: ProviderId) => providers.data?.providers.find((p) => p.id === id);
+  const preferred = providers.data?.bindings.browser;
+  const localRoute = providers.data?.bindings['browser.local'];
+  return (
+    <section className="surface-section" aria-labelledby="browser-backends-heading">
+      <header>
+        <h2 id="browser-backends-heading">Browser backends</h2>
+        <button
+          className="icon-button"
+          aria-label="Refresh browser backends"
+          onClick={() => {
+            providers.reload();
+            tools.reload();
+          }}
+        >
+          <Icon name="replay" size={15} />
+        </button>
+      </header>
+      <div>
+        {providers.loading ? (
+          <p className="inline-note">Loading browser backends…</p>
+        ) : providers.error ? (
+          <LoadError error={providers.error} onRetry={providers.reload} />
+        ) : (
+          <>
+            <p className="inline-note">
+              New browser sessions use{' '}
+              <strong>
+                {BROWSER_BACKENDS.find((backend) => backend.id === preferred)?.name ?? 'no backend'}
+              </strong>
+              . Each backend's own tools (browserless.*, localbrowser.*) stay pinned to it. The
+              backend is chosen in the API&apos;s .env and takes effect after a restart.
+            </p>
+            <div className="tool-sources-grid">
+              {BROWSER_BACKENDS.map((backend) => {
+                const status = statusOf(backend.id);
+                const backendTools = (tools.data?.tools ?? []).filter(
+                  (tool) => tool.providerId === backend.id,
+                );
+                const usable = backendTools.filter((tool) => tool.availability === 'available');
+                return (
+                  <div className="tool-source-card" key={backend.id}>
+                    <div className="tool-source-heading">
+                      <h3>{backend.name}</h3>
+                      {status ? modeChip(status.mode) : <Chip tone="neutral">unknown</Chip>}
+                    </div>
+                    <p className="tool-source-detail">{backend.about}</p>
+                    <ul className="tool-source-list">
+                      <li>
+                        <span>Runs on</span>
+                        <span>{backend.where}</span>
+                      </li>
+                      <li>
+                        <span>New sessions</span>
+                        {preferred === backend.id ? (
+                          <Chip tone="good">default</Chip>
+                        ) : (
+                          <Chip tone="neutral">not default</Chip>
+                        )}
+                      </li>
+                      {localRoute === backend.id && (
+                        <li>
+                          <span>Local-only work</span>
+                          <Chip tone="good">used</Chip>
+                        </li>
+                      )}
+                      <li>
+                        <span>Health</span>
+                        {status ? healthChip(status.healthy) : <Chip tone="neutral">unknown</Chip>}
+                      </li>
+                      <li>
+                        <span>Tools</span>
+                        <span>
+                          {tools.loading
+                            ? '…'
+                            : usable.length.toString() +
+                              ' of ' +
+                              backendTools.length.toString() +
+                              ' usable' +
+                              (status?.mode === 'mock' && usable.length > 0 ? ' (simulated)' : '')}
+                        </span>
+                      </li>
+                    </ul>
+                    {status?.detail && <p className="inline-note">{status.detail}</p>}
+                    {status?.mode !== 'live' && (
+                      <p className="inline-note">
+                        To use it live, set <code>{backend.enable}</code>.
+                      </p>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          </>
         )}
       </div>
     </section>
@@ -542,7 +706,10 @@ function ToolInventorySection({
                 {group.map((tool) => (
                   <li key={tool.name}>
                     <span>{tool.name}</span>
-                    {availabilityChip(tool.availability)}
+                    <span>
+                      {tool.executionMode === 'mock' && <Chip tone="warn">simulated</Chip>}{' '}
+                      {availabilityChip(tool.availability)}
+                    </span>
                   </li>
                 ))}
               </ul>

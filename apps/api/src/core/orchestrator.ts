@@ -10,6 +10,7 @@
 import type {
   Capability,
   CapabilityMap,
+  CompiledNodeDecision,
   CompletionDecision,
   DataLabel,
   DecisionState,
@@ -29,12 +30,14 @@ import { newId, nowIso } from '../lib/ids.js';
 import { ApprovalRejectedError, waitForApproval } from './approvalGate.js';
 import type { RunBus } from './bus.js';
 import { buildEgressEvent } from './ledger.js';
-import { clearPause, pauseRun, waitWhilePaused } from './pauseGate.js';
+import { clearPause, waitWhilePaused } from './pauseGate.js';
 import { detectPii } from './redaction.js';
 import { classify } from './risk.js';
 import type { DecisionService } from './decisions/service.js';
 import type { SessionStateService } from './sessions/service.js';
 import type { ToolRegistry } from './tools/registry.js';
+import { eligibleTaskTools, mockTwinsOfLiveTools } from './tools/taskEligibility.js';
+import { toolVersions, usableAgentRoute } from './graph/compile.js';
 import { fanOut, type FanOutOutcome } from './swarm.js';
 import { getPlaybook } from './playbooks/registry.js';
 import type {
@@ -67,6 +70,7 @@ export interface OrchestratorDeps {
   provider: <C extends Capability>(capability: C) => CapabilityMap[C];
   /** Reads the registry's live BINDINGS, so a re-point is reflected everywhere. */
   providerFor: (capability: Capability) => ProviderId;
+  browserForSession?: (sessionId: string, runId: string) => import('@htn/shared').BrowserAdapter;
   decisionService: DecisionService;
   sessionStateService: SessionStateService;
   toolRegistry?: ToolRegistry;
@@ -77,6 +81,7 @@ export interface OrchestratorDeps {
       toolId: string;
       arguments: Json;
       signal?: AbortSignal;
+      forceApproval?: boolean;
     }): Promise<{ output: Json; summary: string; dataLabels?: DataLabel[] }>;
   };
   toolDiscovery?: {
@@ -89,9 +94,26 @@ export interface OrchestratorDeps {
   };
   /** Cached/local catalog sources, including user-configured MCP servers. */
   localToolCandidates?: () => Promise<string[]>;
+  /** Keep a graph-level Jev decision a run had to make, so the next run reuses it. */
+  recordCompiledDecision?: (
+    graphId: string,
+    nodeId: string,
+    entry: CompiledNodeDecision,
+  ) => Promise<void>;
   /** Release resources only after the run and all its graph branches have settled. */
   releaseRunResources?: (input: { runId: string; stepId: string }) => Promise<void>;
+  /**
+   * Cost ceilings applied to every agent task at run time. A node asking for
+   * more time is clamped (and the clamp logged) instead of being rejected, so
+   * saved graphs keep running. Absent means no ceiling. `networkRetries` is how
+   * many times an agent the run could not reach is started again (default 2);
+   * it is the ONLY way an agent task runs Hermes more than once.
+   */
+  agentCeilings?: { maxDurationMs: number; networkRetries?: number };
 }
+
+/** Retries for an unreachable agent when no ceiling says otherwise. */
+const DEFAULT_AGENT_NETWORK_RETRIES = 2;
 
 import { KeyedLock } from './locks.js';
 
@@ -154,6 +176,18 @@ export class Orchestrator {
     } catch (err) {
       await this.finishWithError(run.id, err as Error, controller.signal.aborted);
     } finally {
+      // Expire suspended handoff/approval work when its enclosing run ends.
+      // A late decision must never revive a timed-out run.
+      controller.abort();
+      for (const approval of await store.listApprovals(run.id))
+        if (approval.status === 'pending') {
+          const expired = await store.patchApproval(approval.id, {
+            status: 'expired',
+            decidedAt: nowIso(),
+            note: 'Run ended before this approval was resolved.',
+          });
+          await bus.emit(run.id, { type: 'approval.resolved', approval: expired });
+        }
       // Contexts and mutable browser resources belong to the run, not an agent node.
       const finalRun = await store.getRun(run.id);
       for (const session of await store.listSessionStates(run.id)) {
@@ -436,6 +470,9 @@ export class Orchestrator {
 
       provider,
       providerFor,
+      browserForSession: this.deps.browserForSession
+        ? (sessionId) => this.deps.browserForSession!(sessionId, runId)
+        : undefined,
 
       redact: async (text: string, field: string): Promise<RedactionOutput> => {
         const { redacted, spans } = detectPii(text, piiCounter);
@@ -477,15 +514,18 @@ export class Orchestrator {
         return candidates.filter((id) => executable.has(id));
       },
 
-      callBrokeredTool: async ({ stepId, toolId, args, dataLabels }) => {
+      callBrokeredTool: async ({ stepId, toolId, args, dataLabels, forceApproval }) => {
         const broker = this.deps.toolBroker;
         const registry = this.deps.toolRegistry;
         if (!broker || !registry) return null;
 
         const [descriptor] = await registry.resolve([toolId]);
-        // Unknown to the registry is not a broker problem -- let the caller
-        // fall back to the provider catalog, which owns its own names.
-        if (!descriptor) return null;
+        if (!descriptor)
+          throw new Error(
+            'TOOL_NOT_REGISTERED: ' +
+              toolId +
+              '. Discover and register the provider tool before execution.',
+          );
 
         // A short-lived session state whose ONLY purpose is to carry the
         // author's pinned choice as a grant the broker can verify. One tool,
@@ -523,6 +563,7 @@ export class Orchestrator {
             toolId: descriptor.id,
             arguments: args as Json,
             signal,
+            forceApproval,
           });
           return { output: result.output, summary: result.summary, dataLabels: result.dataLabels };
         } finally {
@@ -572,6 +613,10 @@ export class Orchestrator {
 
       judgeCompletion: judgeCheckpoint,
 
+      recordCompiledDecision: async (graphId, nodeId, entry) => {
+        await this.deps.recordCompiledDecision?.(graphId, nodeId, entry).catch(() => undefined);
+      },
+
       runAgentTask: async (spec: AgentTaskSpec): Promise<AgentTaskResult> => {
         const step = await createStep({
           label: spec.label,
@@ -589,11 +634,33 @@ export class Orchestrator {
         // (~8s) default was sized for the mock and would cancel a real,
         // healthy call almost immediately.
         const pollIntervalMs = spec.pollIntervalMs ?? 1500;
-        const maxPolls = spec.maxPolls ?? 40;
-        const maxTurns = spec.maxTurns ?? 3;
-        // Both undefined by default -- no wall-clock or failure ceiling beyond
-        // maxPolls/maxTurns unless the graph author opts in.
-        const maxDurationMs = spec.maxDurationMs;
+        const ceilings = this.deps.agentCeilings;
+        // A node's time budget, clamped to the run-wide cost ceiling. Clamped
+        // rather than rejected so saved graphs keep running. `spec.maxTurns` is
+        // accepted for saved graphs and ignored: an agent task is one Hermes run.
+        const maxDurationMs =
+          ceilings && (spec.maxDurationMs ?? Infinity) > ceilings.maxDurationMs
+            ? ceilings.maxDurationMs
+            : spec.maxDurationMs;
+        if (ceilings && (spec.maxDurationMs ?? 0) > (maxDurationMs ?? 0)) {
+          await ctx.log(
+            'info',
+            'Agent task "' +
+              spec.label +
+              '" time budget clamped to the cost ceiling: ' +
+              Math.round((maxDurationMs ?? 0) / 1000).toString() +
+              's (node asked for ' +
+              Math.round((spec.maxDurationMs ?? 0) / 1000).toString() +
+              's).',
+          );
+        }
+        const networkRetries = ceilings?.networkRetries ?? DEFAULT_AGENT_NETWORK_RETRIES;
+        // An explicit wall-clock budget sizes the per-turn poll budget too.
+        // Otherwise the fixed 60s default cut a healthy multi-tool research
+        // turn off at ~61s of a 600s maxDurationMs (observed live).
+        const maxPolls =
+          spec.maxPolls ??
+          (maxDurationMs !== undefined ? Math.ceil(maxDurationMs / pollIntervalMs) : 40);
         const maxFailedToolCalls = spec.maxFailedToolCalls;
         const startedAt = Date.now();
         let sessionStateId: string | undefined;
@@ -650,9 +717,17 @@ export class Orchestrator {
             sanitizedForRemote: Boolean(sanitizedTask) && !remoteForbidden,
           };
 
+          const allToolsBaseline = spec.routing === 'all_tools_frontier';
           const discoveredIds: string[] = [];
           if (this.deps.localToolCandidates) {
             discoveredIds.push(...(await this.deps.localToolCandidates()));
+          }
+          if (allToolsBaseline && this.deps.toolRegistry) {
+            // The baseline arm starts from EVERY registered tool; eligibility
+            // below still drops what this task's labels may not use.
+            discoveredIds.push(
+              ...(await this.deps.toolRegistry.list()).map((tool) => tool.descriptor.id),
+            );
           }
           if (
             this.deps.toolDiscovery &&
@@ -683,6 +758,8 @@ export class Orchestrator {
           // Resolve all candidates through the trusted registry, then use Jev's
           // typed family/tool decisions before Hermes can start its inner loop.
           let availableTools = [...new Set([...spec.availableTools, ...discoveredIds])];
+          // Exact candidate set (id -> version) a frozen route must match.
+          let candidateVersions: Record<string, string> | undefined;
           if (ceiling !== undefined)
             availableTools = availableTools.filter((id) => ceiling.includes(id));
           if (this.deps.toolRegistry) {
@@ -716,7 +793,9 @@ export class Orchestrator {
               );
             }
 
-            const descriptors = eligibleTaskTools(resolved, decisionState);
+            const eligible = eligibleTaskTools(resolved, decisionState);
+            const mockTwins = mockTwinsOfLiveTools(eligible);
+            const descriptors = eligible.filter((descriptor) => !mockTwins.includes(descriptor));
 
             // Report WHY each tool was dropped, separately. Lumping these
             // together sends you hunting the wrong cause: the first time this
@@ -731,8 +810,19 @@ export class Orchestrator {
             const mislabelled = resolved.filter(
               (descriptor) =>
                 !unavailable.includes(descriptor) &&
-                !descriptors.some((kept) => kept.id === descriptor.id),
+                !eligible.some((kept) => kept.id === descriptor.id),
             );
+            if (mockTwins.length > 0) {
+              await ctx.log(
+                'info',
+                'Subtask "' +
+                  spec.label +
+                  '" left out ' +
+                  mockTwins.length +
+                  ' mocked duplicate(s) of live tools: ' +
+                  mockTwins.map((descriptor) => descriptor.id).join(', '),
+              );
+            }
             if (unavailable.length > 0) {
               await ctx.log(
                 'warn',
@@ -771,6 +861,7 @@ export class Orchestrator {
             }
 
             availableTools = descriptors.map((descriptor) => descriptor.id);
+            candidateVersions = toolVersions(descriptors);
           }
 
           // Jev makes the one task-level capability decision. Its exposedTools
@@ -778,7 +869,7 @@ export class Orchestrator {
           // The model gateway may narrow a single turn, but can never widen it.
           const decider = provider('decision');
           const routeCacheKey =
-            decisionState.sanitizedForRemote && availableTools.length > 0
+            !allToolsBaseline && decisionState.sanitizedForRemote && availableTools.length > 0
               ? JSON.stringify({
                   task: decisionState.taskSummary,
                   labels: decisionState.dataLabels,
@@ -787,15 +878,92 @@ export class Orchestrator {
                 })
               : undefined;
           const cachedRoute = routeCacheKey ? this.getCachedTaskRoute(routeCacheKey) : undefined;
-          const routed = cachedRoute
-            ? { ok: true as const, data: cachedRoute }
-            : decider.mode !== 'live' || decisionState.sanitizedForRemote
-              ? await decider.route(
-                  { task: decisionState.taskSummary, availableTools },
-                  buildCallContext({ stepId: step.id, policyRule: 'subtask-routing' }),
-                )
-              : null;
-          if (routeCacheKey && routed?.ok) this.cacheTaskRoute(routeCacheKey, routed.data);
+          // A route frozen when the graph was saved replaces the Jev call, and
+          // only where that call would have happened: never for the baseline
+          // arm, never for state the live decider may not see.
+          const mayAskDecider = decider.mode !== 'live' || decisionState.sanitizedForRemote;
+          const frozenRoute =
+            !allToolsBaseline && mayAskDecider && spec.compiledRoute && candidateVersions
+              ? usableAgentRoute(spec.compiledRoute.entry, {
+                  nodeHash: spec.compiledRoute.nodeHash,
+                  decisionMode: decider.mode,
+                  tools: candidateVersions,
+                })
+              : undefined;
+          // The all-tools baseline deliberately skips Jev: it IS the "no
+          // routing" arm. This is an explicit opt-in, not a failure path, so
+          // the fail-closed rule below (failure never exposes all tools) is
+          // untouched.
+          const routed = allToolsBaseline
+            ? {
+                ok: true as const,
+                data: {
+                  privacy: decisionState.sanitizedForRemote
+                    ? ('cloud' as const)
+                    : ('private' as const),
+                  intelligence: 'high' as const,
+                  privacyConfidence: 1,
+                  intelligenceConfidence: 1,
+                  modelTier: 'frontier' as const,
+                  exposedTools: availableTools,
+                  confidence: 1,
+                  rationale: 'Baseline arm: every eligible tool exposed, frontier model, no Jev.',
+                },
+              }
+            : frozenRoute
+              ? { ok: true as const, data: frozenRoute }
+              : cachedRoute
+                ? { ok: true as const, data: cachedRoute }
+                : mayAskDecider
+                  ? await decider.route(
+                      { task: decisionState.taskSummary, availableTools },
+                      buildCallContext({ stepId: step.id, policyRule: 'subtask-routing' }),
+                    )
+                  : null;
+          if (routeCacheKey && routed?.ok && !frozenRoute)
+            this.cacheTaskRoute(routeCacheKey, routed.data);
+          // No usable frozen route: keep what Jev decided for the next run.
+          if (
+            routed?.ok &&
+            !frozenRoute &&
+            !allToolsBaseline &&
+            spec.compiledRoute &&
+            spec.nodeId &&
+            candidateVersions &&
+            this.deps.recordCompiledDecision
+          ) {
+            await this.deps
+              .recordCompiledDecision(spec.compiledRoute.graphId, spec.nodeId, {
+                kind: 'agent_route',
+                nodeHash: spec.compiledRoute.nodeHash,
+                decisionMode: decider.mode,
+                tools: candidateVersions,
+                privacy: routed.data.privacy,
+                intelligence: routed.data.intelligence,
+                privacyConfidence: routed.data.privacyConfidence,
+                intelligenceConfidence: routed.data.intelligenceConfidence,
+                modelTier: routed.data.modelTier,
+                exposedTools: routed.data.exposedTools.filter((id) => availableTools.includes(id)),
+                confidence: routed.data.confidence,
+                ...(routed.data.rationale ? { rationale: routed.data.rationale } : {}),
+                source: 'run',
+                at: nowIso(),
+              })
+              .catch(() => undefined);
+          }
+          if (routed && !routed.ok && availableTools.length > 0) {
+            // Without this the run just shows an agent that never calls a
+            // tool; the reason (e.g. a Jev AUTH failure) was invisible.
+            await ctx.log(
+              'warn',
+              'Subtask "' +
+                spec.label +
+                '" runs with NO tools: Jev routing failed (' +
+                routed.error.code +
+                '): ' +
+                routed.error.message,
+            );
+          }
 
           // FAIL CLOSED, not open — docs/agentos-design.md is explicit:
           // "Routing... failures fail closed; failure never exposes all
@@ -842,7 +1010,13 @@ export class Orchestrator {
               : routeResult.exposedTools,
             confidence: routeResult.confidence,
             escalated: false,
-            rule: routed?.ok ? 'jev-routed' : 'route-failed-safe-local',
+            rule: allToolsBaseline
+              ? 'baseline-all-tools-frontier'
+              : frozenRoute
+                ? 'compiled-graph-route'
+                : routed?.ok
+                  ? 'jev-routed'
+                  : 'route-failed-safe-local',
             at: nowIso(),
           };
           await store.createScheduleDecision(decision);
@@ -860,12 +1034,15 @@ export class Orchestrator {
               spec.sanitizedGoal ??
               (labels.every((label) => label === 'public') ? spec.goal : undefined),
             dataLabels: labels,
-            budget: { stepsRemaining: maxTurns },
+            budget: { stepsRemaining: 1 },
             candidateToolIds: availableTools,
             taskToolIds: decision.exposedTools,
             toolCeiling: ceiling,
             boundBrowserSessionId,
             contextScopeId: spec.contextScope?.id,
+            ...(allToolsBaseline ? { pinnedCostTier: 'frontier' as const } : {}),
+            // The frozen route's tier picks the model without a per-task Jev call.
+            ...(frozenRoute ? { preferredModelTier: frozenRoute.modelTier } : {}),
           };
           const sessionState = priorState
             ? await sessionStateService.patch(priorState.id, {
@@ -885,66 +1062,96 @@ export class Orchestrator {
           ]);
           const begun = await sessionStateService.beginTurn(sessionState.id);
 
-          // 3. Start the task with ONLY the tools Jev exposed.
+          // 3. Run the agent ONCE, with only the tools Jev exposed.
+          //
+          // An agent task is a single Hermes run. Its result goes to Jev's
+          // completion judge, the verdict is recorded, and the graph moves on
+          // whatever the verdict is: AgentOS never re-prompts the agent for
+          // another turn. Re-prompting on `continue`, on a low-confidence `done`
+          // and after a `blocked` pause is what kept restarting research that had
+          // already finished. The one exception is a run that never happened --
+          // the agent or its model could not be reached -- which is started
+          // again, at most `networkRetries` times.
           const runtime = provider('agent.runtime');
-          const started = previous
-            ? await runtime.continueTask(
+          const requiresToolAction = requiresExternalAction(spec.goal);
+          // Human time -- an approval under review, a pause -- is not harness
+          // execution time, so it never counts against maxDurationMs. Counting
+          // it made maxDurationMs an unannounced approval timeout: a run whose
+          // click waited five minutes for review failed as "did not reach
+          // verified completion" the moment the budget ran out.
+          let humanWaitMs = 0;
+          const holdForHuman = async () => {
+            const heldAt = Date.now();
+            await this.holdWhilePaused(runId, signal);
+            humanWaitMs += Date.now() - heldAt;
+          };
+
+          const launch = async (): Promise<{ taskId: string } | { unreachable: string }> => {
+            if (previous) {
+              const continued = await runtime.continueTask(
                 previous.taskId,
                 { instruction: spec.goal, context: spec.context },
                 buildCallContext({ stepId: step.id, policyRule: 'graph-context-continuation' }),
-              )
-            : await runtime.startTask(
-                { goal: spec.goal, context: spec.context, tools: decision.exposedTools },
-                {
-                  ...buildCallContext({ stepId: step.id, policyRule: 'jev-filtered-toolset' }),
-                  sessionStateId: sessionState.id,
-                  gatewayCredentials: sessionStateService.issueGatewayCredentials(sessionState.id),
-                },
               );
-          if (!started.ok) throw new Error('Failed to start agent task: ' + started.error.message);
-          const taskId = previous?.taskId ?? (started.data as { taskId: string }).taskId;
-          activeTaskId = taskId;
-          await sessionStateService.bindHarnessSession(sessionState.id, taskId);
-          if (spec.contextScope)
-            contextScopes.set(spec.contextScope.id, { sessionStateId: sessionState.id, taskId });
+              return continued.ok
+                ? { taskId: previous.taskId }
+                : { unreachable: 'could not continue the agent: ' + continued.error.message };
+            }
+            const started = await runtime.startTask(
+              { goal: spec.goal, context: spec.context, tools: decision.exposedTools },
+              {
+                ...buildCallContext({ stepId: step.id, policyRule: 'jev-filtered-toolset' }),
+                sessionStateId: sessionState.id,
+                gatewayCredentials: sessionStateService.issueGatewayCredentials(sessionState.id),
+              },
+            );
+            return started.ok
+              ? { taskId: started.data.taskId }
+              : { unreachable: 'could not start the agent: ' + started.error.message };
+          };
 
-          await bus.emit(runId, {
-            type: 'harness.turn',
-            turn: {
-              id: newId('turn'),
-              runId,
-              sessionId: taskId,
-              turnId: taskId + ':' + begun.turn,
-              phase: 'started',
-              at: nowIso(),
-            },
-          });
+          /**
+           * The error that ended a run whose LAST model call failed for a
+           * network reason. Hermes retries a failed call itself and, once it
+           * gives up, ends the run with the error as its "answer"; that run
+           * never got to work, so it is unreachable rather than finished.
+           */
+          const unreachableModel = async (sinceSeq: number): Promise<string | undefined> => {
+            const calls = (await store.eventsSince(runId, sinceSeq)).flatMap(({ event }) =>
+              event.type === 'model.lifecycle' &&
+              event.lifecycle.stepId === step.id &&
+              event.lifecycle.phase !== 'requested'
+                ? [event.lifecycle]
+                : [],
+            );
+            const last = calls.at(-1);
+            const message = last?.phase === 'failed' ? (last.error?.message ?? '') : '';
+            return isNetworkFailure(message) ? message : undefined;
+          };
 
-          // 4. AgentOS owns the bounded outer loop. Hermes owns each inner turn.
-          let toolCalls: { tool: string; args?: unknown; at: string }[] = [];
-          let finalResult: unknown = null;
-          let completed = false;
-          let completionDecision: CompletionDecision | null = null;
-          const requiresToolAction = requiresExternalAction(spec.goal);
-
-          for (let turn = 1; turn <= maxTurns; turn += 1) {
-            // Second pause checkpoint. An agent task is one `ctx.step`, so
-            // without this a paused run would still burn its whole turn budget
-            // before noticing.
-            await this.holdWhilePaused(runId, signal);
-
-            let turnCompleted = false;
-            let turnToolCalls: { tool: string; args?: unknown; at: string }[] = [];
+          /** Poll one Hermes run until it answers, is stopped by a budget, or proves unreachable. */
+          const awaitRun = async (taskId: string, sinceSeq: number): Promise<AgentRunOutcome> => {
             let pollAttempts = 0;
+            let partial: unknown;
+            let partialToolCalls: AgentToolCall[] = [];
+            const stopped = (endedBy: AgentRunEnd): AgentRunOutcome => ({
+              kind: 'stopped',
+              endedBy,
+              result: partial ?? null,
+              toolCalls: partialToolCalls,
+            });
             while (pollAttempts < maxPolls) {
               if (signal.aborted) throw new Error('Run aborted while awaiting agent task');
 
-              if (maxDurationMs !== undefined && Date.now() - startedAt >= maxDurationMs) {
+              if (
+                maxDurationMs !== undefined &&
+                Date.now() - startedAt - humanWaitMs >= maxDurationMs
+              ) {
                 await ctx.log(
                   'warn',
-                  'Agent task ' + taskId + ' hit its maxDurationMs budget; stopping.',
+                  'Agent task ' + taskId + ' hit its maxDurationMs budget; stopping it.',
                 );
-                break;
+                return stopped('duration-budget');
               }
               if (maxFailedToolCalls !== undefined) {
                 const failedCount = (await store.eventsSince(runId, 0)).filter(
@@ -956,9 +1163,11 @@ export class Orchestrator {
                 if (failedCount > maxFailedToolCalls) {
                   await ctx.log(
                     'warn',
-                    'Agent task ' + taskId + ' exceeded its maxFailedToolCalls budget; stopping.',
+                    'Agent task ' +
+                      taskId +
+                      ' exceeded its maxFailedToolCalls budget; stopping it.',
                   );
-                  break;
+                  return stopped('failed-tool-budget');
                 }
               }
 
@@ -966,194 +1175,270 @@ export class Orchestrator {
                 taskId,
                 buildCallContext({ stepId: step.id, policyRule: 'jev-filtered-toolset' }),
               );
-              if (!polled.ok) throw new Error('Agent task polling failed: ' + polled.error.message);
-              if (polled.data.status === 'failed')
-                throw new Error('Agent task ' + taskId + ' failed');
-
-              if (polled.data.status === 'done') {
-                finalResult = polled.data.result ?? null;
-                turnToolCalls = polled.data.toolCalls ?? [];
-                toolCalls.push(...turnToolCalls);
-                turnCompleted = true;
-                break;
+              if (!polled.ok) return { kind: 'unreachable', reason: polled.error.message };
+              if (polled.data.status === 'failed') {
+                return {
+                  kind: 'unreachable',
+                  reason: 'the agent session failed: ' + (polled.data.log?.at(-1) ?? 'no detail'),
+                };
               }
-              const currentRun = await store.getRun(runId);
+              if (polled.data.status === 'done') {
+                const modelFailure = await unreachableModel(sinceSeq);
+                if (modelFailure)
+                  return {
+                    kind: 'unreachable',
+                    reason: 'its model was unreachable: ' + modelFailure,
+                  };
+                return {
+                  kind: 'answered',
+                  endedBy: 'answer',
+                  result: polled.data.result ?? null,
+                  toolCalls: polled.data.toolCalls ?? [],
+                };
+              }
+              if (polled.data.partial !== undefined) partial = polled.data.partial;
+              if (polled.data.toolCalls) partialToolCalls = polled.data.toolCalls;
+
               // Human review time is not harness execution time. Keep polling
               // while the exact action is awaiting approval without consuming
-              // the bounded Hermes poll budget.
-              if (currentRun?.status !== 'awaiting_approval') pollAttempts += 1;
+              // the bounded Hermes poll budget or its wall-clock budget.
+              const awaitingHuman = (await store.getRun(runId))?.status === 'awaiting_approval';
+              if (!awaitingHuman) pollAttempts += 1;
+              const sleptAt = Date.now();
               await sleep(pollIntervalMs);
+              if (awaitingHuman) humanWaitMs += Date.now() - sleptAt;
             }
-
-            if (!turnCompleted) break;
-
-            await bus.emit(runId, {
-              type: 'harness.turn',
-              turn: {
-                id: newId('turn'),
-                runId,
-                sessionId: taskId,
-                turnId: taskId + ':' + (begun.turn + turn - 1),
-                phase: 'quiescent',
-                payload: toJson({ toolCallCount: turnToolCalls.length }),
-                at: nowIso(),
-              },
-            });
-
-            const hasResult = finalResult !== null && finalResult !== undefined;
-            // Harness tool-result messages include provider errors as well as
-            // successes. Only the broker's authoritative lifecycle event proves
-            // that the exact action passed policy, approval, execution, and
-            // verification; never infer success from a role=tool transcript entry.
-            const hasSuccessfulToolResult = (await store.eventsSince(runId, 0)).some(
-              ({ event }) =>
-                event.type === 'tool.lifecycle' &&
-                event.lifecycle.stepId === step.id &&
-                event.lifecycle.phase === 'succeeded',
+            await ctx.log(
+              'warn',
+              'Agent task ' +
+                taskId +
+                ' was still working when its poll budget ran out (' +
+                Math.round((maxPolls * pollIntervalMs) / 1000).toString() +
+                's); stopping it. Raise maxDurationMs or maxPolls on the node.',
             );
-            const verifiedOutcome = hasResult && (!requiresToolAction || hasSuccessfulToolResult);
-            const outstandingRequirements = [
-              ...(!hasResult ? ['agent-result-missing'] : []),
-              ...(requiresToolAction && !hasSuccessfulToolResult
-                ? ['required-tool-action-not-completed']
-                : []),
-            ];
-            const checkpoint: SessionCheckpoint = {
-              runId,
-              objective: spec.goal,
-              sanitizedObjective:
-                spec.sanitizedGoal ??
-                (labels.every((label) => label === 'public') ? spec.goal : undefined),
-              steps: [
-                {
-                  id: step.id + ':turn:' + turn,
-                  label: spec.label + ' turn ' + turn,
-                  status: 'succeeded',
-                  required: true,
-                  sanitizedSummary: hasResult
-                    ? 'Hermes produced a result for the requested objective.'
-                    : 'Harness produced no result.',
-                },
-              ],
-              artifacts: [
-                {
-                  id: step.id + ':result',
-                  kind: 'harness_result',
-                  required: true,
-                  verified: verifiedOutcome,
-                  dataLabels: labels,
-                  sanitizedSummary: verifiedOutcome
-                    ? 'The required harness result and tool action are present and verified.'
-                    : undefined,
-                },
-              ],
-              verifications: [
-                {
-                  id: step.id + ':result-present',
-                  passed: hasResult,
-                  required: true,
-                  reasonCode: hasResult ? 'result-present' : 'result-missing',
-                },
-                ...(requiresToolAction
-                  ? [
-                      {
-                        id: step.id + ':tool-action-completed',
-                        passed: hasSuccessfulToolResult,
-                        required: true,
-                        reasonCode: hasSuccessfulToolResult
-                          ? 'required-tool-action-completed'
-                          : 'required-tool-action-not-completed',
-                      },
-                    ]
-                  : []),
-              ],
-              outstandingRequirements,
-              pendingApprovalIds: [],
-              dataLabels: labels,
-              budget: { stepsRemaining: Math.max(0, maxTurns - turn) },
-              at: nowIso(),
-            };
-            await sessionStateService.checkpoint(sessionState.id, checkpoint);
-            completionDecision = await judgeCheckpoint(checkpoint, step.id);
+            return stopped('poll-budget');
+          };
 
-            if (completionDecision.status === 'done' && completionDecision.verified) {
-              completed = true;
-              retainContext = Boolean(spec.contextScope);
-              await sessionStateService.setStatus(
-                sessionState.id,
-                retainContext ? 'quiescent' : 'completed',
-              );
-              break;
-            }
-            if (completionDecision.status === 'blocked') {
-              // The spec is explicit: `blocked` PAUSES for the user. Failing
-              // the run here instead would throw away a Hermes session that is
-              // still alive and still resumable, and would report a run that is
-              // merely stuck as a run that broke.
-              await sessionStateService.setStatus(sessionState.id, 'blocked');
-              const reason =
-                completionDecision.verificationFailures.join(', ') ||
-                completionDecision.reasonCodes.join(', ') ||
-                'no reason given';
-              await bus.emit(runId, {
-                type: 'log',
-                runId,
-                level: 'warn',
-                message:
-                  'The completion judge returned `blocked` (' +
-                  reason +
-                  '). Pausing for you — resume the run to continue, or cancel it.',
-                at: nowIso(),
-              });
-
-              pauseRun(runId);
-              await this.holdWhilePaused(runId, signal);
-              if (signal.aborted) throw new Error('Run cancelled while blocked: ' + reason);
-
-              // Resumed by a human. Fall through to the continuation below and
-              // spend another bounded turn in the SAME Hermes session.
-              await sessionStateService.setStatus(sessionState.id, 'running');
-            }
-            if (turn < maxTurns) {
-              await sessionStateService.beginTurn(sessionState.id);
-              const continued = await runtime.continueTask(
-                taskId,
-                {
-                  instruction:
-                    'Continue working toward the original objective. You must use an available tool when the objective requests an external action; do not claim completion until the tool succeeds. Resolve every missing verification before stopping.',
-                  context: { previousResultPresent: hasResult },
-                },
-                buildCallContext({ stepId: step.id, policyRule: 'bounded-agent-continuation' }),
-              );
-              if (!continued.ok) {
-                throw new Error('Failed to continue agent task: ' + continued.error.message);
+          let taskId: string | undefined;
+          let attempts = 0;
+          const runAgent = async (): Promise<FinishedAgentRun> => {
+            for (;;) {
+              attempts += 1;
+              // The pause checkpoint. An agent task is one `ctx.step`, so
+              // without this a paused run would still start Hermes.
+              await holdForHuman();
+              if (signal.aborted) throw new Error('Run aborted while awaiting agent task');
+              const turn =
+                attempts === 1
+                  ? begun.turn
+                  : (await sessionStateService.beginTurn(sessionState.id)).turn;
+              const sinceSeq = (await store.eventsSince(runId, 0)).at(-1)?.seq ?? 0;
+              const launched = await launch();
+              let outcome: AgentRunOutcome;
+              if ('taskId' in launched) {
+                taskId = launched.taskId;
+                activeTaskId = taskId;
+                await sessionStateService.bindHarnessSession(sessionState.id, taskId);
+                if (spec.contextScope)
+                  contextScopes.set(spec.contextScope.id, {
+                    sessionStateId: sessionState.id,
+                    taskId,
+                  });
+                await bus.emit(runId, {
+                  type: 'harness.turn',
+                  turn: {
+                    id: newId('turn'),
+                    runId,
+                    sessionId: taskId,
+                    turnId: taskId + ':' + turn,
+                    phase: 'started',
+                    at: nowIso(),
+                  },
+                });
+                outcome = await awaitRun(taskId, sinceSeq);
+              } else {
+                outcome = { kind: 'unreachable', reason: launched.unreachable };
               }
-              await bus.emit(runId, {
-                type: 'harness.turn',
-                turn: {
-                  id: newId('turn'),
-                  runId,
-                  sessionId: taskId,
-                  turnId: taskId + ':' + (begun.turn + turn),
-                  phase: 'started',
-                  at: nowIso(),
-                },
-              });
-            }
-          }
+              if (outcome.kind !== 'unreachable') return outcome;
 
-          if (!completed || !completionDecision) {
-            await sessionStateService.setStatus(sessionState.id, 'blocked');
+              if (attempts > networkRetries) {
+                throw new Error(
+                  'Agent task "' +
+                    spec.label +
+                    '" could not reach its agent after ' +
+                    attempts.toString() +
+                    ' attempt(s): ' +
+                    outcome.reason,
+                );
+              }
+              await ctx.log(
+                'warn',
+                'Agent task "' +
+                  spec.label +
+                  '" could not reach its agent (' +
+                  outcome.reason +
+                  '). Starting it again, retry ' +
+                  attempts.toString() +
+                  ' of ' +
+                  networkRetries.toString() +
+                  ': the only case in which AgentOS runs an agent twice.',
+              );
+              // A fresh run needs the old process gone and its gateway tokens
+              // dead, so nothing still in flight can act inside the new turn.
+              // A shared context is re-prompted in place instead: replacing it
+              // would drop the transcript the scope exists to keep.
+              if (!previous) {
+                if (taskId) {
+                  await runtime
+                    .cancelTask(
+                      taskId,
+                      buildCallContext({
+                        stepId: step.id,
+                        policyRule: 'unreachable-agent-restart',
+                      }),
+                    )
+                    .catch(() => undefined);
+                  activeTaskId = undefined;
+                }
+                sessionStateService.revokeGatewayCredentials(sessionState.id);
+              }
+              await sleep(attempts * 2000);
+            }
+          };
+          const outcome = await runAgent();
+
+          const toolCalls = outcome.toolCalls;
+          const finalResult = outcome.result;
+          if (outcome.kind === 'stopped' && taskId) {
+            // Stop Hermes where it is. What it had said so far is its result.
             await runtime.cancelTask(
               taskId,
-              buildCallContext({ stepId: step.id, policyRule: 'outer-loop-budget-cancel' }),
+              buildCallContext({ stepId: step.id, policyRule: 'agent-budget-stop' }),
             );
-            throw new Error(
-              'Agent task ' + taskId + ' did not reach verified completion within its budget',
+            if (spec.contextScope) contextScopes.delete(spec.contextScope.id);
+          }
+          await bus.emit(runId, {
+            type: 'harness.turn',
+            turn: {
+              id: newId('turn'),
+              runId,
+              sessionId: taskId ?? step.id,
+              turnId: (taskId ?? step.id) + ':' + (begun.turn + attempts - 1).toString(),
+              phase: outcome.kind === 'answered' ? 'quiescent' : 'cancelled',
+              payload: toJson({ toolCallCount: toolCalls.length, endedBy: outcome.endedBy }),
+              at: nowIso(),
+            },
+          });
+
+          // 4. Jev judges the run once. Its verdict is recorded and followed as
+          //    given; whatever it is, the graph continues with this result.
+          const hasResult = harnessResultPresent(finalResult);
+          // Harness tool-result messages include provider errors as well as
+          // successes. Only the broker's authoritative lifecycle event proves
+          // that the exact action passed policy, approval, execution, and
+          // verification; never infer success from a role=tool transcript entry.
+          const successfulToolCalls = (await store.eventsSince(runId, 0)).filter(
+            ({ event }) =>
+              event.type === 'tool.lifecycle' &&
+              event.lifecycle.stepId === step.id &&
+              event.lifecycle.phase === 'succeeded',
+          ).length;
+          const hasSuccessfulToolResult = successfulToolCalls > 0;
+          const verifiedOutcome = hasResult && (!requiresToolAction || hasSuccessfulToolResult);
+          const outstandingRequirements = [
+            ...(!hasResult ? ['agent-result-missing'] : []),
+            ...(requiresToolAction && !hasSuccessfulToolResult
+              ? ['required-tool-action-not-completed']
+              : []),
+          ];
+          const isPublic = labels.every((label) => label === 'public');
+          const checkpoint: SessionCheckpoint = {
+            runId,
+            objective: spec.goal,
+            sanitizedObjective: spec.sanitizedGoal ?? (isPublic ? spec.goal : undefined),
+            steps: [
+              {
+                id: step.id + ':run',
+                label: spec.label,
+                status: outcome.kind === 'answered' ? 'succeeded' : 'failed',
+                required: true,
+                sanitizedSummary: hasResult
+                  ? completionEvidence(finalResult, successfulToolCalls, isPublic)
+                  : outcome.kind === 'answered'
+                    ? 'Harness produced no result.'
+                    : 'Harness was stopped by its ' + outcome.endedBy + ' before it answered.',
+              },
+            ],
+            artifacts: [
+              {
+                id: step.id + ':result',
+                kind: 'harness_result',
+                required: true,
+                verified: verifiedOutcome,
+                dataLabels: labels,
+                sanitizedSummary: verifiedOutcome
+                  ? 'The required harness result and tool action are present and verified.'
+                  : undefined,
+              },
+            ],
+            verifications: [
+              {
+                id: step.id + ':result-present',
+                passed: hasResult,
+                required: true,
+                reasonCode: hasResult ? 'result-present' : 'result-missing',
+              },
+              ...(requiresToolAction
+                ? [
+                    {
+                      id: step.id + ':tool-action-completed',
+                      passed: hasSuccessfulToolResult,
+                      required: true,
+                      reasonCode: hasSuccessfulToolResult
+                        ? 'required-tool-action-completed'
+                        : 'required-tool-action-not-completed',
+                    },
+                  ]
+                : []),
+            ],
+            outstandingRequirements,
+            pendingApprovalIds: [],
+            dataLabels: labels,
+            // No further turns exist, and Jev is told so.
+            budget: { stepsRemaining: 0 },
+            at: nowIso(),
+          };
+          await sessionStateService.checkpoint(sessionState.id, checkpoint);
+          const completionDecision = await judgeCheckpoint(checkpoint, step.id);
+          if (!(completionDecision.status === 'done' && completionDecision.verified)) {
+            const reasons = [
+              ...completionDecision.verificationFailures,
+              ...completionDecision.reasonCodes,
+            ];
+            await ctx.log(
+              completionDecision.status === 'done' ? 'info' : 'warn',
+              'Jev judged agent task "' +
+                spec.label +
+                '" `' +
+                completionDecision.status +
+                '`' +
+                (reasons.length > 0 ? ' (' + [...new Set(reasons)].join(', ') + ')' : '') +
+                '. The agent is not run again; the graph continues with its result.',
             );
           }
 
-          if (!retainContext)
+          // A shared context stays available to the next node in its scope
+          // whatever the verdict, so the rest of the graph can still run.
+          retainContext = Boolean(spec.contextScope) && outcome.kind === 'answered';
+          await sessionStateService.setStatus(
+            sessionState.id,
+            retainContext
+              ? 'quiescent'
+              : completionDecision.status === 'done'
+                ? 'completed'
+                : 'blocked',
+          );
+          if (!retainContext && outcome.kind === 'answered' && taskId)
             await runtime.cancelTask(
               taskId,
               buildCallContext({ stepId: step.id, policyRule: 'completed-session-close' }),
@@ -1181,13 +1466,17 @@ export class Orchestrator {
             await bus.emit(runId, { type: 'egress.logged', egress });
           }
 
+          // `succeeded` means the agent ran and the graph moves on; Jev's verdict
+          // on the result is the `completionDecision` beside it.
           await this.upsertStep(step.id, {
             status: 'succeeded',
             output: toJson({
-              resultPresent: finalResult !== null && finalResult !== undefined,
+              resultPresent: harnessResultPresent(finalResult),
               toolCallCount: toolCalls.length,
               toolCalls,
               completionDecision,
+              endedBy: outcome.endedBy,
+              attempts,
             }),
             endedAt: nowIso(),
           });
@@ -1253,13 +1542,65 @@ export class Orchestrator {
   }
 }
 
-function eligibleTaskTools(descriptors: ToolDescriptor[], state: DecisionState): ToolDescriptor[] {
-  return descriptors.filter(
-    (descriptor) =>
-      descriptor.availability === 'available' &&
-      descriptor.baselineEffect !== 'unknown' &&
-      descriptor.simulated !== true &&
-      state.dataLabels.every((label) => descriptor.allowedDataLabels.includes(label)),
+/** A live Hermes turn that ended on a tool call reports `{ text: '' }`: no answer. */
+function harnessResultPresent(result: unknown): boolean {
+  if (result === null || result === undefined) return false;
+  if (typeof result === 'string') return result.trim().length > 0;
+  if (typeof result === 'object' && 'text' in result && typeof result.text === 'string')
+    return result.text.trim().length > 0;
+  return true;
+}
+
+/**
+ * What the completion judge is told about a finished turn. A bare "Hermes
+ * produced a result" gave Jev nothing to judge, so it guessed `continue` at ~0.5
+ * confidence and the run kept searching. The excerpt only goes out when every
+ * data label is public; otherwise the judge gets size and tool-call counts only.
+ */
+function completionEvidence(result: unknown, toolCalls: number, isPublic: boolean): string {
+  let text: string;
+  if (typeof result === 'string') text = result;
+  else if (
+    result &&
+    typeof result === 'object' &&
+    'text' in result &&
+    typeof result.text === 'string'
+  )
+    text = result.text;
+  else text = JSON.stringify(result) ?? '';
+  const head =
+    'Hermes returned a ' +
+    text.length.toString() +
+    '-character answer after ' +
+    toolCalls.toString() +
+    ' successful tool call(s).';
+  return isPublic && text ? head + ' Answer excerpt: ' + text.slice(0, 1500) : head;
+}
+
+type AgentToolCall = { tool: string; args?: unknown; at: string };
+type AgentRunEnd = 'answer' | 'duration-budget' | 'poll-budget' | 'failed-tool-budget';
+
+/** A Hermes run that happened: it answered, or a budget stopped it. */
+type FinishedAgentRun = {
+  kind: 'answered' | 'stopped';
+  endedBy: AgentRunEnd;
+  /** The final message, or for a stopped run whatever it had said so far. */
+  result: unknown;
+  toolCalls: AgentToolCall[];
+};
+
+/** How one launch ended. Only `unreachable` ever leads to a second run. */
+type AgentRunOutcome = FinishedAgentRun | { kind: 'unreachable'; reason: string };
+
+/**
+ * Transport-level failures: the network, a provider that is down or
+ * overloaded, a connection that closed. These mean the agent never got to
+ * work. A refused request, a bad route or a policy error is NOT one of these,
+ * and retrying it would only repeat it.
+ */
+function isNetworkFailure(message: string): boolean {
+  return /\b(?:ECONN\w+|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|EPIPE|UND_ERR_\w+)\b|socket hang up|fetch failed|network|connection (?:error|closed|reset|refused|lost)|timed out|timeout|overloaded|rate.?limit|too many requests|service unavailable|bad gateway|\b(?:429|500|502|503|504|529)\b/i.test(
+    message,
   );
 }
 

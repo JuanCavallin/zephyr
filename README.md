@@ -8,7 +8,7 @@ to build this beyond the hackathon — see [What's next](#whats-next).
 Agents today are a black box holding your credentials: every step goes to the most
 expensive model, the agent can see every tool you own, your data goes wherever it decides,
 and you find out about the email after it was sent. Zephyr is the opposite bet: an agent
-you can supervise, that gets cheaper and more private *because* of that supervision, not
+you can supervise, that gets cheaper and more private _because_ of that supervision, not
 in spite of it.
 
 Zephyr sits between any agent harness and the world. A tiny, non-generative decision model
@@ -114,41 +114,59 @@ measured on 2026-10-09 with local Chrome.
 | Page snapshot: one in-page script vs per-element Playwright calls | **3.6 s → 19 ms**, 191x faster (lowest 92x)                         |
 | Pre-action target check: 1 call vs 4                              | 19.8 ms → 1.2 ms, 15x faster                                        |
 | Tools handed to the harness per task                              | at most **8**, from a 1,000+ tool catalog                           |
-| Exact-action broker                                               | **13** error codes, every one fails closed                          |
-| Test assertions run in CI                                         | **503** across 19 test files                                        |
+| Exact-action broker                                               | **14** error codes, every one fails closed                          |
+| Test assertions run in CI                                         | **942** across 29 test files                                        |
 
 ## The app
 
-| Route          | What it is                                                                                 |
-| -------------- | ------------------------------------------------------------------------------------------ |
+| Route          | What it is                                                                                                                                                                                 |
+| -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `/`            | Composer, three modes: **Run as agent task** (one supervised `agent` run), **Build a workflow** (chat-to-graph: drafts a graph to review, runs nothing), **Preview** (labelled, synthetic) |
-| `/runs`        | History, live status, launch a playbook directly                                           |
-| `/runs/:id`    | Live trace: decisions, model calls, tool lifecycle, approvals, egress, pause/resume/cancel |
-| `/compare`     | Run vs baseline: tokens, cost, latency                                                     |
-| `/graphs`      | Workflow editor: canvas, per-node tuning, a chat panel that edits the open graph, **Run graph**, **Run + compare to baseline** |
-| `/connections` | Provider mode + health, Composio, generic MCP servers, reviewed tool inventory             |
+| `/runs`        | History, live status, launch a playbook directly                                                                                                                                           |
+| `/runs/:id`    | Live trace: decisions, model calls, tool lifecycle, approvals, egress, pause/resume/cancel                                                                                                 |
+| `/compare`     | Run vs baseline: tokens, cost, latency                                                                                                                                                     |
+| `/graphs`      | Workflow editor: canvas, per-node tuning, a chat panel that edits the open graph, **Run graph**, **Run + compare to baseline**                                                             |
+| `/connections` | Provider mode + health, Composio, generic MCP servers, reviewed tool inventory                                                                                                             |
 
 ## Providers
 
 Playbooks ask for a **capability**, never a vendor; `providers/registry.ts` binds them.
-Every provider has a mock twin. A missing key (or, for Hermes, a checkout path that does not
-exist on this machine) **downgrades live → mock and never crashes**. The UI shows mode and
-health as separate facts: `live` + unhealthy is not ready.
+Every provider has a mock twin, and a keyless checkout boots the mock demo. Legacy
+operator configuration can downgrade unavailable providers to mock; the UI shows the
+effective mode and health separately. User-funded live model/browser calls require the
+user's scoped key and never fall back to the operator's credentials. `live` + unhealthy
+is not ready.
 
-| Provider           | Role                                                                         | Goes live with                                                            |
-| ------------------ | ---------------------------------------------------------------------------- | ------------------------------------------------------------------------- |
-| Jev (TypeSafe AI)  | Every routing / tool / browser-target / completion decision                  | `AI_GATEWAY_API_KEY` (Vercel AI Gateway). [Read this first.](docs/jev.md) |
-| Hermes (Nous)      | Agent harness, subprocess over ACP                                           | `uv` + a `hermes-agent` checkout at `HERMES_CWD`                          |
-| Browserbase        | Cloud browser (Stagehand), swarm workers                                     | `BROWSERBASE_API_KEY`, `BROWSERBASE_PROJECT_ID`                           |
-| Local Chrome       | The private browser route: local-only data never reaches the cloud           | Chrome installed, `LOCALBROWSER_MODE=live`                                |
-| Composio           | 1000+ app tools with delegated OAuth; Gmail send is reviewed as irreversible | `COMPOSIO_API_KEY`, `COMPOSIO_AUTH_CONFIG_ID`                             |
-| Generic MCP        | Any HTTP Streamable MCP server; unknown tools stay unavailable (fail-closed) | add it on `/connections`                                                  |
-| Gemini             | Direct Google cloud route for tool-capable agent turns                       | `GEMINI_API_KEY`                                                           |
-| Ollama             | Local/private model route                                                    | Ollama running                                                            |
-| Anthropic          | Bound `text.model` plus direct tool-capable cloud routes for agent turns     | `ANTHROPIC_API_KEY`                                                       |
-| GPTZero            | Escalate-only check on outbound text written in your name                    | `GPTZERO_API_KEY`                                                         |
+| Provider          | Role                                                                         | Goes live with                                                            |
+| ----------------- | ---------------------------------------------------------------------------- | ------------------------------------------------------------------------- |
+| Jev (TypeSafe AI) | Every routing / tool / browser-target / completion decision                  | `AI_GATEWAY_API_KEY` (Vercel AI Gateway). [Read this first.](docs/jev.md) |
+| Hermes (Nous)     | Agent harness, subprocess over ACP                                           | `uv` + a `hermes-agent` checkout at `HERMES_CWD`                          |
+| Browserbase       | Deprecated compatibility cloud browser; remains the selected default         | `BROWSERBASE_API_KEY`, `BROWSERBASE_PROJECT_ID`                           |
+| Browserless       | Optional remote CDP browser with revocable watch/control viewer              | `BROWSERLESS_API_KEY`, `BROWSERLESS_BASE_URL`, `BROWSERLESS_MODE=live`    |
+| Local Chrome      | The private browser route: local-only data never reaches the cloud           | Chrome installed, `LOCALBROWSER_MODE=live`                                |
+| Composio          | 1000+ app tools with delegated OAuth; Gmail send is reviewed as irreversible | `COMPOSIO_API_KEY`, `COMPOSIO_AUTH_CONFIG_ID`                             |
+| Generic MCP       | Any HTTP Streamable MCP server; unknown tools stay unavailable (fail-closed) | add it on `/connections`                                                  |
+| Gemini            | Direct Google cloud route for tool-capable agent turns                       | `GEMINI_API_KEY`                                                          |
+| Ollama            | Local/private model route                                                    | Ollama running                                                            |
+| Anthropic         | Bound `text.model` plus direct tool-capable cloud routes for agent turns     | `ANTHROPIC_API_KEY`                                                       |
+| GPTZero           | Escalate-only check on outbound text written in your name                    | `GPTZERO_API_KEY`                                                         |
 
 Flip one `<PROVIDER>_MODE=live` at a time and confirm it at `GET /api/providers`.
+
+`BROWSER_BACKEND=browserbase|browserless|localbrowser` chooses new browser sessions after
+an API restart; existing sessions and explicit provider tool IDs keep their backend.
+Browserbase and local Chrome use an authenticated JPEG/input bridge; Browserless uses
+its provider's live viewer. Local Chrome remains the privacy/development path rather
+than the replacement demo default.
+
+The shared Action workspace shows browser handoffs and document/cell/message/tool
+proposals in one place, with approve/revise/reject and separate proposed/actual receipts.
+Connections supports process-memory user keys (`CREDENTIAL_SOURCE=user`); browser
+funding defaults to the existing operator account (`BROWSER_CREDENTIAL_SOURCE=operator`).
+Cloud browsing/search and Composio/OAuth connections remain separate from model billing.
+See the [integration plan](docs/supervised-browser-integration.md) and
+[verification report](docs/supervised-browser-verification.md) for implemented modules,
+rehearsal commands and hosted provider limits.
 
 **Jev cannot generate text.** It returns a choice, a score, or a probability with calibrated
 confidence. If you are writing a prompt for Jev you are using it wrong — it takes `criteria`.

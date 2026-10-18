@@ -151,7 +151,24 @@ SAFETY
 REDACTION
 
 - If a document may contain personal data, put a redact node between loading it
-  and any node that sends content to a model.`.trim();
+  and any node that sends content to a model.
+
+COST AND SCOPE (every model call, tool call and browser page costs money)
+
+- Scope each agent_task to ONE deliverable with a number and a stop rule in the
+  goal: "find 3 black running shoes under $250 with price and product URL; stop as
+  soon as you have 3". Never "research X" open-endedly, never "verify" each
+  item again after it was found, never collect more than the request needs.
+- Budgets for an adaptive task: maxTurns 2-3, maxDurationMs <= 180000,
+  maxFailedToolCalls <= 3. The server clamps anything larger (4 turns, 300s) and
+  caps each turn at about 8 tool calls, after which the agent must report.
+- Do fixed work as fixed nodes: a known search or page read is a tool node, not an
+  agent turn. Use agent_task only for the part whose next step depends on results.
+- Use ONE agent by default. Split into several agent_task or swarm nodes only when
+  the parts are independent (no shared page, no dependence on each other's results)
+  AND running them in parallel is faster without costing more calls overall, e.g.
+  checking N already-known product URLs. Never split a single search into several
+  agents, and never run parallel agents on the same browser session.`.trim();
 
 /**
  * Steering for live-web work, DERIVED from what the catalog actually contains.
@@ -239,7 +256,7 @@ export function buildSynthesisSystemPrompt(
             ? 'Prefer fixed tool/decide steps; use agent_task only if the request truly requires feedback.'
             : modeHint === 'dispatch'
               ? 'Prefer dispatch when one known tool must be selected at runtime; do not add an agent loop just to choose.'
-              : 'Prefer one bounded agent_task for the adaptive observe-reason-act portion, with explicit maxTurns, maxDurationMs, and maxFailedToolCalls.',
+              : 'Prefer one bounded agent_task for the adaptive observe-reason-act portion, with a numbered deliverable, a stop rule, and the budgets from COST AND SCOPE.',
           'This is a planning hint, not a schema exception. The generated graph must still fit the request and validate.',
           '',
         ]

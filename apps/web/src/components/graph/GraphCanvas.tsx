@@ -43,7 +43,8 @@ import {
   type StepStatus,
 } from '@htn/shared';
 import { NodeCard, type NodeCardData } from './NodeCard';
-import { BrowserPanel, type PanelSession } from './BrowserPanel';
+import type { PanelSession } from './BrowserPanel';
+import { ActionWorkspace } from '../actions/ActionWorkspace';
 import { EXECUTOR_CLASSES } from './palette';
 
 const NODE_TYPES = { agentNode: NodeCard };
@@ -351,7 +352,8 @@ export function GraphCanvas({
       {/* Docked, not modal: the graph dims but stays on screen, so you never
           lose track of WHICH node this browser belongs to. See BrowserPanel. */}
       {openSession && (
-        <BrowserPanel
+        <ActionWorkspace
+          key={openSession.sessionId}
           session={openSession}
           steps={(steps ?? []).filter((step) => step.nodeId === openSession.nodeId)}
           {...(handoffBySession.get(openSession.sessionId)

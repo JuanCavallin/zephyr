@@ -138,6 +138,7 @@ function fixture() {
     },
     async callBrokeredTool({ toolId, args }) {
       calls.push({ toolId, args });
+      if(toolId==='browserbase.open') {opened+=1;return {output:{sessionId:'new_session'},summary:'Test browser opened.'};}
       return {
         output: results.get(toolId) ?? { text: 'page result' },
         summary: 'Test tool completed.',
@@ -164,6 +165,7 @@ function fixture() {
     provider: ((capability: string) => {
       if (capability === 'browser')
         return {
+          id:'browserbase',
           async openSession() {
             opened += 1;
             return { ok: true, data: { sessionId: 'new_session' }, meta };

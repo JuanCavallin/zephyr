@@ -12,7 +12,7 @@ export interface EgressInput {
   id: string;
   runId: string;
   stepId?: string;
-  providerId: ProviderId;
+  providerId: ProviderId | 'tavily';
   op: string;
   destination: string | null;
   dataSpans?: { placeholder: string; type: string }[];
@@ -23,6 +23,9 @@ export interface EgressInput {
   tokensIn?: number;
   tokensOut?: number;
   estimatedCostCents?: number;
+  model?: string;
+  cacheReadTokens?: number;
+  cacheWriteTokens?: number;
 }
 
 export function buildEgressEvent(input: EgressInput, at: string): EgressEvent {
@@ -42,6 +45,9 @@ export function buildEgressEvent(input: EgressInput, at: string): EgressEvent {
     tokensIn: input.tokensIn,
     tokensOut: input.tokensOut,
     estimatedCostCents: input.estimatedCostCents,
+    ...(input.model ? { model: input.model } : {}),
+    ...(input.cacheReadTokens ? { cacheReadTokens: input.cacheReadTokens } : {}),
+    ...(input.cacheWriteTokens ? { cacheWriteTokens: input.cacheWriteTokens } : {}),
   };
 }
 

@@ -7,6 +7,7 @@ import {
   buildTrace,
   previewTrace,
   PREVIEW_LIMIT,
+  providerLabel,
   SCENARIOS,
   type RouteOption,
   type RouteOverrides,
@@ -14,6 +15,7 @@ import {
   type Trace,
 } from '../lib/workspace';
 import { useRunStream } from '../hooks/useRunStream';
+import { DebugLog } from '../components/graph/DebugLog';
 import { useRunGraph } from '../hooks/useGraph';
 import { useTools } from '../hooks/useTools';
 import { useHarness } from '../components/layout/AppShell';
@@ -28,6 +30,8 @@ import { ApprovalPanel } from '../components/approvals/ApprovalPanel';
 import { handoffSessionIdFor } from '../lib/handoff';
 import { EgressLedger } from '../components/egress/EgressLedger';
 import { Icon, Mark } from '../components/ui/Icon';
+import { ActionWorkspace } from '../components/actions/ActionWorkspace';
+import { actionStatus, groupActions } from '../lib/actions';
 
 function WorkingStatus({ children, active = true }: { children: ReactNode; active?: boolean }) {
   return (
@@ -118,6 +122,8 @@ function WorkspaceShell({
   override,
   onOverride,
   metrics,
+  actionWorkspace,
+  debugLog,
 }: {
   trace: Trace;
   selected?: string;
@@ -131,8 +137,11 @@ function WorkspaceShell({
   override?: RouteOption;
   onOverride?: (nodeId: string, route: RouteOption) => void;
   metrics: ReactNode;
+  actionWorkspace?: ReactNode;
+  /** Rendered beneath the graph, inside the same pane. */
+  debugLog?: ReactNode;
 }) {
-  const open = !!selected && trace.nodes.some((node) => node.id === selected);
+  const open = !actionWorkspace && !!selected && trace.nodes.some((node) => node.id === selected);
   // Either pane can be given the whole width. Only one can be collapsed at a time, so
   // hiding one always reveals the other rather than leaving an empty workspace.
   const [view, setView] = useState<'split' | 'chat' | 'graph'>('split');
@@ -235,15 +244,19 @@ function WorkspaceShell({
         </button>
       </div>
       <div className="route-map-region" aria-hidden={!graphOpen} inert={!graphOpen || undefined}>
-        {trace.nodes.length ? (
-          <DecisionCanvas trace={trace} selected={selected} onSelect={onSelect} paused={paused} />
-        ) : (
-          <div className="graph-skeleton">
-            <Icon name="graph" size={30} />
-            <span>Waiting for the first recorded step</span>
-            <small>Planned nodes appear here as soon as a workflow is prepared.</small>
-          </div>
-        )}
+        <div className="route-map-main">
+          {trace.nodes.length ? (
+            <DecisionCanvas trace={trace} selected={selected} onSelect={onSelect} paused={paused} />
+          ) : (
+            <div className="graph-skeleton">
+              <Icon name="graph" size={30} />
+              <span>Waiting for the first recorded step</span>
+              <small>Planned nodes appear here as soon as a workflow is prepared.</small>
+            </div>
+          )}
+          {actionWorkspace}
+        </div>
+        {debugLog}
       </div>
       {open && graphOpen && (
         <RunInspector
@@ -432,8 +445,8 @@ export function Workspace() {
                   : mode === 'workflow'
                     ? 'Your next workflow'
                     : customPreview
-                    ? 'Exploring a workflow'
-                    : sample.title}
+                      ? 'Exploring a workflow'
+                      : sample.title}
               </h1>
               <p>
                 {mode === 'preview'
@@ -626,6 +639,7 @@ export function LiveRunWorkspace() {
   const snapshot = useRunGraph(view.run?.input ?? null);
   const [now, setNow] = useState(Date.now());
   const [selected, setSelected] = useState<string>();
+  const [actionTarget, setActionTarget] = useState<{ kind: 'action' | 'browser'; id: string }>();
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
   const [loadError, setLoadError] = useState('');
@@ -638,6 +652,76 @@ export function LiveRunWorkspace() {
   // Read from the run, never from a local click -- pause lands at the next step
   // boundary, so the server is the only thing that knows when it took effect.
   const runPaused = view.run?.status === 'paused';
+
+  // A pending approval or handoff blocks the whole run, but the panel sits in
+  // the lane and was easy to miss below the fold or in a background tab. Bring
+  // it into view and flag the tab title until it is decided.
+  const pendingApprovals = view.approvals.filter((approval) => approval.status === 'pending');
+  const firstPendingId = pendingApprovals[0]?.id;
+  const actions = useMemo(
+    () => groupActions(view.toolLifecycle, view.approvals),
+    [view.toolLifecycle, view.approvals],
+  );
+  const activeAction =
+    actionTarget?.kind === 'action'
+      ? actions.find((item) => item.id === actionTarget.id)
+      : undefined;
+  const activeBrowser =
+    actionTarget?.kind === 'browser'
+      ? view.browserSessions.find((item) => item.sessionId === actionTarget.id)
+      : undefined;
+  const browserHandoff = activeBrowser
+    ? pendingApprovals.find(
+        (item) => handoffSessionIdFor(item, view.browserSessions) === activeBrowser.sessionId,
+      )
+    : undefined;
+  const openedApproval = useRef<string | undefined>(undefined);
+  useEffect(() => {
+    if (!firstPendingId || openedApproval.current === firstPendingId) return;
+    if (actionTarget) {
+      openedApproval.current = firstPendingId;
+      return;
+    }
+    const pending = pendingApprovals[0]!;
+    const browserId = handoffSessionIdFor(pending, view.browserSessions);
+    if (browserId) {
+      openedApproval.current = firstPendingId;
+      setActionTarget({ kind: 'browser', id: browserId });
+    } else {
+      const action = actions.find((item) => item.approval?.id === pending.id);
+      if (action) {
+        openedApproval.current = firstPendingId;
+        setActionTarget({ kind: 'action', id: action.id });
+      }
+    }
+  }, [firstPendingId, actions, view.browserSessions]);
+  const selectNode = (nodeId: string) => {
+    setSelected(nodeId);
+    const action = actions.find((item) => 'tool:' + item.id === nodeId);
+    if (action) setActionTarget({ kind: 'action', id: action.id });
+  };
+  const resumeHandoff = async (approvalId: string) => {
+    setBusy(true);
+    setError('');
+    try {
+      await api.decide(approvalId, { decision: 'approved' });
+    } catch (issue) {
+      setError(issue instanceof Error ? issue.message : 'Handoff could not continue.');
+      throw issue;
+    } finally {
+      setBusy(false);
+    }
+  };
+  const approvalsRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!firstPendingId) return;
+    approvalsRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    const previous = document.title;
+    document.title = '● Action needed · ' + previous;
+    return () => {
+      document.title = previous;
+    };
+  }, [firstPendingId]);
 
   useEffect(() => {
     if (terminal) return;
@@ -748,22 +832,92 @@ export function LiveRunWorkspace() {
                         'Waiting for a backend update')}
               </WorkingStatus>
             )}
-            {view.approvals
-              .filter((approval) => approval.status === 'pending')
-              .map((approval) => {
+            <div ref={approvalsRef}>
+              {pendingApprovals.map((approval) => {
                 // A handoff approval carries the id of a browser session the
                 // run is holding open. Passing its URL through is what turns
                 // "approve this" into "here is the browser, go and do it".
                 const sessionId = handoffSessionIdFor(approval, view.browserSessions);
+                const action = actions.find((item) => item.approval?.id === approval.id);
+                if (sessionId || action)
+                  return (
+                    <section className="action-pending-card" key={approval.id}>
+                      <Icon name="lock" size={16} />
+                      <div>
+                        <strong>{sessionId ? 'Manual step needed' : 'Review this action'}</strong>
+                        <p>{approval.question}</p>
+                        <button
+                          className="primary-button"
+                          onClick={() =>
+                            setActionTarget({
+                              kind: sessionId ? 'browser' : 'action',
+                              id: sessionId ?? action!.id,
+                            })
+                          }
+                        >
+                          {sessionId ? 'Open browser workspace' : 'Review & decide'}
+                        </button>
+                      </div>
+                    </section>
+                  );
                 return (
                   <ApprovalPanel
                     key={approval.id}
                     approval={approval}
+                    decisionsDisabled={!view.connected}
                     {...(sessionId ? { handoffSessionId: sessionId } : {})}
                   />
                 );
               })}
-            {view.run?.error && (
+            </div>
+            {(actions.length > 0 || view.browserSessions.length > 0) && (
+              <section className="recorded-actions" aria-label="Recorded actions">
+                <h3>Actions & resources</h3>
+                <ul>
+                  {view.browserSessions.map((session) => (
+                    <li key={session.sessionId}>
+                      <button
+                        aria-pressed={actionTarget?.id === session.sessionId}
+                        onClick={() => setActionTarget({ kind: 'browser', id: session.sessionId })}
+                      >
+                        <Icon name="globe" size={15} />
+                        <span>
+                          <strong>{providerLabel(session.providerId)} browser</strong>
+                          <small>
+                            {session.closedAt
+                              ? 'Session ended · decision replay'
+                              : session.mode === 'mock' ? 'Inspect simulated handoff' : 'Watch browser & take control'}
+                          </small>
+                        </span>
+                        <Icon name="arrow" size={14} />
+                      </button>
+                    </li>
+                  ))}
+                  {actions.map((action) => (
+                    <li key={action.id}>
+                      <button
+                        aria-pressed={actionTarget?.id === action.id}
+                        onClick={() => setActionTarget({ kind: 'action', id: action.id })}
+                      >
+                        <Icon name="activity" size={15} />
+                        <span>
+                          <strong>{action.latest.action.toolId}</strong>
+                          <small>
+                            {actionStatus(
+                              action,
+                              action.latest.evidence ? [action.latest.evidence] : [],
+                            )}
+                          </small>
+                        </span>
+                        <Icon name="arrow" size={14} />
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              </section>
+            )}
+            {/* A failed run's summary is usually the error message itself. */}
+            {view.run?.error && view.run.error.message !== view.run.summary && (
               <p className="error-note" role="alert">
                 {view.run.error.message}
               </p>
@@ -822,19 +976,37 @@ export function LiveRunWorkspace() {
     <WorkspaceShell
       trace={trace}
       selected={selected}
-      onSelect={setSelected}
+      onSelect={selectNode}
       onDeselect={() => setSelected(undefined)}
       paused={!view.connected || terminal}
       lane={lane}
+      debugLog={<DebugLog view={view} selectedNodeId={selected} />}
+      actionWorkspace={
+        activeAction || activeBrowser ? (
+          <ActionWorkspace
+            key={actionTarget?.id}
+            {...(activeAction ? { action: activeAction } : {})}
+            {...(activeBrowser
+              ? {
+                  session: activeBrowser,
+                  steps: view.steps.filter((step) => step.nodeId === activeBrowser.nodeId),
+                }
+              : {})}
+            {...(browserHandoff ? { handoff: browserHandoff } : {})}
+            connected={view.connected || terminal}
+            busy={busy}
+            onResume={resumeHandoff}
+            onClose={() => setActionTarget(undefined)}
+          />
+        ) : undefined
+      }
       composer={
         <TaskComposer
           mode="backend"
           onSend={followUp}
           busy={busy}
           disabled={!terminal}
-          placeholder={
-            terminal ? 'Ask a follow-up…' : 'This run is in progress…'
-          }
+          placeholder={terminal ? 'Ask a follow-up…' : 'This run is in progress…'}
           hint={
             terminal
               ? 'A follow-up edits this workflow and reruns it. This run stays as it is.'

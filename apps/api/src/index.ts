@@ -27,7 +27,7 @@ async function main(): Promise<void> {
   await initializeRuntimeProviders();
 
   const app = createApp();
-  const server = app.listen(config.port, () => {
+  const server = app.listen(config.port, '127.0.0.1', () => {
     console.log('[api] listening on http://localhost:' + config.port);
     console.log('[api] health:    http://localhost:' + config.port + '/api/health');
     console.log('[api] providers: http://localhost:' + config.port + '/api/providers');

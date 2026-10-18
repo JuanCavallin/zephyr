@@ -15,6 +15,11 @@ import { agentGraphSchema, type AgentGraph, type GraphEdge, type GraphNode } fro
 import { newId, nowIso } from '../lib/ids.js';
 import { store } from '../store/index.js';
 import { buildDemoGraph, DEMO_GRAPH_ID } from '../core/graph/demo.graph.js';
+import {
+  saveGraphOwned,
+  saveGraphOwnedUnlocked,
+  withGraphWriteLock,
+} from './graphCompile.service.js';
 
 export class GraphValidationError extends Error {
   readonly code = 'VALIDATION_ERROR';
@@ -69,15 +74,17 @@ export async function createGraph(input: {
   description?: string;
   nodes?: unknown[];
   edges?: unknown[];
+  assertions?: unknown[];
 }): Promise<AgentGraph> {
   const at = nowIso();
-  return store.saveGraph(
+  return saveGraphOwned(
     parseOrThrow({
       id: newId('graph'),
       name: input.name ?? 'Untitled graph',
       description: input.description,
       nodes: input.nodes ?? [],
       edges: input.edges ?? [],
+      ...(input.assertions ? { assertions: input.assertions } : {}),
       version: 1,
       createdAt: at,
       updatedAt: at,
@@ -103,22 +110,26 @@ export async function mutateGraph(
   expectedVersion: number | undefined,
   apply: (graph: AgentGraph) => AgentGraph,
 ): Promise<AgentGraph> {
-  const current = await store.getGraph(id);
-  if (!current) throw new GraphNotFoundError(id);
+  // Serialised with the compile step's writes, so the version check and the
+  // save are one step and a late compile can never overwrite this edit.
+  return withGraphWriteLock(id, async () => {
+    const current = await store.getGraph(id);
+    if (!current) throw new GraphNotFoundError(id);
 
-  if (expectedVersion !== undefined && expectedVersion !== current.version) {
-    throw new GraphConflictError(expectedVersion, current.version);
-  }
+    if (expectedVersion !== undefined && expectedVersion !== current.version) {
+      throw new GraphConflictError(expectedVersion, current.version);
+    }
 
-  const next = parseOrThrow({
-    ...apply(structuredClone(current)),
-    id: current.id,
-    createdAt: current.createdAt,
-    version: current.version + 1,
-    updatedAt: nowIso(),
+    const next = parseOrThrow({
+      ...apply(structuredClone(current)),
+      id: current.id,
+      createdAt: current.createdAt,
+      version: current.version + 1,
+      updatedAt: nowIso(),
+    });
+
+    return saveGraphOwnedUnlocked(next);
   });
-
-  return store.saveGraph(next);
 }
 
 /* -------------------------------------------------------------------------- */
@@ -188,6 +199,6 @@ export function removeEdge(graph: AgentGraph, edgeId: string): AgentGraph {
 export async function seedGraphs(): Promise<void> {
   const existing = await store.getGraph(DEMO_GRAPH_ID);
   if (existing) return;
-  await store.saveGraph(parseOrThrow(buildDemoGraph(nowIso())));
+  await saveGraphOwned(parseOrThrow(buildDemoGraph(nowIso())));
   console.log('[graphs] seeded "' + DEMO_GRAPH_ID + '"');
 }

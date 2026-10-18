@@ -25,9 +25,21 @@ import { release } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { chromium, type Browser, type Page } from 'playwright-core';
-import type { ElementTable, ProviderCallContext } from '@htn/shared';
+import {
+  LOCAL_BROWSER_DESTINATION,
+  median,
+  type ElementTable,
+  type ProviderCallContext,
+} from '@htn/shared';
 import { config } from '../src/config.js';
-import { eligibleRows, renderTable, toCriteria, toState } from '../src/core/tools/elementTable.js';
+import { renderTable, toState } from '../src/core/tools/elementTable.js';
+import {
+  COLLECT_ROWS,
+  INTERACTIVE_SELECTOR,
+  validateTargetScript,
+  type RawRow,
+} from '../src/providers/browserPage.js';
+import { planBrowserQuestions } from '../src/providers/jev/browserDecider.js';
 import { createLiveLocalBrowser } from '../src/providers/localbrowser/live.js';
 
 const OUT =
@@ -59,24 +71,6 @@ const CHECK_ROUNDS = 3;
 /** A page that served a bot wall is reported but left out of the medians. */
 const BOT_WALL = /sorry|prove your humanity|just a moment|access denied|attention required/i;
 
-// Same list as INTERACTIVE_SELECTOR in providers/localbrowser/live.ts.
-const SELECTOR = [
-  'a[href]',
-  'button',
-  'input:not([type="hidden"])',
-  'select',
-  'textarea',
-  '[role="button"]',
-  '[role="link"]',
-  '[role="checkbox"]',
-  '[role="radio"]',
-  '[role="combobox"]',
-  '[role="textbox"]',
-  '[role="menuitem"]',
-  '[role="tab"]',
-  '[contenteditable="true"]',
-].join(',');
-
 interface Row {
   url: string;
   title: string;
@@ -96,34 +90,35 @@ interface Row {
   checkAfterMs: number;
 }
 
-// The adapter launches its own Chrome and never hands out the Page. Wrapping
-// launch() on the shared module instance lets every measurement below run
-// against exactly the page the adapter snapshots.
-let launched: Browser | undefined;
-const launch = chromium.launch.bind(chromium);
-chromium.launch = async (options) => {
-  launched = await launch(options);
-  return launched;
-};
+// The adapter never hands out its Page. A transport that launches Chrome here,
+// with the adapter's own launch options, keeps that page in reach, so every
+// measurement below runs against exactly the page the adapter snapshots.
+const channel = process.env.LOCALBROWSER_CHANNEL ?? 'chrome';
+let launched: { browser: Browser; page: Page } | undefined;
 
 const ctx: ProviderCallContext = { runId: 'bench', stepId: 'bench', policyRule: 'bench-browser' };
-const adapter = createLiveLocalBrowser({
-  mode: 'live',
-  channel: process.env.LOCALBROWSER_CHANNEL ?? 'chrome',
-  keyVar: 'LOCALBROWSER_CHANNEL',
-});
+const adapter = createLiveLocalBrowser(
+  { mode: 'live', channel, keyVar: 'LOCALBROWSER_CHANNEL' },
+  {
+    backend: 'localbrowser',
+    destination: LOCAL_BROWSER_DESTINATION,
+    async connect() {
+      const browser = await chromium.launch({
+        channel,
+        headless: true,
+        timeout: config.browser.timeoutMs,
+      });
+      launched = { browser, page: await browser.newPage() };
+      return launched;
+    },
+  },
+);
 const snapshot = adapter.snapshot?.bind(adapter);
 if (!snapshot) throw new Error('The local-browser adapter has no snapshot().');
 
-function median(values: number[]): number {
-  const sorted = [...values].sort((a, b) => a - b);
-  const mid = Math.floor(sorted.length / 2);
-  return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
-}
-
 /** The shape the in-page collector replaced: about 8 Playwright calls per element. */
 async function perElementSnapshot(page: Page): Promise<number> {
-  const all = page.locator(SELECTOR);
+  const all = page.locator(INTERACTIVE_SELECTOR);
   const count = await all.count();
   let calls = 1;
   let rows = 0;
@@ -144,19 +139,13 @@ async function perElementSnapshot(page: Page): Promise<number> {
   return calls;
 }
 
-// String IIFEs, as in the adapter: this package has no DOM lib.
-const visibleIndices = `(() => {
-  const out = [];
-  document.querySelectorAll(${JSON.stringify(SELECTOR)}).forEach((el, i) => {
-    const s = window.getComputedStyle(el);
-    if (el.getClientRects().length > 0 && s.visibility !== 'hidden' && s.display !== 'none' && Number(s.opacity) !== 0) out.push(i);
-  });
-  return out;
-})()`;
-
-/** The 4th call of the old 4-call check. */
+/**
+ * The 4th call of the old 4-call check, as the adapters ran it before
+ * validateTargetScript() folded all four into one. A string IIFE, as in
+ * providers/browserPage.ts: this package has no DOM lib.
+ */
 const occlusionProbe = (index: number): string => `(() => {
-  const el = document.querySelectorAll(${JSON.stringify(SELECTOR)})[${index}];
+  const el = document.querySelectorAll(${JSON.stringify(INTERACTIVE_SELECTOR)})[${index}];
   if (!el) return null;
   const rect = el.getBoundingClientRect();
   if (rect.width === 0 || rect.height === 0) return true;
@@ -165,70 +154,9 @@ const occlusionProbe = (index: number): string => `(() => {
   return !(hit === el || el.contains(hit) || hit.contains(el));
 })()`;
 
-/** Same body as validateTargetScript() in providers/localbrowser/live.ts. */
-const atomicCheck = (index: number): string => `(() => {
-  const el = document.querySelectorAll(${JSON.stringify(SELECTOR)})[${index}];
-  if (!el) return { exists: false };
-  const rect = el.getBoundingClientRect();
-  const style = window.getComputedStyle(el);
-  const visible = rect.width > 0 && rect.height > 0 &&
-    style.visibility !== 'hidden' && style.display !== 'none' && Number(style.opacity) !== 0;
-  const enabled = !el.disabled && el.getAttribute('aria-disabled') !== 'true';
-  let occluded = true;
-  if (visible) {
-    const hit = document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2);
-    occluded = !hit || !(hit === el || el.contains(hit) || hit.contains(el));
-  }
-  return { exists: true, visible, enabled, occluded };
-})()`;
-
-/** The request providers/jev/browserDecider.ts builds for a step with every operation allowed. */
+/** The exact request the Jev browser decider sends for a step with every operation allowed. */
 function jevRequest(table: ElementTable, goal: string) {
-  const click = toCriteria(eligibleRows(table, 'CLICK'));
-  const type = toCriteria(eligibleRows(table, 'TYPE_TEXT'));
-  const select = toCriteria(eligibleRows(table, 'SELECT'));
-  const operation: Record<string, string> = {};
-  if (click) operation.CLICK = 'Click one of the listed elements.';
-  if (type) {
-    operation.TYPE_TEXT = 'Type into one of the listed fields. A separate model supplies the text.';
-  }
-  if (select) operation.SELECT = 'Choose an option in a dropdown.';
-  Object.assign(operation, {
-    SCROLL_DOWN: 'Scroll down to reveal more.',
-    SCROLL_UP: 'Scroll back up.',
-    WAIT: 'Wait for the page to settle.',
-    DONE: 'The goal is already satisfied on this page.',
-    BLOCKED: 'The goal cannot be progressed from this page.',
-  });
-  const questions: Record<string, unknown> = {
-    operation: {
-      type: 'choice',
-      instructions: 'What is the single best next action for the goal?',
-      criteria: operation,
-    },
-  };
-  if (click && Object.keys(click).length > 1) {
-    questions.click_target = {
-      type: 'choice',
-      instructions: 'Which element should be clicked?',
-      criteria: click,
-    };
-  }
-  if (type && Object.keys(type).length > 1) {
-    questions.type_text_target = {
-      type: 'choice',
-      instructions: 'Which field should be typed into?',
-      criteria: type,
-    };
-  }
-  if (select && Object.keys(select).length > 1) {
-    questions.select_target = {
-      type: 'choice',
-      instructions: 'Which dropdown should be used?',
-      criteria: select,
-    };
-  }
-  return { state: toState(table, goal), questions };
+  return { state: toState(table, goal), questions: planBrowserQuestions(table).questions };
 }
 
 const rows: Row[] = [];
@@ -243,8 +171,8 @@ for (const url of PAGES) {
   const { sessionId } = opened.data;
   try {
     if (!launched) throw new Error('Did not capture the adapter browser.');
-    chrome = launched.version();
-    const page = launched.contexts()[0].pages()[0];
+    chrome = launched.browser.version();
+    const { page } = launched;
     await page.waitForLoadState('load', { timeout: 15_000 }).catch(() => undefined);
     await page.waitForLoadState('networkidle', { timeout: 6_000 }).catch(() => undefined);
     await page.waitForTimeout(1_500);
@@ -286,12 +214,13 @@ for (const url of PAGES) {
       beforeMs.push(performance.now() - started);
     }
 
-    // Pre-action check per target: 4 calls vs 1 atomic evaluate.
-    const targets = (await page.evaluate<number[], undefined>(visibleIndices, undefined)).slice(
-      0,
-      CHECK_TARGETS,
-    );
-    const all = page.locator(SELECTOR);
+    // Pre-action check per target: 4 calls vs 1 atomic evaluate. Targets are the
+    // rows the adapter's own collector counts as visible.
+    const targets = (await page.evaluate<RawRow[], undefined>(COLLECT_ROWS, undefined))
+      .filter((row) => row.visible)
+      .map((row) => row.domIndex)
+      .slice(0, CHECK_TARGETS);
+    const all = page.locator(INTERACTIVE_SELECTOR);
     const checkBefore: number[] = [];
     const checkAfter: number[] = [];
     for (let round = 0; round < CHECK_ROUNDS; round += 1) {
@@ -304,7 +233,7 @@ for (const url of PAGES) {
         await page.evaluate<boolean | null, undefined>(occlusionProbe(index), undefined);
         checkBefore.push(performance.now() - started);
         started = performance.now();
-        await page.evaluate<unknown, undefined>(atomicCheck(index), undefined);
+        await page.evaluate<unknown, undefined>(validateTargetScript(index), undefined);
         checkAfter.push(performance.now() - started);
       }
     }

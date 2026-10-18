@@ -32,6 +32,7 @@ import { ChatPanel } from '../components/chat/ChatPanel';
 import { GraphCanvas } from '../components/graph/GraphCanvas';
 import { Legend } from '../components/graph/Legend';
 import { NodeInspector } from '../components/graph/NodeInspector';
+import { ReusePanel } from '../components/graph/ReusePanel';
 import { buildDefaultNode, defaultLabelFor } from '../components/graph/nodeDefaults';
 import { Badge } from '../components/ui/Badge';
 import { Button } from '../components/ui/Button';
@@ -163,19 +164,36 @@ export function GraphEditor() {
     }
   };
 
-  const launchWithBaseline = async () => {
+  /**
+   * Launch the graph next to its baseline(s) on THE SAME TASK: the server
+   * hands each baseline the graph's own prompt and variables. A shared pairId
+   * lets the Benchmarks page pair these runs exactly.
+   *
+   * withAgent adds B1 -- one frontier agent with every tool -- which is the
+   * fair "no orchestration" control but a real, full agent run, so it is opt-in.
+   */
+  const launchWithBaseline = async (withAgent = false) => {
     if (!graph) return;
     setLaunching(true);
     setLaunchError(null);
     try {
-      // Both POSTs fire before either is awaited -- genuinely parallel, not
-      // one blocking the other -- so the baseline's latency never adds to
-      // the graph run's, and vice versa.
-      const [{ run: graphRun }, { run: baselineRun }] = await Promise.all([
-        api.runGraph(graph.id, { target: DEMO_TARGET }),
-        api.createRun('baseline', { target: DEMO_TARGET, graphId: graph.id }),
+      const variables = { target: DEMO_TARGET };
+      const pairId = 'pair_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+      const baselineInput = { graphId: graph.id, variables, pairId };
+      // Every POST fires before any is awaited -- genuinely parallel -- so no
+      // arm's latency adds to another's.
+      const [{ run: graphRun }, { run: baselineRun }, agentRun] = await Promise.all([
+        api.runGraph(graph.id, variables, pairId),
+        api.createRun('baseline', baselineInput),
+        withAgent ? api.createRun('baseline_agent', baselineInput) : Promise.resolve(null),
       ]);
-      navigate('/compare?a=' + graphRun.id + '&b=' + baselineRun.id);
+      navigate(
+        '/compare?a=' +
+          graphRun.id +
+          '&b=' +
+          baselineRun.id +
+          (agentRun ? '&c=' + agentRun.run.id : ''),
+      );
     } catch (err) {
       setLaunchError((err as Error).message);
     } finally {
@@ -347,8 +365,17 @@ export function GraphEditor() {
             variant="ghost"
             onClick={() => void launchWithBaseline()}
             disabled={launching || !graph}
+            title="Also send this workflow's own task to one frontier model call (no tools)"
           >
             Run + compare to baseline
+          </Button>
+          <Button
+            variant="ghost"
+            onClick={() => void launchWithBaseline(true)}
+            disabled={launching || !graph}
+            title="Also run the task as one frontier agent with every tool and no Jev routing -- a full agent run, so it costs real money in live mode"
+          >
+            Run + compare to both baselines
           </Button>
           <Button
             variant="ghost"
@@ -492,6 +519,8 @@ export function GraphEditor() {
           </p>
         )}
       </Card>
+
+      {graph && <ReusePanel graph={graph} selectedNodeId={selectedNodeId} />}
     </div>
   );
 }

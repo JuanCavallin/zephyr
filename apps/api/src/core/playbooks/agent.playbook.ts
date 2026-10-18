@@ -1,4 +1,4 @@
-import { agentInputSchema, type AgentInput, type Json } from '@htn/shared';
+import { agentInputSchema, type AgentInput, type CompletionDecision, type Json } from '@htn/shared';
 import { definePlaybook } from './types.js';
 
 /** Generic UI entry point: one user objective becomes one supervised Hermes run. */
@@ -27,7 +27,7 @@ export const agentPlaybook = definePlaybook<AgentInput>({
       maxTurns: input.maxTurns,
     });
     return {
-      summary: 'Agent task completed with verified Jev completion.',
+      summary: verdictSummary(agentTask.completionDecision),
       result: toJson({
         output: agentTask.result,
         exposedTools: agentTask.scheduleDecision.exposedTools,
@@ -37,6 +37,27 @@ export const agentPlaybook = definePlaybook<AgentInput>({
     };
   },
 });
+
+/** The run summary says what Jev decided; the agent itself always ran exactly once. */
+function verdictSummary(decision: CompletionDecision): string {
+  const confidence = ' (confidence ' + decision.confidence.toFixed(2) + ')';
+  if (decision.status === 'done' && decision.verified)
+    return 'Agent task finished; Jev judged it done' + confidence + '.';
+  if (decision.status === 'done')
+    return (
+      'Agent task finished; Jev judged it done' +
+      confidence +
+      ', but AgentOS could not verify: ' +
+      decision.verificationFailures.join(', ') +
+      '.'
+    );
+  return (
+    'Agent task finished; Jev judged it ' +
+    decision.status +
+    confidence +
+    '. The agent was not run again.'
+  );
+}
 
 function toJson(value: unknown): Json {
   if (value === undefined) return null;

@@ -51,7 +51,13 @@ export interface ToolDescriptor {
   availability: 'available' | 'unavailable' | 'requires_connection';
   executorRef: string;
   credentialRef?: string;
+  /** Trusted connected-account identity for review; never an API key/vault reference. */
+  accountRef?: string;
   simulated?: boolean;
+  /** Reviewed connected-app mutations must expose an exact change approval. */
+  requiresChangeReview?: boolean;
+  /** Effective backend mode, distinct from non-executable fixture simulation. */
+  executionMode?: 'live' | 'mock';
 }
 
 /** The exact action that must pass authorization immediately before execution. */
@@ -66,6 +72,12 @@ export interface ToolAction {
   destination?: string;
   dataLabels: DataLabel[];
   createdAt: Iso;
+  /** Hash of exact proposed arguments/destination; never a permission grant. */
+  previewFingerprint?: string;
+  /** Bound by the broker from trusted descriptor metadata, not model arguments. */
+  accountRef?: string;
+  /** Server-prepared operation/target bound to the exact human review. */
+  review?: Json;
 }
 
 export type ActionPolicy = 'auto' | 'verify' | 'ask_user' | 'deny';
@@ -216,6 +228,18 @@ export interface AgentSessionState {
   candidateToolIds: string[];
   /** Immutable Jev-selected task grant. A model turn may narrow this set, never widen it. */
   taskToolIds?: string[];
+  /**
+   * Set only by the all-tools BASELINE arm: every turn uses a route of this
+   * cost tier instead of a Jev model choice, so the comparison measures the
+   * graph against "frontier model, every tool" as the design spec asks.
+   */
+  pinnedCostTier?: ModelCostTier;
+  /**
+   * A graph's frozen route tier for this task. Unlike the pin it is only a
+   * preference among ELIGIBLE routes: with none of that tier eligible, Jev
+   * picks as usual.
+   */
+  preferredModelTier?: import('./providers.js').ModelTier;
   /** Server-side resource binding; never included in model context by default. */
   boundBrowserSessionId?: string;
   selectedToolIds: string[];
@@ -306,6 +330,14 @@ export interface ModelLifecycleEvent {
   tokensOut?: number;
   estimatedCostCents?: number;
   toolCallCount?: number;
+  /**
+   * Readable, truncated copy of what went into / came out of the model, for the
+   * run's debug log. Present only when every data label on the session is `public`;
+   * otherwise `ioWithheld` is set and nothing is carried.
+   */
+  inputPreview?: string;
+  outputPreview?: string;
+  ioWithheld?: boolean;
   error?: { code: string; message: string };
   at: Iso;
 }
@@ -342,6 +374,9 @@ export interface ToolLifecycleEvent {
   approvalId?: string;
   /** Tool output is untrusted; only a compact local summary enters the event stream. */
   outputSummary?: string;
+  evidence?: import('./actionEvidence.js').ActionEvidence;
+  /** A remote write error after dispatch may have committed; never retry it blindly. */
+  outcome?: 'completed' | 'not_executed' | 'partial' | 'unknown';
   error?: { code: string; message: string };
   at: Iso;
 }

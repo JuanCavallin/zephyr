@@ -50,8 +50,11 @@ import type {
   OpenAiMessage,
   OpenAiTool,
 } from '../../core/modelGateway/service.js';
+import { isBoundTextRoute } from '../../core/modelGateway/catalog.js';
 import { newId } from '../../lib/ids.js';
 import type { RecordEgress } from '../withEgress.js';
+import { costCents } from '../pricing.js';
+import type { CredentialStore } from '../../services/credentials.js';
 
 const DEFAULT_BASE_URL = 'https://generativelanguage.googleapis.com/v1beta';
 const REQUEST_TIMEOUT_MS = 45_000;
@@ -69,9 +72,43 @@ const UNSUPPORTED_SCHEMA_KEYS = new Set([
   '$ref',
 ]);
 
-interface GeminiPart {
+export interface GeminiPart {
   text?: string;
   functionCall?: { name?: unknown; args?: unknown };
+  thoughtSignature?: unknown;
+}
+
+/**
+ * Gemini 3 signs every function call it makes, and a later request that
+ * replays the call without its `thoughtSignature` is refused with HTTP 400
+ * ("Function call is missing a thought_signature"). Hermes speaks OpenAI
+ * chat-completions, which has nowhere to carry the signature, so it is kept
+ * here by the call id this backend hands out, and put back on replay. Bounded:
+ * one entry per call, oldest dropped first.
+ */
+const thoughtSignatures = new Map<string, string>();
+const MAX_THOUGHT_SIGNATURES = 2000;
+
+/**
+ * Google's documented stand-in for a call Gemini did not make -- Jev may have
+ * routed the turn that made it to Anthropic -- or whose signature was lost to
+ * a restart. Verified live: both the real signature and this value are
+ * accepted; no signature at all is HTTP 400.
+ */
+const UNSIGNED_CALL_SIGNATURE = 'skip_thought_signature_validator';
+
+/** Remember the signature of each call Gemini returned, by the id handed out for it. */
+export function rememberThoughtSignatures(parts: GeminiPart[], calls: GatewayToolCall[]): void {
+  const signed = parts.filter((part) => part.functionCall);
+  calls.forEach((call, index) => {
+    const signature = signed[index]?.thoughtSignature;
+    if (typeof signature !== 'string' || !signature) return;
+    thoughtSignatures.set(call.id, signature);
+    if (thoughtSignatures.size > MAX_THOUGHT_SIGNATURES) {
+      const oldest = thoughtSignatures.keys().next().value;
+      if (oldest !== undefined) thoughtSignatures.delete(oldest);
+    }
+  });
 }
 
 interface GeminiResponse {
@@ -88,14 +125,47 @@ export function createGeminiBackend(
   cfg: ProviderConfig,
   recordEgress: RecordEgress,
   fallback: ChatModelBackend,
+  credentialResolver?: CredentialStore,
 ): ChatModelBackend {
   return {
     async complete(input, ctx) {
-      if (input.route.providerId !== 'gemini') return fallback.complete(input, ctx);
-      if (cfg.mode !== 'live' || !cfg.apiKey) {
+      if (input.route.providerId !== 'gemini' || isBoundTextRoute(input.route)) {
+        return fallback.complete(input, ctx);
+      }
+      if (cfg.mode !== 'live') {
         throw new Error('Gemini route selected while GEMINI_MODE is not live.');
       }
-      return completeLive(cfg, input, ctx, recordEgress);
+      const credential = credentialResolver
+        ? await credentialResolver.require({
+            runId: ctx.runId,
+            providerId: 'gemini',
+            purpose: 'model',
+          })
+        : null;
+      const effective = credential ? { ...cfg, apiKey: credential.secret } : cfg;
+      if (!effective.apiKey) throw new Error('Gemini credentials are required.');
+      try {
+        return await completeLive(
+          effective,
+          input,
+          ctx,
+          recordEgress,
+          credential && credentialResolver
+            ? () =>
+                credentialResolver.assertCurrent(credential.reference, {
+                  runId: ctx.runId,
+                  providerId: 'gemini',
+                  purpose: 'model',
+                })
+            : undefined,
+        );
+      } catch (error) {
+        const message =
+          error instanceof Error && error.message.startsWith('Gemini ')
+            ? error.message.replaceAll(effective.apiKey, '[credential redacted]')
+            : 'Gemini request failed.';
+        throw new Error(message);
+      }
     },
   };
 }
@@ -205,9 +275,17 @@ export function toGeminiRequest(messages: OpenAiMessage[]): TranslatedRequest {
       if (Array.isArray(calls)) {
         for (const call of calls) {
           if (!call || typeof call !== 'object') continue;
-          const fn = (call as { function?: { name?: unknown; arguments?: unknown } }).function;
+          const { id, function: fn } = call as {
+            id?: unknown;
+            function?: { name?: unknown; arguments?: unknown };
+          };
           if (typeof fn?.name !== 'string') continue;
-          parts.push({ functionCall: { name: fn.name, args: safeArgs(fn.arguments) } });
+          parts.push({
+            functionCall: { name: fn.name, args: safeArgs(fn.arguments) },
+            thoughtSignature:
+              (typeof id === 'string' ? thoughtSignatures.get(id) : undefined) ??
+              UNSIGNED_CALL_SIGNATURE,
+          });
         }
       }
       // A turn with no parts at all is rejected by the API; drop it instead.
@@ -219,8 +297,19 @@ export function toGeminiRequest(messages: OpenAiMessage[]): TranslatedRequest {
     if (text) contents.push({ role: 'user', parts: [{ text }] });
   }
 
+  // Fold consecutive same-role turns into one, the shape Gemini documents: a
+  // function response followed by a user note (the gateway's tool-budget
+  // instruction, Hermes's empty-reply nudge) is one user turn, as are several
+  // function responses.
+  const merged: TranslatedRequest['contents'] = [];
+  for (const content of contents) {
+    const previous = merged.at(-1);
+    if (previous?.role === content.role) previous.parts.push(...content.parts);
+    else merged.push({ role: content.role, parts: [...content.parts] });
+  }
+
   return {
-    contents,
+    contents: merged,
     ...(systemChunks.length > 0
       ? { systemInstruction: { parts: [{ text: systemChunks.join('\n\n') }] } }
       : {}),
@@ -291,8 +380,9 @@ export function parseToolCalls(
     }
     return [
       {
-        // Gemini returns no call id; the gateway needs a stable one per turn.
-        id: 'call_' + index,
+        // Gemini returns no call id. A unique one, not the index, because the
+        // call's thought signature is remembered by it across requests.
+        id: newId('call') + '_' + index.toString(),
         type: 'function' as const,
         function: { name: call.name, arguments: JSON.stringify(call.args ?? {}) },
       },
@@ -317,12 +407,15 @@ async function completeLive(
   input: ChatModelBackendInput,
   ctx: ProviderCallContext,
   recordEgress: RecordEgress,
+  beforeRequest?: () => void,
 ): Promise<ChatModelBackendResult> {
   const started = Date.now();
   const baseUrl = (cfg.baseUrl ?? DEFAULT_BASE_URL).replace(/\/$/, '');
   const endpoint = baseUrl + '/models/' + input.route.modelId + ':generateContent';
   let tokensIn: number | undefined;
   let tokensOut: number | undefined;
+  let model: string | undefined;
+  let estimatedCostCents: number | undefined;
 
   try {
     const translated = toGeminiRequest(input.messages);
@@ -330,31 +423,56 @@ async function completeLive(
     const payload = {
       ...translated,
       ...(tools.length > 0 ? { tools } : {}),
+      ...(tools.length > 0 && input.toolChoice === 'none'
+        ? { toolConfig: { functionCallingConfig: { mode: 'NONE' } } }
+        : {}),
       ...(input.maxTokens ? { generationConfig: { maxOutputTokens: input.maxTokens } } : {}),
     };
 
-    const response = await fetchWithOneRetry(endpoint, cfg.apiKey ?? '', payload, ctx.signal);
+    const response = await fetchWithOneRetry(
+      endpoint,
+      cfg.apiKey ?? '',
+      payload,
+      ctx.signal,
+      beforeRequest,
+    );
     if (!response.ok) {
-      throw new Error('Gemini returned HTTP ' + response.status + (await safeDetail(response)));
+      // Gemini's own reason ("Function call is missing a thought_signature...")
+      // is what makes a 400 fixable; the caller redacts the key from it.
+      const reason = await response
+        .json()
+        .then((failed) => (failed as GeminiResponse).error?.message?.slice(0, 200))
+        .catch(() => undefined);
+      throw new Error(
+        'Gemini returned HTTP ' + response.status.toString() + (reason ? ': ' + reason : '.'),
+      );
     }
 
     const body = (await response.json()) as GeminiResponse;
+    if (cfg.apiKey && JSON.stringify(body).includes(cfg.apiKey))
+      throw new Error('Gemini response contained credential data and was refused.');
     const parts = body.candidates?.[0]?.content?.parts;
     if (!parts) {
       // A blocked or empty candidate is a real outcome, not a parse bug — say which.
-      const reason = body.candidates?.[0]?.finishReason ?? body.error?.message ?? 'no candidate';
-      throw new Error('Gemini returned no content (' + reason + ').');
+      throw new Error('Gemini returned no content.');
     }
 
     tokensIn = finite(body.usageMetadata?.promptTokenCount) ?? 0;
     tokensOut = finite(body.usageMetadata?.candidatesTokenCount) ?? 0;
+    model = body.modelVersion ?? input.route.modelId;
+    // No built-in Gemini rate: this stays undefined (counted as UNPRICED, not
+    // free) unless MODEL_PRICES_JSON supplies one. See providers/pricing.ts.
+    estimatedCostCents = costCents(model, { inputTokens: tokensIn, outputTokens: tokensOut });
 
+    const toolCalls = parseToolCalls(parts, input);
+    rememberThoughtSignatures(parts, toolCalls);
     return {
       text: parts.flatMap((part) => (typeof part.text === 'string' ? [part.text] : [])).join(''),
-      toolCalls: parseToolCalls(parts, input),
+      toolCalls,
       tokensIn,
       tokensOut,
-      actualModel: body.modelVersion ?? input.route.modelId,
+      actualModel: model,
+      estimatedCostCents,
     };
   } finally {
     // Recorded in `finally` so a thrown request still leaves a ledger row: a
@@ -371,6 +489,8 @@ async function completeLive(
       latencyMs: Date.now() - started,
       tokensIn,
       tokensOut,
+      estimatedCostCents,
+      model: model ?? input.route.modelId,
     }).catch((error: unknown) => {
       console.error(
         '[egress] failed to record Gemini call:',
@@ -385,8 +505,11 @@ async function fetchWithOneRetry(
   apiKey: string,
   payload: unknown,
   signal?: AbortSignal,
+  beforeRequest?: () => void,
 ): Promise<Response> {
   for (let attempt = 0; attempt < 2; attempt += 1) {
+    signal?.throwIfAborted();
+    beforeRequest?.();
     const response = await fetch(endpoint, {
       method: 'POST',
       headers: {
@@ -406,15 +529,6 @@ async function fetchWithOneRetry(
     return response;
   }
   throw new Error('Gemini retry loop exhausted.');
-}
-
-async function safeDetail(response: Response): Promise<string> {
-  try {
-    const text = (await response.text()).slice(0, 400);
-    return text ? ': ' + text : '';
-  } catch {
-    return '';
-  }
 }
 
 function finite(value: unknown): number | undefined {

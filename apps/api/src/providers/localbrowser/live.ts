@@ -36,6 +36,9 @@
 import { chromium, type Browser, type Locator, type Page } from 'playwright-core';
 import type {
   BrowserAdapter,
+  BrowserBackend,
+  BrowserViewer,
+  BrowserHumanInput,
   BrowserPerformResult,
   ElementRow,
   ElementTable,
@@ -45,6 +48,19 @@ import type {
 } from '@htn/shared';
 import { LOCAL_BROWSER_DESTINATION, needsTarget } from '@htn/shared';
 import { config, type ProviderConfig } from '../../config.js';
+import { browserLocation, browserFailure } from '../browserSafety.js';
+import {
+  COLLECT_ROWS,
+  INTERACTIVE_SELECTOR,
+  NON_TEXT_INPUT,
+  inferRole,
+  rejectionFor,
+  truncate,
+  validateTargetScript,
+  type RawRow,
+  type TargetState,
+} from '../browserPage.js';
+import { notifyBrowserSessionClosed } from '../withBrowserOwnership.js';
 
 interface Snapshot {
   id: string;
@@ -55,221 +71,76 @@ interface Snapshot {
   domIndices: Map<number, number>;
 }
 
-/** One row as the in-page collector returns it. Serialisable, no DOM types. */
-interface RawRow {
-  domIndex: number;
-  tag: string;
-  role: string | null;
-  type: string | null;
-  name: string;
-  value: string;
-  visible: boolean;
-}
-
 interface Handle {
   browser: Browser;
   page: Page;
   snapshot?: Snapshot;
+  credentialRef?: string;
 }
 
-/**
- * Interactive roles only. Static text, headings and images are dropped: they
- * are never an action target, and they are most of a page's element count.
- */
-const INTERACTIVE_SELECTOR = [
-  'a[href]',
-  'button',
-  'input:not([type="hidden"])',
-  'select',
-  'textarea',
-  '[role="button"]',
-  '[role="link"]',
-  '[role="checkbox"]',
-  '[role="radio"]',
-  '[role="combobox"]',
-  '[role="textbox"]',
-  '[role="menuitem"]',
-  '[role="tab"]',
-  '[contenteditable="true"]',
-].join(',');
-
-/**
- * The in-page collector. ONE call returns every row.
- *
- * WHY A STRING IIFE AND NOT AN ARROW FUNCTION: this package's tsconfig has no
- * `dom` lib — it is a server, and adding one would hand every other file in
- * apps/api a fake `document`. A string body runs in the page where those
- * globals are real and is invisible to tsc.
- *
- * WHY AN IIFE SPECIFICALLY: Playwright's string form evaluates the string as an
- * EXPRESSION in page context. A string containing arrow-function SOURCE
- * (`'el => el.tagName'`) therefore evaluates to a function object, which is not
- * serialisable, and comes back as `undefined` — silently, with no error. That
- * cost a real bug here: every role resolved to 'element' and the occlusion
- * probe always returned falsy, i.e. never blocked. An IIFE is an expression
- * that returns data, so it cannot fail that way.
- *
- * WHY ONE CALL: the previous shape made ~8 protocol round trips PER ELEMENT.
- * On a page with 60 controls that is ~480 round trips for one snapshot, which
- * is the opposite of the latency goal.
- */
-const COLLECT_ROWS = `(() => {
-  const SEL = ${JSON.stringify(
-    [
-      'a[href]',
-      'button',
-      'input:not([type="hidden"])',
-      'select',
-      'textarea',
-      '[role="button"]',
-      '[role="link"]',
-      '[role="checkbox"]',
-      '[role="radio"]',
-      '[role="combobox"]',
-      '[role="textbox"]',
-      '[role="menuitem"]',
-      '[role="tab"]',
-      '[contenteditable="true"]',
-    ].join(','),
-  )};
-  const out = [];
-  document.querySelectorAll(SEL).forEach((el, domIndex) => {
-    const style = window.getComputedStyle(el);
-    const visible =
-      el.getClientRects().length > 0 &&
-      style.visibility !== 'hidden' &&
-      style.display !== 'none' &&
-      Number(style.opacity) !== 0;
-    out.push({
-      domIndex,
-      tag: el.tagName.toLowerCase(),
-      role: el.getAttribute('role'),
-      type: el.getAttribute('type'),
-      name: (
-        el.getAttribute('aria-label') ||
-        (el.innerText || '').trim() ||
-        el.getAttribute('placeholder') ||
-        el.getAttribute('title') ||
-        el.getAttribute('alt') ||
-        ''
-      ),
-      value: (el.value === undefined || el.value === null) ? '' : String(el.value),
-      visible,
-    });
-  });
-  return out;
-})()`;
-
-/**
- * PRE-FLIGHT VALIDATION IN ONE PROTOCOL CALL.
- *
- * The three checks before any action — attached, interactable, occluded — used
- * to be four separate round trips (`count`, `isVisible`, `isEnabled`, then an
- * `elementFromPoint` probe). Against a LOCAL browser that is merely wasteful;
- * against Browserbase every one of them is a network RPC, so four round trips
- * per click is a real and avoidable cost.
- *
- * `browser-use/jev-ultrafast` reports cutting median protocol calls from 1,092
- * to 101 by making reads atomic like this. Same idea, same reason.
- *
- * The checks themselves are unchanged and still fail closed: anything this
- * cannot positively confirm comes back as not-actionable.
- */
-function validateTargetScript(domIndex: number): string {
-  return `(() => {
-     const SEL = ${JSON.stringify(INTERACTIVE_SELECTOR)};
-     const el = document.querySelectorAll(SEL)[${domIndex}];
-     if (!el) return { exists: false };
-
-     const rect = el.getBoundingClientRect();
-     const style = window.getComputedStyle(el);
-     const visible =
-       rect.width > 0 && rect.height > 0 &&
-       style.visibility !== 'hidden' && style.display !== 'none' &&
-       Number(style.opacity) !== 0;
-
-     const enabled = !el.disabled && el.getAttribute('aria-disabled') !== 'true';
-
-     let occluded = true;
-     if (visible) {
-       const hit = document.elementFromPoint(
-         rect.left + rect.width / 2,
-         rect.top + rect.height / 2,
-       );
-       occluded = !hit || !(hit === el || el.contains(hit) || hit.contains(el));
-     }
-
-     return { exists: true, visible, enabled, occluded };
-   })()`;
+export interface BrowserTransport {
+  backend: BrowserBackend;
+  destination: string;
+  connect(
+    ctx: ProviderCallContext,
+  ): Promise<{ browser: Browser; page: Page; credentialRef?: string }>;
+  validate?(credentialRef: string | undefined, ctx: ProviderCallContext): void;
+  viewer?(
+    page: Page,
+    mode: 'watch' | 'control',
+    ctx: ProviderCallContext,
+  ): Promise<Partial<BrowserViewer>>;
+  revoke?(page: Page): Promise<void>;
 }
 
-interface TargetState {
-  exists: boolean;
-  visible?: boolean;
-  enabled?: boolean;
-  occluded?: boolean;
-}
-
-/** Everything unproven is treated as not-actionable. */
-function rejectionFor(state: TargetState | null): TargetRejection | null {
-  if (!state || typeof state !== 'object') return 'occluded';
-  if (!state.exists) return 'detached';
-  if (!state.visible || !state.enabled) return 'not_interactable';
-  if (state.occluded !== false) return 'occluded';
-  return null;
-}
-
-/** Labels are the main table-size risk, and the table IS the request state. */
-const MAX_LABEL_CHARS = 80;
-
-function truncate(text: string, max = MAX_LABEL_CHARS): string {
-  const clean = text.replace(/\s+/g, ' ').trim();
-  return clean.length > max ? clean.slice(0, max - 1) + '…' : clean;
-}
-
-function meta(op: string, started: number, destination: string | null) {
-  return {
-    provider: 'localbrowser' as const,
-    op,
-    mode: 'live' as const,
-    latencyMs: Date.now() - started,
-    destination,
-  };
-}
-
-function failure<T>(
-  op: string,
-  started: number,
-  err: unknown,
-  code: 'UPSTREAM' | 'BAD_INPUT' | 'TIMEOUT' = 'UPSTREAM',
-): ProviderResult<T> {
-  return {
-    ok: false,
-    error: {
-      code,
-      message: err instanceof Error ? err.message : String(err),
-      retryable: code !== 'BAD_INPUT',
-    },
-    meta: meta(op, started, LOCAL_BROWSER_DESTINATION),
-  };
-}
-
-function rejected<T>(op: string, started: number, reason: TargetRejection): ProviderResult<T> {
-  return {
-    ok: false,
-    error: {
-      code: 'BAD_INPUT',
-      message: reason,
-      // A stale snapshot is worth retrying after a re-snapshot; a wrong
-      // operation for the element's role is not.
-      retryable: reason === 'stale_snapshot' || reason === 'occluded',
-    },
-    meta: meta(op, started, LOCAL_BROWSER_DESTINATION),
-  };
-}
-
-export function createLiveLocalBrowser(cfg: ProviderConfig): BrowserAdapter {
+/** Shared Playwright execution engine for local Chrome and cloud CDP sessions. */
+export function createLiveLocalBrowser(
+  cfg: ProviderConfig,
+  transport?: BrowserTransport,
+): BrowserAdapter {
+  const backend = transport?.backend ?? 'localbrowser';
+  const destination = transport?.destination ?? LOCAL_BROWSER_DESTINATION;
   const sessions = new Map<string, Handle>();
+  function meta(op: string, started: number, destination: string | null) {
+    return {
+      provider: backend,
+      op,
+      mode: 'live' as const,
+      latencyMs: Date.now() - started,
+      destination,
+    };
+  }
+
+  function failure<T>(
+    op: string,
+    started: number,
+    err: unknown,
+    code: 'UPSTREAM' | 'BAD_INPUT' | 'TIMEOUT' = 'UPSTREAM',
+  ): ProviderResult<T> {
+    return {
+      ok: false,
+      error: {
+        code,
+        message: browserFailure(err),
+        retryable: code !== 'BAD_INPUT',
+      },
+      meta: meta(op, started, destination),
+    };
+  }
+
+  function rejected<T>(op: string, started: number, reason: TargetRejection): ProviderResult<T> {
+    return {
+      ok: false,
+      error: {
+        code: 'BAD_INPUT',
+        message: reason,
+        // A stale snapshot is worth retrying after a re-snapshot; a wrong
+        // operation for the element's role is not.
+        retryable: reason === 'stale_snapshot' || reason === 'occluded',
+      },
+      meta: meta(op, started, destination),
+    };
+  }
 
   /** Shared by openSession — concurrency is money on one backend and RAM on this one. */
   function atCapacity(): boolean {
@@ -325,7 +196,7 @@ export function createLiveLocalBrowser(cfg: ProviderConfig): BrowserAdapter {
       table: {
         snapshotId: id,
         sessionId,
-        url: handle.page.url(),
+        url: browserLocation(handle.page.url()),
         title: await handle.page.title().catch(() => ''),
         capturedAt: new Date().toISOString(),
         rows,
@@ -335,50 +206,14 @@ export function createLiveLocalBrowser(cfg: ProviderConfig): BrowserAdapter {
     };
   }
 
-  /**
-   * Is the element actually the thing a user would hit at that point?
-   *
-   * `elementFromPoint` at the centre answers the question a visibility flag
-   * cannot: a cookie banner with `z-index: 9999` leaves the button below it
-   * "visible" and "enabled" while every click lands on the banner.
-   */
-  async function isOccluded(handle: Handle, domIndex: number): Promise<boolean> {
-    try {
-      // An IIFE with the index baked in, for the reason spelled out on
-      // COLLECT_ROWS: a string containing arrow-function source evaluates to a
-      // function object, comes back `undefined`, and would make this check
-      // silently answer "not occluded" for every element on every page.
-      const result = await handle.page.evaluate<boolean | null, undefined>(
-        `(() => {
-           const SEL = ${JSON.stringify(INTERACTIVE_SELECTOR)};
-           const el = document.querySelectorAll(SEL)[${domIndex}];
-           if (!el) return null;
-           const rect = el.getBoundingClientRect();
-           if (rect.width === 0 || rect.height === 0) return true;
-           const x = rect.left + rect.width / 2;
-           const y = rect.top + rect.height / 2;
-           const hit = document.elementFromPoint(x, y);
-           if (!hit) return true;
-           return !(hit === el || el.contains(hit) || hit.contains(el));
-         })()`,
-        undefined,
-      );
-      // `null` means the element is gone; a non-boolean means the probe did not
-      // run. Neither proves the element is reachable, so both fail closed.
-      return typeof result === 'boolean' ? result : true;
-    } catch {
-      return true;
-    }
-  }
-
   return {
-    id: 'localbrowser',
+    id: backend,
     mode: 'live',
-    capabilities: ['browser.local'],
+    capabilities: backend === 'localbrowser' ? ['browser.local'] : ['browser'],
 
     async health() {
       const started = Date.now();
-      if (!cfg.channel) {
+      if (!transport && !cfg.channel) {
         return {
           ok: false,
           error: {
@@ -393,8 +228,8 @@ export function createLiveLocalBrowser(cfg: ProviderConfig): BrowserAdapter {
       }
       return {
         ok: true,
-        data: { detail: 'channel=' + cfg.channel + ', sessions=' + sessions.size },
-        meta: meta('health', started, LOCAL_BROWSER_DESTINATION),
+        data: { detail: 'live ' + backend + ', sessions=' + sessions.size },
+        meta: meta('health', started, destination),
       };
     },
 
@@ -407,7 +242,7 @@ export function createLiveLocalBrowser(cfg: ProviderConfig): BrowserAdapter {
       );
     },
 
-    async openSession(input, _ctx: ProviderCallContext) {
+    async openSession(input, ctx: ProviderCallContext) {
       const started = Date.now();
       if (atCapacity()) {
         return failure(
@@ -422,27 +257,42 @@ export function createLiveLocalBrowser(cfg: ProviderConfig): BrowserAdapter {
 
       let browser: Browser | undefined;
       try {
-        browser = await chromium.launch({
-          channel: cfg.channel,
-          headless: true,
-          timeout: config.browser.timeoutMs,
-        });
-        const page = await browser.newPage();
+        const connected = transport ? await transport.connect(ctx) : undefined;
+        browser =
+          connected?.browser ??
+          (await chromium.launch({
+            channel: cfg.channel,
+            headless: cfg.headless ?? true,
+            timeout: config.browser.timeoutMs,
+          }));
+        const page = connected?.page ?? (await browser.newPage());
+        await page.setViewportSize({ width: 1280, height: 720 });
         page.setDefaultTimeout(config.browser.timeoutMs);
 
         if (input.startUrl) {
           await page.goto(input.startUrl, { waitUntil: 'domcontentloaded' });
         }
 
-        const sessionId = 'lb_' + Math.random().toString(36).slice(2, 10);
-        sessions.set(sessionId, { browser, page });
+        const sessionId = backend + '_' + Math.random().toString(36).slice(2, 10);
+        sessions.set(sessionId, { browser, page, credentialRef: connected?.credentialRef });
+        browser.on?.('disconnected', () => {
+          sessions.delete(sessionId);
+          notifyBrowserSessionClosed(sessionId);
+        });
+        page.context().on('page', (newPage) => {
+          const handle = sessions.get(sessionId);
+          if (handle) {
+            handle.page = newPage;
+            handle.snapshot = undefined;
+          }
+        });
 
         // No live view URL: the browser is on this machine. Reporting a fake
         // one would break the truthful-labeling acceptance criterion.
         return {
           ok: true as const,
-          data: { sessionId, liveViewUrl: undefined },
-          meta: meta('openSession', started, LOCAL_BROWSER_DESTINATION),
+          data: { sessionId, interactive: true },
+          meta: meta('openSession', started, destination),
         };
       } catch (err) {
         // A half-launched browser is a leaked Chrome process. Close it here —
@@ -452,9 +302,10 @@ export function createLiveLocalBrowser(cfg: ProviderConfig): BrowserAdapter {
       }
     },
 
-    async act(input, _ctx) {
+    async act(input, ctx) {
       const started = Date.now();
       const handle = sessions.get(input.sessionId);
+      transport?.validate?.(handle?.credentialRef, ctx);
       if (!handle) {
         return failure('act', started, new Error('Unknown sessionId'), 'BAD_INPUT');
       }
@@ -478,20 +329,41 @@ export function createLiveLocalBrowser(cfg: ProviderConfig): BrowserAdapter {
         handle.snapshot = undefined;
         return {
           ok: true as const,
-          data: { url: handle.page.url() },
-          meta: meta('act', started, LOCAL_BROWSER_DESTINATION),
+          data: { url: browserLocation(handle.page.url()) },
+          meta: meta('act', started, destination),
         };
       } catch (err) {
         return failure('act', started, err);
       }
     },
 
+    async navigate(input, ctx) {
+      const started = Date.now();
+      const handle = sessions.get(input.sessionId);
+      transport?.validate?.(handle?.credentialRef, ctx);
+      if (!handle) {
+        return failure('navigate', started, new Error('Unknown sessionId'), 'BAD_INPUT');
+      }
+      try {
+        handle.snapshot = undefined;
+        await handle.page.goto(input.url, { waitUntil: 'domcontentloaded' });
+        return {
+          ok: true as const,
+          data: { url: browserLocation(handle.page.url()) },
+          meta: meta('navigate', started, destination),
+        };
+      } catch (err) {
+        return failure('navigate', started, err);
+      }
+    },
+
     async extract<T = unknown>(
       input: { sessionId: string; instruction: string },
-      _ctx: ProviderCallContext,
+      ctx: ProviderCallContext,
     ) {
       const started = Date.now();
       const handle = sessions.get(input.sessionId);
+      transport?.validate?.(handle?.credentialRef, ctx);
       if (!handle) {
         return failure<T>('extract', started, new Error('Unknown sessionId'), 'BAD_INPUT');
       }
@@ -500,25 +372,28 @@ export function createLiveLocalBrowser(cfg: ProviderConfig): BrowserAdapter {
         // CSS scope; empty means the whole body.
         const scope = input.instruction.trim();
         const text = scope
-          ? await handle.page.locator(scope).first().innerText()
+          ? // Short wait: a scope that is absent (no <main>) should fall back
+            // fast, not hold the tool for Playwright's 30s default.
+            await handle.page.locator(scope).first().innerText({ timeout: 2_000 })
           : await handle.page.locator('body').innerText();
         return {
           ok: true as const,
           data: {
-            url: handle.page.url(),
+            url: browserLocation(handle.page.url()),
             title: await handle.page.title().catch(() => ''),
             text: truncate(text, 4000),
           } as T,
-          meta: meta('extract', started, LOCAL_BROWSER_DESTINATION),
+          meta: meta('extract', started, destination),
         };
       } catch (err) {
         return failure<T>('extract', started, err);
       }
     },
 
-    async snapshot(input, _ctx) {
+    async snapshot(input, ctx) {
       const started = Date.now();
       const handle = sessions.get(input.sessionId);
+      transport?.validate?.(handle?.credentialRef, ctx);
       if (!handle) {
         return failure<ElementTable>(
           'snapshot',
@@ -537,16 +412,17 @@ export function createLiveLocalBrowser(cfg: ProviderConfig): BrowserAdapter {
         return {
           ok: true as const,
           data: snap.table,
-          meta: meta('snapshot', started, LOCAL_BROWSER_DESTINATION),
+          meta: meta('snapshot', started, destination),
         };
       } catch (err) {
         return failure<ElementTable>('snapshot', started, err);
       }
     },
 
-    async perform(input, _ctx) {
+    async perform(input, ctx) {
       const started = Date.now();
       const handle = sessions.get(input.sessionId);
+      transport?.validate?.(handle?.credentialRef, ctx);
       if (!handle) {
         return failure<BrowserPerformResult>(
           'perform',
@@ -573,10 +449,10 @@ export function createLiveLocalBrowser(cfg: ProviderConfig): BrowserAdapter {
             ok: true as const,
             data: {
               operation: input.operation,
-              url: handle.page.url(),
+              url: browserLocation(handle.page.url()),
               navigated: false,
             },
-            meta: meta('perform', started, LOCAL_BROWSER_DESTINATION),
+            meta: meta('perform', started, destination),
           };
         } catch (err) {
           return failure<BrowserPerformResult>('perform', started, err);
@@ -619,7 +495,10 @@ export function createLiveLocalBrowser(cfg: ProviderConfig): BrowserAdapter {
         }
 
         const state = await handle.page
-          .evaluate<TargetState | null, undefined>(validateTargetScript(domIndex), undefined)
+          .evaluate<TargetState | null, undefined>(
+            validateTargetScript(domIndex, { label: row.label, role: row.role }),
+            undefined,
+          )
           .catch(() => null);
 
         const rejection = rejectionFor(state);
@@ -653,14 +532,122 @@ export function createLiveLocalBrowser(cfg: ProviderConfig): BrowserAdapter {
           data: {
             operation: input.operation,
             index: input.index,
-            url,
+            url: browserLocation(url),
             navigated: url !== urlBefore,
           },
-          meta: meta('perform', started, LOCAL_BROWSER_DESTINATION),
+          meta: meta('perform', started, destination),
         };
       } catch (err) {
         return failure<BrowserPerformResult>('perform', started, err);
       }
+    },
+
+    async viewer(input, ctx) {
+      const started = Date.now();
+      const handle = sessions.get(input.sessionId);
+      if (!handle) return failure('viewer', started, new Error('Unknown sessionId'), 'BAD_INPUT');
+      transport?.validate?.(handle.credentialRef, ctx);
+      try {
+        const supplied = transport?.viewer
+          ? await transport.viewer(handle.page, input.mode, ctx)
+          : {};
+        return {
+          ok: true as const,
+          data: {
+            providerId: backend,
+            mode: 'live' as const,
+            kind: 'stream' as const,
+            owner: 'agent' as const,
+            revision: 0,
+            phase: 'agent_running' as const,
+            pageUrl: browserLocation(handle.page.url()),
+            canWatch: true,
+            canControl: true,
+            interactive: input.mode === 'control',
+            width: 1280,
+            height: 720,
+            ...supplied,
+          },
+          meta: meta('viewer', started, destination),
+        };
+      } catch (err) {
+        return failure('viewer', started, err);
+      }
+    },
+    async liveView(sessionId, ctx) {
+      const handle = sessions.get(sessionId);
+      if (!handle)
+        return failure('liveView', Date.now(), new Error('Unknown sessionId'), 'BAD_INPUT');
+      transport?.validate?.(handle.credentialRef, ctx);
+      return {
+        ok: true as const,
+        data: { pageUrl: browserLocation(handle.page.url()), interactive: true },
+        meta: meta('liveView', Date.now(), destination),
+      };
+    },
+    async captureFrame(sessionId, ctx) {
+      const handle = sessions.get(sessionId);
+      if (!handle)
+        return failure('captureFrame', Date.now(), new Error('Unknown sessionId'), 'BAD_INPUT');
+      transport?.validate?.(handle.credentialRef, ctx);
+      try {
+        const bytes = await handle.page.screenshot({ type: 'jpeg', quality: 65, fullPage: false });
+        return {
+          ok: true as const,
+          data: { bytes, width: 1280, height: 720 },
+          meta: meta('captureFrame', Date.now(), destination),
+        };
+      } catch (err) {
+        return failure('captureFrame', Date.now(), err);
+      }
+    },
+    async humanInput(input, ctx) {
+      const handle = sessions.get(input.sessionId);
+      if (!handle)
+        return failure('humanInput', Date.now(), new Error('Unknown sessionId'), 'BAD_INPUT');
+      transport?.validate?.(handle.credentialRef, ctx);
+      try {
+        const entry = input.input;
+        if (entry.type === 'click') await handle.page.mouse.click(entry.x, entry.y);
+        else if (entry.type === 'key') await handle.page.keyboard.press(entry.key);
+        else if (entry.type === 'text') await handle.page.keyboard.insertText(entry.text);
+        else await handle.page.mouse.wheel(entry.deltaX, entry.deltaY);
+        handle.snapshot = undefined;
+        return { ok: true as const, data: null, meta: meta('humanInput', Date.now(), destination) };
+      } catch (err) {
+        return failure('humanInput', Date.now(), err);
+      }
+    },
+    async revokeControl(sessionId, _ctx) {
+      const handle = sessions.get(sessionId);
+      if (!handle)
+        return failure('revokeControl', Date.now(), new Error('Unknown sessionId'), 'BAD_INPUT');
+      try {
+        await transport?.revoke?.(handle.page);
+        return {
+          ok: true as const,
+          data: null,
+          meta: meta('revokeControl', Date.now(), destination),
+        };
+      } catch (err) {
+        return failure('revokeControl', Date.now(), err);
+      }
+    },
+    async invalidateSnapshot(sessionId, _ctx) {
+      const handle = sessions.get(sessionId);
+      if (!handle)
+        return failure(
+          'invalidateSnapshot',
+          Date.now(),
+          new Error('Unknown sessionId'),
+          'BAD_INPUT',
+        );
+      handle.snapshot = undefined;
+      return {
+        ok: true as const,
+        data: null,
+        meta: meta('invalidateSnapshot', Date.now(), destination),
+      };
     },
 
     async closeSession(sessionId, _ctx) {
@@ -680,37 +667,11 @@ export function createLiveLocalBrowser(cfg: ProviderConfig): BrowserAdapter {
         return {
           ok: true as const,
           data: null,
-          meta: meta('closeSession', started, LOCAL_BROWSER_DESTINATION),
+          meta: meta('closeSession', started, destination),
         };
       } catch (err) {
         return failure('closeSession', started, err);
       }
     },
   };
-}
-
-const NON_TEXT_INPUT = new Set([
-  'checkbox',
-  'radio',
-  'submit',
-  'button',
-  'reset',
-  'file',
-  'image',
-  'range',
-  'color',
-]);
-
-function inferRole(tag: string, type: string | null): string {
-  if (tag === 'a') return 'link';
-  if (tag === 'button') return 'button';
-  if (tag === 'select') return 'combobox';
-  if (tag === 'textarea') return 'textbox';
-  if (tag === 'input') {
-    if (type === 'checkbox') return 'checkbox';
-    if (type === 'radio') return 'radio';
-    if (type === 'submit' || type === 'button' || type === 'reset') return 'button';
-    return 'textbox';
-  }
-  return tag || 'element';
 }

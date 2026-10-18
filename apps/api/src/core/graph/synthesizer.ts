@@ -33,6 +33,7 @@ import {
   type ToolCatalogEntry,
 } from './synthesisPrompt.js';
 import { newId, nowIso } from '../../lib/ids.js';
+import { unknownGraphTools } from './preflight.js';
 
 export interface SynthesisDependencies {
   listTools(conversationId: string): Promise<ToolCatalogEntry[]>;
@@ -137,7 +138,9 @@ export async function synthesiseGraph(
         // Simple direct plans do not need the frontier route. Adaptive plans
         // retain the larger budget because subagent goals and bounds need detail.
         tier: modeHint === 'direct' ? 'standard' : 'frontier',
-        maxTokens: modeHint === 'direct' ? 3072 : 4096,
+        // Thinking-capable models spend part of this budget before emitting any
+        // JSON: a 3072 cap produced ~1.5-3k chars cut off mid-document.
+        maxTokens: modeHint === 'direct' ? 8192 : 12288,
         json: true,
       },
       {
@@ -188,7 +191,12 @@ export async function synthesiseGraph(
         '\n  raw reply:',
         preview(completion.data.text),
       );
-      repairHint = 'Your reply was not valid JSON. Return ONLY the JSON object.';
+      // tokensOut at the cap means the reply was cut off, not malformed.
+      const cap = modeHint === 'direct' ? 8192 : 12288;
+      repairHint =
+        completion.data.tokensOut >= cap
+          ? 'Your reply was cut off before the JSON ended. Return a shorter document: fewer nodes, terse labels, no prose.'
+          : 'Your reply was not valid JSON. Return ONLY the JSON object.';
       continue;
     }
 
@@ -285,36 +293,6 @@ export async function synthesiseGraph(
     repairHint,
   );
   throw new SynthesisError('Could not produce a valid graph in two attempts', { repairHint });
-}
-
-function unknownGraphTools(graph: AgentGraph, catalog: Set<string>): string[] {
-  const referenced = new Set<string>();
-  for (const node of graph.nodes) {
-    const config = node.config as Record<string, unknown>;
-    if (node.type === 'tool' || node.type === 'submit') {
-      if (typeof config.tool === 'string') referenced.add(config.tool);
-    }
-    if (node.type === 'dispatch') {
-      for (const tool of Array.isArray(config.candidateTools) ? config.candidateTools : []) {
-        if (typeof tool === 'string') referenced.add(tool);
-      }
-      if (config.args && typeof config.args === 'object' && !Array.isArray(config.args)) {
-        for (const tool of Object.keys(config.args as object)) referenced.add(tool);
-      }
-    }
-    if (node.type === 'agent_task') {
-      for (const tool of Array.isArray(config.availableTools) ? config.availableTools : []) {
-        if (typeof tool === 'string') referenced.add(tool);
-      }
-      for (const tool of Array.isArray(config.toolCeiling) ? config.toolCeiling : []) {
-        if (typeof tool === 'string') referenced.add(tool);
-      }
-    }
-    if (node.type === 'swarm' && typeof config.workerTool === 'string') {
-      referenced.add(config.workerTool);
-    }
-  }
-  return [...referenced].filter((tool) => !catalog.has(tool)).sort();
 }
 
 async function chooseSynthesisMode(

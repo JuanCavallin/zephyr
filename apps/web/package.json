@@ -9,7 +9,8 @@
     "preview": "vite preview",
     "typecheck": "tsc --noEmit",
     "test": "node --experimental-strip-types --test \"tests/*.test.mjs\"",
-    "test:browser": "node tests/workspace.browser.mjs"
+    "test:browser": "node tests/workspace.browser.mjs",
+    "test:actions-browser": "node tests/actions.browser.mjs"
   },
   "dependencies": {
     "@htn/shared": "workspace:*",

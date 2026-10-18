@@ -2,7 +2,7 @@
 
 The numbers the README quotes about Zephyr's own performance and guarantees, and where each
 one comes from. Browser figures were measured on 2026-10-09; the rest are read from the code
-(line links as of commit `35c5867`).
+(values and line links checked on 2026-10-16).
 
 ## Browser: what Jev sees
 
@@ -30,11 +30,13 @@ to 2.2M tokens. Counted in characters instead of tokens, the cut is 98.4%.
 **Before** is the shape each step replaced, re-implemented in the benchmark. The snapshot read
 every element with separate Playwright calls (visibility, tag, role, type, aria-label, text,
 placeholder, title: about 8 per element, for up to 60 visible elements), as the comment in
-[localbrowser/live.ts](../apps/api/src/providers/localbrowser/live.ts#L112-L114) records. The
-target check made 4 calls: `count`, `isVisible`, `isEnabled` and an `elementFromPoint` probe,
-as in `localbrowser/live.ts` at commit `fea5826`.
-**After** is the adapter today: `COLLECT_ROWS` and `validateTargetScript` in
-[localbrowser/live.ts](../apps/api/src/providers/localbrowser/live.ts#L112-L204).
+[browserPage.ts](../apps/api/src/providers/browserPage.ts#L63-L65) records. The target check
+made 4 calls: `count`, `isVisible`, `isEnabled` and an `elementFromPoint` probe, as in
+`localbrowser/live.ts` at commit `fea5826`.
+**After** is the code every browser adapter runs today: `COLLECT_ROWS` and
+`validateTargetScript` in
+[browserPage.ts](../apps/api/src/providers/browserPage.ts#L67-L139). The benchmark imports
+both, and the Jev request it measures comes from the decider's own `planBrowserQuestions`.
 
 ## Per-site results
 
@@ -91,18 +93,18 @@ python apps/api/scripts/bench-browser-tokens.py .data/bench-browser
 
 | Claim                                         | Value                                                                                                                 | Where                                                                                                                                                                                                         |
 | --------------------------------------------- | --------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Tools Jev exposes per task                    | At most 8, each with probability ≥ 0.5                                                                                | [jev/live.ts](../apps/api/src/providers/jev/live.ts#L23-L24), [L579–L582](../apps/api/src/providers/jev/live.ts#L579-L582), [decisions/service.ts](../apps/api/src/core/decisions/service.ts#L97)             |
-| Composio candidates per task                  | At most 24 (`COMPOSIO_DISCOVERY_LIMIT`)                                                                               | [config.ts](../apps/api/src/config.ts#L95)                                                                                                                                                                    |
+| Tools Jev exposes per task                    | At most 8, each with probability ≥ 0.5                                                                                | [jev/live.ts](../apps/api/src/providers/jev/live.ts#L25-L26), [L644–L647](../apps/api/src/providers/jev/live.ts#L644-L647), [decisions/service.ts](../apps/api/src/core/decisions/service.ts#L103)            |
+| Composio candidates per task                  | At most 24 (`COMPOSIO_DISCOVERY_LIMIT`)                                                                               | [config.ts](../apps/api/src/config.ts#L118)                                                                                                                                                                   |
 | Tool catalog behind them                      | 1,000+ tools; Composio lists [1,500+ apps](https://composio.dev)                                                      | [README providers table](../README.md#providers)                                                                                                                                                              |
-| Model routing                                 | Privacy (private, cloud) × intelligence (low, high) picks a local, cheap or frontier route                            | [jev/live.ts](../apps/api/src/providers/jev/live.ts#L501-L567)                                                                                                                                                |
-| Jev confidence floor                          | 0.7; below it a deterministic rule decides                                                                            | [decisions/service.ts](../apps/api/src/core/decisions/service.ts#L96)                                                                                                                                         |
-| Browser decision budget                       | 2 s, then the deterministic fallback                                                                                  | [config.ts](../apps/api/src/config.ts#L82)                                                                                                                                                                    |
-| Exact-action broker                           | 13 error codes, every one fails closed                                                                                | [broker.ts](../apps/api/src/core/tools/broker.ts#L24-L37)                                                                                                                                                     |
-| Irreversible actions, e.g. `GMAIL_SEND_EMAIL` | At least `ask_user`, never automatic; a revision is re-validated and re-authorized, and cannot change the destination | [register.ts](../apps/api/src/providers/composio/register.ts#L24-L33), [decisions/service.ts](../apps/api/src/core/decisions/service.ts#L66-L68), [broker.ts](../apps/api/src/core/tools/broker.ts#L283-L333) |
-| Test assertions run in CI                     | 503 across 19 test files: 16 API check scripts and 3 web test files                                                   | the command below                                                                                                                                                                                             |
+| Model routing                                 | Privacy (private, cloud) × intelligence (low, high) picks a local, cheap or frontier route                            | [jev/live.ts](../apps/api/src/providers/jev/live.ts#L566-L632)                                                                                                                                                |
+| Jev confidence floor                          | 0.7; below it a deterministic rule decides                                                                            | [decisions/service.ts](../apps/api/src/core/decisions/service.ts#L102)                                                                                                                                        |
+| Browser decision budget                       | 2 s, then the deterministic fallback                                                                                  | [config.ts](../apps/api/src/config.ts#L102)                                                                                                                                                                   |
+| Exact-action broker                           | 14 error codes, every one fails closed                                                                                | [broker.ts](../apps/api/src/core/tools/broker.ts#L33-L47)                                                                                                                                                     |
+| Irreversible actions, e.g. `GMAIL_SEND_EMAIL` | At least `ask_user`, never automatic; a revision is re-validated and re-authorized, and cannot change the destination | [register.ts](../apps/api/src/providers/composio/register.ts#L49-L56), [decisions/service.ts](../apps/api/src/core/decisions/service.ts#L72-L74), [broker.ts](../apps/api/src/core/tools/broker.ts#L323-L391) |
+| Test assertions run in CI                     | 942 across 29 test files: the 24 API check scripts in `check:all` and 5 web test files                                | the command below                                                                                                                                                                                             |
 
 ```bash
 grep -ohE '\bassert(\.[a-zA-Z]+)?\(' \
-  apps/api/scripts/{graph-schema,graph-synthesis,graph-context,graph-scopes,graph-critique,jev-decisions,model-gateway,mcp-gateway,mcp-connections,sqlite-store,tool-broker,composio-catalog,browser-tools,content-check,gemini-backend,anthropic-backend}.check.ts \
-  apps/web/tests/{theme,tools,workspace}.test.mjs | wc -l     # 503
+  apps/api/scripts/{graph-schema,graph-synthesis,graph-context,graph-scopes,graph-critique,benchmark,jev-decisions,agent-single-run,model-gateway,mcp-gateway,mcp-connections,sqlite-store,tool-broker,composio-catalog,browser-tools,content-check,gemini-backend,anthropic-backend,credentials,search,browser-integration,browser-http,action-workspace,authoring-mock}.check.ts \
+  apps/web/tests/*.test.mjs | wc -l     # 942
 ```

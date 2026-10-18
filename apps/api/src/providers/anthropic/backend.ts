@@ -20,8 +20,11 @@ import type {
   OpenAiMessage,
   OpenAiTool,
 } from '../../core/modelGateway/service.js';
+import { isBoundTextRoute } from '../../core/modelGateway/catalog.js';
 import { newId } from '../../lib/ids.js';
 import type { RecordEgress } from '../withEgress.js';
+import type { CredentialStore } from '../../services/credentials.js';
+import { costCents } from '../pricing.js';
 
 const DEFAULT_BASE_URL = 'https://api.anthropic.com/v1';
 const ANTHROPIC_VERSION = '2023-06-01';
@@ -60,7 +63,12 @@ export interface AnthropicRequest {
 interface AnthropicResponse {
   model?: string;
   content?: AnthropicContentBlock[];
-  usage?: { input_tokens?: number; output_tokens?: number };
+  usage?: {
+    input_tokens?: number;
+    output_tokens?: number;
+    cache_read_input_tokens?: number | null;
+    cache_creation_input_tokens?: number | null;
+  };
   error?: { message?: string };
 }
 
@@ -68,14 +76,47 @@ export function createAnthropicBackend(
   cfg: ProviderConfig,
   recordEgress: RecordEgress,
   fallback: ChatModelBackend,
+  credentialResolver?: CredentialStore,
 ): ChatModelBackend {
   return {
     async complete(input, ctx) {
-      if (input.route.providerId !== 'anthropic') return fallback.complete(input, ctx);
-      if (cfg.mode !== 'live' || !cfg.apiKey) {
+      if (input.route.providerId !== 'anthropic' || isBoundTextRoute(input.route)) {
+        return fallback.complete(input, ctx);
+      }
+      if (cfg.mode !== 'live') {
         throw new Error('Anthropic route selected while ANTHROPIC_MODE is not live.');
       }
-      return completeLive(cfg, input, ctx, recordEgress);
+      const credential = credentialResolver
+        ? await credentialResolver.require({
+            runId: ctx.runId,
+            providerId: 'anthropic',
+            purpose: 'model',
+          })
+        : null;
+      const effective = credential ? { ...cfg, apiKey: credential.secret } : cfg;
+      if (!effective.apiKey) throw new Error('Anthropic credentials are required.');
+      try {
+        return await completeLive(
+          effective,
+          input,
+          ctx,
+          recordEgress,
+          credential && credentialResolver
+            ? () =>
+                credentialResolver.assertCurrent(credential.reference, {
+                  runId: ctx.runId,
+                  providerId: 'anthropic',
+                  purpose: 'model',
+                })
+            : undefined,
+        );
+      } catch (error) {
+        const message =
+          error instanceof Error && error.message.startsWith('Anthropic ')
+            ? error.message.replaceAll(effective.apiKey, '[credential redacted]')
+            : 'Anthropic request failed.';
+        throw new Error(message);
+      }
     },
   };
 }
@@ -282,11 +323,16 @@ async function completeLive(
   input: ChatModelBackendInput,
   ctx: ProviderCallContext,
   recordEgress: RecordEgress,
+  beforeRequest?: () => void,
 ): Promise<ChatModelBackendResult> {
   const started = Date.now();
   const endpoint = (cfg.baseUrl ?? DEFAULT_BASE_URL).replace(/\/$/, '') + '/messages';
   let tokensIn: number | undefined;
   let tokensOut: number | undefined;
+  let cacheReadTokens: number | undefined;
+  let cacheWriteTokens: number | undefined;
+  let model: string | undefined;
+  let estimatedCostCents: number | undefined;
 
   try {
     const translated = toAnthropicRequest(input.messages);
@@ -294,30 +340,65 @@ async function completeLive(
     const payload = {
       model: input.route.modelId,
       max_tokens: input.maxTokens ?? 1024,
+      // An agent turn resends the same system prompt, tool schemas and growing
+      // transcript every time. Automatic caching bills the repeated prefix at
+      // ~0.1x input on the next turn. Prefixes under the model's minimum are
+      // simply not cached, so this is safe on short calls too.
+      cache_control: { type: 'ephemeral' },
       ...translated,
-      ...(tools.length > 0 ? { tools } : {}),
+      ...(tools.length > 0
+        ? {
+            tools,
+            // Ask for one call at a time rather than discarding extras in
+            // parseToolCalls: a model that planned three parallel searches and
+            // saw one run re-planned the other two on every following call.
+            tool_choice:
+              input.toolChoice === 'none'
+                ? { type: 'none' }
+                : { type: 'auto', disable_parallel_tool_use: true },
+          }
+        : {}),
     };
-    const response = await fetchWithOneRetry(endpoint, cfg.apiKey ?? '', payload, ctx.signal);
+    const response = await fetchWithOneRetry(
+      endpoint,
+      cfg.apiKey ?? '',
+      payload,
+      ctx.signal,
+      beforeRequest,
+    );
     if (!response.ok) {
-      throw new Error('Anthropic returned HTTP ' + response.status + (await safeDetail(response)));
+      throw new Error('Anthropic returned HTTP ' + response.status + '.');
     }
 
     const body = (await response.json()) as AnthropicResponse;
+    if (cfg.apiKey && JSON.stringify(body).includes(cfg.apiKey))
+      throw new Error('Anthropic response contained credential data and was refused.');
     const blocks = body.content;
     if (!Array.isArray(blocks)) {
-      throw new Error(
-        'Anthropic returned no content (' + (body.error?.message ?? 'empty response') + ').',
-      );
+      throw new Error('Anthropic returned no content.');
     }
-    tokensIn = finite(body.usage?.input_tokens) ?? 0;
+    // `input_tokens` EXCLUDES cached tokens; tokensIn reports the whole prompt
+    // so token counts stay comparable with and without caching.
+    const uncached = finite(body.usage?.input_tokens) ?? 0;
+    cacheReadTokens = finite(body.usage?.cache_read_input_tokens) ?? 0;
+    cacheWriteTokens = finite(body.usage?.cache_creation_input_tokens) ?? 0;
+    tokensIn = uncached + cacheReadTokens + cacheWriteTokens;
     tokensOut = finite(body.usage?.output_tokens) ?? 0;
+    model = body.model ?? input.route.modelId;
+    estimatedCostCents = costCents(model, {
+      inputTokens: uncached,
+      outputTokens: tokensOut,
+      cacheReadTokens,
+      cacheWriteTokens,
+    });
 
     return {
       text: blocks.flatMap((block) => (block.type === 'text' ? [block.text] : [])).join(''),
       toolCalls: parseToolCalls(blocks, input),
       tokensIn,
       tokensOut,
-      actualModel: body.model ?? input.route.modelId,
+      actualModel: model,
+      estimatedCostCents,
     };
   } finally {
     await recordEgress({
@@ -332,6 +413,10 @@ async function completeLive(
       latencyMs: Date.now() - started,
       tokensIn,
       tokensOut,
+      estimatedCostCents,
+      model: model ?? input.route.modelId,
+      cacheReadTokens,
+      cacheWriteTokens,
     }).catch((error: unknown) => {
       console.error(
         '[egress] failed to record Anthropic call:',
@@ -346,8 +431,11 @@ async function fetchWithOneRetry(
   apiKey: string,
   payload: unknown,
   signal?: AbortSignal,
+  beforeRequest?: () => void,
 ): Promise<Response> {
   for (let attempt = 0; attempt < 2; attempt += 1) {
+    signal?.throwIfAborted();
+    beforeRequest?.();
     const response = await fetch(endpoint, {
       method: 'POST',
       headers: {
@@ -368,15 +456,6 @@ async function fetchWithOneRetry(
     return response;
   }
   throw new Error('Anthropic retry loop exhausted.');
-}
-
-async function safeDetail(response: Response): Promise<string> {
-  try {
-    const text = (await response.text()).slice(0, 400);
-    return text ? ': ' + text : '';
-  } catch {
-    return '';
-  }
 }
 
 function finite(value: unknown): number | undefined {

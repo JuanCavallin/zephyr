@@ -1,14 +1,15 @@
 import type { Capability, TextModelAdapter } from '@htn/shared';
-import type { ProviderConfig } from '../../config.js';
+import {config,type ProviderConfig } from '../../config.js';
 import { mockBase, mockCall } from '../_mock.js';
 import { createLiveAnthropic } from './live.js';
 import { estimateCostCents } from './pricing.js';
 import { mockGraphFor } from './mockGraphs.js';
+import { credentials } from '../../services/credentials.js';
 
 const CAPABILITIES: readonly Capability[] = ['text.model'];
 
 export function create(cfg: ProviderConfig): TextModelAdapter {
-  if (cfg.mode === 'live') return createLiveAnthropic(cfg);
+  if (cfg.mode === 'live') return createLiveAnthropic(cfg, credentials);
   return createMock(cfg);
 }
 
@@ -26,7 +27,7 @@ function createMock(cfg: ProviderConfig): TextModelAdapter {
       // MOCK_ALL demo insurance is supposed to protect. Deterministic, so a
       // rehearsed demo is identical every time. See mockGraphs.ts.
       if (input.json && ctx.policyRule === 'graph-synthesis') {
-        const graph = mockGraphFor(input.prompt);
+        const graph = mockGraphFor(input.prompt, config.browser.backend);
         const jsonIn = Math.ceil((input.prompt.length + (input.system?.length ?? 0)) / 4);
         const jsonOut = Math.ceil(graph.length / 4);
         return mockCall(

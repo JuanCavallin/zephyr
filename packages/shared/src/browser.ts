@@ -128,6 +128,35 @@ export const LOCAL_BROWSER_DESTINATION = 'local://chromium';
  */
 export const BROWSERBASE_API_DESTINATION = 'https://api.browserbase.com';
 
+export const BROWSERLESS_DEFAULT_DESTINATION = 'https://production-sfo.browserless.io';
+
+export type BrowserBackend = 'browserbase' | 'browserless' | 'localbrowser';
+export interface BrowserControlState {
+  owner: 'agent' | 'human';
+  revision: number;
+  phase: 'agent_running' | 'draining' | 'human_control' | 'verifying' | 'closed';
+}
+export type BrowserHumanInput =
+  | { type: 'click'; x: number; y: number }
+  | { type: 'key'; key: string }
+  | { type: 'text'; text: string }
+  | { type: 'scroll'; deltaX: number; deltaY: number };
+export interface BrowserViewer extends BrowserControlState {
+  providerId: BrowserBackend;
+  mode: import('./providers.js').ProviderMode;
+  kind: 'iframe' | 'stream' | 'none';
+  liveViewUrl?: string;
+  pageUrl?: string;
+  interactive: boolean;
+  canWatch: boolean;
+  canControl: boolean;
+  width: number;
+  height: number;
+  expiresAt?: string;
+  simulated?: boolean;
+  reason?: string;
+}
+
 /* -------------------------------------------------------------------------- */
 /* Session records — what the UI needs to show a live browser                  */
 /* -------------------------------------------------------------------------- */
@@ -153,6 +182,11 @@ export const BROWSERBASE_API_DESTINATION = 'https://api.browserbase.com';
  * content — never put form values, cookies or credentials on it.
  */
 export interface BrowserSessionRecord {
+  /** Truthful execution and viewer state, never a bearer URL. */
+  mode?: import('./providers.js').ProviderMode;
+  viewerKind?: BrowserViewer['kind'];
+  owner?: BrowserControlState['owner'];
+  revision?: number;
   runId: string;
   /** The adapter's own opaque id, as returned by openSession. */
   sessionId: string;
@@ -177,4 +211,45 @@ export interface BrowserSessionRecord {
   /** Where the session was pointed when it opened, if anywhere. */
   startUrl?: string;
   openedAt: Iso;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Cross-run browser memory                                                   */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Which element a graph node used on a page, remembered across runs so a
+ * repeat visit needs no target decision. It records IDENTITY (role + label,
+ * plus which of several equal matches), never an index, never page text,
+ * typed values or query strings, and only for public pages. It remembers
+ * WHICH element, never permission: approval is decided afresh every time.
+ */
+export interface BrowserTargetMemory {
+  /** scope | operations | origin+path template | normalized goal. */
+  key: string;
+  /** `graphId|nodeId` for graph runs, `adhoc:<run kind>` otherwise. */
+  scope: string;
+  origin: string;
+  pathTemplate: string;
+  operation: BrowserOperation;
+  role: string;
+  label: string;
+  /** 0-based position among rows sharing this role and label. */
+  ordinal: number;
+  /** A person's correction outranks a model pick. */
+  source: 'jev' | 'deterministic' | 'human';
+  hits: number;
+  misses: number;
+  consecutiveMisses: number;
+  createdAt: Iso;
+  lastSeen: Iso;
+}
+
+/** An origin that showed a challenge, sign-in wall or empty page to an automated read. */
+export interface BrowserSiteBlock {
+  origin: string;
+  reason: 'empty_page' | 'browser_challenge';
+  count: number;
+  firstAt: Iso;
+  lastAt: Iso;
 }

@@ -1,10 +1,11 @@
 import type { ProviderAdapter, ProviderResult } from '@htn/shared';
 import type { ProviderConfig } from '../../config.js';
 import { mockBase } from '../_mock.js';
+import { localOllamaEndpoint } from './backend.js';
 
 export function create(cfg: ProviderConfig): ProviderAdapter {
   if (cfg.mode !== 'live') return mockBase('ollama', [], cfg.mode);
-  const baseUrl = (cfg.baseUrl ?? 'http://127.0.0.1:11434').replace(/\/$/, '');
+  const baseUrl = localOllamaEndpoint(cfg.baseUrl);
   return {
     id: 'ollama',
     mode: 'live',

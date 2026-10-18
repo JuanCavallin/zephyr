@@ -42,6 +42,17 @@ export interface BrowserDecisionRequest {
    */
   typeText?: string;
   signal?: AbortSignal;
+  /** Trusted server context only; never sourced from page content or model arguments. */
+  credentialRunId?: string;
+  /** Trusted run/provider/session/control generation, for isolated target resolutions. */
+  cacheScope?: string;
+  /** Trusted privacy policy: even the numbered table must stay on the machine. */
+  localOnly?: boolean;
+  /**
+   * Trusted `graphId|nodeId` (or `adhoc:<kind>`) for cross-run target memory.
+   * Absent means nothing is remembered beyond this run.
+   */
+  memoryScope?: string;
 }
 
 export interface BrowserDecision {
@@ -53,7 +64,9 @@ export interface BrowserDecision {
   /** Full distribution over the offered targets, when the source provides one. */
   probabilities?: Record<string, number>;
   /** Truthful labeling — the UI must not present a fallback as a model decision. */
-  source: 'jev' | 'deterministic' | 'cache';
+  source: 'jev' | 'deterministic' | 'cache' | 'memory';
+  /** For a `memory` hit: who originally chose this element. */
+  remembered?: 'jev' | 'deterministic' | 'human';
   /** Why, in one line. For the trace, not for the model. */
   rationale: string;
   /**
@@ -70,6 +83,22 @@ export interface BrowserDecision {
    * Defaults to `confidence >= LOW_CONFIDENCE_THRESHOLD` when omitted.
    */
   cacheable?: boolean;
+  /**
+   * What the model call cost, for the egress ledger. Only a decision that
+   * actually asked a model carries it; cache, memory, single-target and
+   * deterministic answers made no call and leave it out.
+   */
+  usage?: BrowserDecisionUsage;
+}
+
+export interface BrowserDecisionUsage {
+  destination: string;
+  model: string;
+  latencyMs: number;
+  tokensIn?: number;
+  tokensOut?: number;
+  /** Undefined when the call could not be priced, never 0 for "unknown". */
+  estimatedCostCents?: number;
 }
 
 export type BrowserDecider = (request: BrowserDecisionRequest) => Promise<BrowserDecision>;
@@ -283,7 +312,10 @@ export function pageKey(url: string, goal: string): string {
  */
 export function withResolutionCache(inner: BrowserDecider, cache: ResolutionCache): BrowserDecider {
   return async (request) => {
-    const key = pageKey(request.table.url, request.goal);
+    const key =
+      (request.cacheScope ?? request.credentialRunId ?? 'legacy') + ':' + (request.localOnly ? 'local' : 'public') +
+      '\u0000' +
+      pageKey(request.table.url, request.goal);
     const hit = cache.get(key);
 
     if (hit) {

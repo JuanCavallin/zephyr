@@ -21,6 +21,8 @@ toolsRouter.get('/tools', async (_req, res) => {
     family: tool.descriptor.family,
     effect: tool.descriptor.baselineEffect,
     reversibility: tool.descriptor.reversibility,
+    // Additive: lets a client mark simulated tools (a mocked backend) as such.
+    ...(tool.descriptor.executionMode ? { executionMode: tool.descriptor.executionMode } : {}),
   }));
   // Startup and connection lifecycle operations populate this registry; a
   // catalog read never performs provider discovery itself.

@@ -30,10 +30,19 @@ function note(label, detail) {
   console.log('  [INFO] ' + label + (detail ? ' -> ' + detail : ''));
 }
 
+// Dashboard mutations need the local control cookie and a same-origin header;
+// without them run creation is refused (401/403), not a live-adapter failure.
+let cookie = '';
+
 async function api(path, init) {
   const res = await fetch(BASE + path, {
     ...init,
-    headers: { 'content-type': 'application/json', ...(init?.headers ?? {}) },
+    headers: {
+      'content-type': 'application/json',
+      Origin: new URL(BASE).origin,
+      ...(cookie ? { Cookie: cookie } : {}),
+      ...(init?.headers ?? {}),
+    },
   });
   const body = await res.json().catch(() => null);
   return { status: res.status, body };
@@ -51,6 +60,16 @@ async function waitFor(runId, predicate, timeoutMs = 180_000) {
 
 async function main() {
   console.log('Live adapter check against ' + BASE + '\n');
+
+  const session = await fetch(BASE + '/api/credentials/session', {
+    method: 'POST',
+    headers: { Origin: new URL(BASE).origin },
+  });
+  cookie = session.headers.get('set-cookie')?.split(';')[0] ?? '';
+  if (!session.ok || !cookie) {
+    console.log('Could not establish a local control session (HTTP ' + session.status + ').');
+    process.exit(1);
+  }
 
   console.log('1. Which adapters are actually live');
   const providers = await api('/api/providers');

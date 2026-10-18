@@ -51,6 +51,10 @@ export function Nav({
           <Icon name="clock" />
           <span>Run history</span>
         </NavLink>
+        <NavLink to="/benchmarks">
+          <Icon name="activity" />
+          <span>Benchmarks</span>
+        </NavLink>
         <NavLink to="/connections">
           <Icon name="connect" />
           <span>Connections</span>

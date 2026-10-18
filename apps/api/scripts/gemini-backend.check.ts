@@ -12,6 +12,7 @@ import type { ChatModelBackendInput, OpenAiMessage } from '../src/core/modelGate
 import {
   geminiModelRoutes,
   parseToolCalls,
+  rememberThoughtSignatures,
   sanitizeSchema,
   toGeminiRequest,
   toGeminiTools,
@@ -52,7 +53,14 @@ import {
 
   const model = out.contents[1];
   assert.equal(model?.role, 'model', 'assistant must map to the model role');
-  assert.deepEqual(model?.parts, [{ functionCall: { name: 'mail_send', args: { to: 'a@b.c' } } }]);
+  // A call Gemini did not sign (another model made it) carries Google's
+  // documented stand-in; without any signature Gemini 3 answers HTTP 400.
+  assert.deepEqual(model?.parts, [
+    {
+      functionCall: { name: 'mail_send', args: { to: 'a@b.c' } },
+      thoughtSignature: 'skip_thought_signature_validator',
+    },
+  ]);
 
   // The tool result must be addressed by NAME, recovered from the call id.
   const toolTurn = out.contents[2];
@@ -71,7 +79,34 @@ import {
       tool_calls: [{ id: 'c1', type: 'function', function: { name: 'x', arguments: 'not json' } }],
     },
   ]);
-  assert.deepEqual(out.contents[0]?.parts, [{ functionCall: { name: 'x', args: {} } }]);
+  assert.deepEqual(out.contents[0]?.parts, [
+    { functionCall: { name: 'x', args: {} }, thoughtSignature: 'skip_thought_signature_validator' },
+  ]);
+}
+
+// --- Gemini's own thought signature is put back when its call is replayed ---
+{
+  const input = {
+    tools: [{ type: 'function', function: { name: 'mail_send' } }],
+  } as ChatModelBackendInput;
+  const returned = [
+    { functionCall: { name: 'mail_send', args: { to: 'a@b.c' } }, thoughtSignature: 'sig-123' },
+  ];
+  const calls = parseToolCalls(returned, input);
+  rememberThoughtSignatures(returned, calls);
+  const replayed = toGeminiRequest([
+    { role: 'user', content: 'Send it.' },
+    { role: 'assistant', content: '', tool_calls: calls },
+    { role: 'tool', tool_call_id: calls[0]!.id, content: 'delivered' },
+  ]);
+  assert.deepEqual(replayed.contents[1]?.parts, [
+    { functionCall: { name: 'mail_send', args: { to: 'a@b.c' } }, thoughtSignature: 'sig-123' },
+  ]);
+  assert.notEqual(
+    parseToolCalls(returned, input)[0]?.id,
+    calls[0]?.id,
+    'call ids are unique across requests, so signatures cannot collide',
+  );
 }
 
 // --- an assistant turn with nothing in it is dropped, not sent empty --------

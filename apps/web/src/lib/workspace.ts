@@ -39,7 +39,7 @@ export type TraceNode = {
 
 export type TraceTool = {
   id: string;
-  /** 'composio' | 'browserbase' | 'localbrowser' | 'mcp' ... Undefined when the catalog is unknown. */
+  /** 'composio' | 'browserbase' | 'browserless' | 'localbrowser' | 'mcp' ... Undefined when the catalog is unknown. */
   providerId?: string;
   family?: string;
   effect?: string;
@@ -65,7 +65,8 @@ export type ToolMeta = { providerId?: string; family?: string; effect?: string }
 const PROVIDER_LABELS: Record<string, string> = {
   composio: 'Composio',
   browserbase: 'Browserbase',
-  localbrowser: 'Local browser',
+  browserless: 'Browserless',
+  localbrowser: 'Local browser (Playwright)',
   mcp: 'MCP',
   hermes: 'Hermes',
 };
@@ -117,6 +118,7 @@ const APP_GLYPHS: Record<string, string> = {
 const PROVIDER_GLYPHS: Record<string, string> = {
   composio: '🔌',
   browserbase: '🌐',
+  browserless: '☁️',
   localbrowser: '🖥️',
   mcp: '🧩',
 };

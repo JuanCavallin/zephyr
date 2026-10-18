@@ -10,6 +10,7 @@ import { newId, nowIso } from '../../lib/ids.js';
 import { ApprovalRejectedError, waitForApproval } from '../approvalGate.js';
 import type { RunBus } from '../bus.js';
 import type { SessionStateService } from '../sessions/service.js';
+import { actionForTrace } from '../../services/actionEvidence.js';
 
 export interface ToolApprovalReceipt {
   approvalId: string;
@@ -113,14 +114,18 @@ function approvalQuestion(descriptor: ToolDescriptor, action: ToolAction): strin
 }
 
 function exactActionJson(action: ToolAction): Json {
+  const trace = actionForTrace(action);
   return {
     actionId: action.id,
     toolId: action.toolId,
     descriptorVersion: action.descriptorVersion,
     operation: action.operation,
-    arguments: action.arguments,
+    arguments: trace.arguments,
     destination: action.destination ?? null,
+    ...(action.accountRef ? { accountRef: action.accountRef } : {}),
+    ...(action.review ? { review: action.review } : {}),
     dataLabels: action.dataLabels,
+    ...(action.previewFingerprint ? { previewFingerprint: action.previewFingerprint } : {}),
   };
 }
 

@@ -26,6 +26,12 @@ import {
 } from './eligibility.js';
 
 export interface DecisionServiceOptions {
+  /**
+   * Below this, an action-policy recommendation is escalated one step towards a
+   * human (never relaxed). It is the only confidence floor: model routes and
+   * completion verdicts follow Jev at any confidence, because overriding them
+   * re-ran agent turns that had already finished their work.
+   */
   minimumConfidence?: number;
   maximumTools?: number;
   now?: () => string;
@@ -63,13 +69,50 @@ function deterministicActionPolicy(descriptor: ToolDescriptor, action: ToolActio
   ) {
     return 'deny';
   }
-  if (descriptor.baselineEffect === 'destructive' || descriptor.reversibility === 'irreversible') {
+  if (descriptor.requiresChangeReview || descriptor.baselineEffect === 'destructive' || descriptor.reversibility === 'irreversible') {
     return 'ask_user';
   }
   if (descriptor.baselineEffect === 'write' || descriptor.reversibility === 'recoverable') {
     return 'verify';
   }
   return 'auto';
+}
+
+function isPlainPublicRead(
+  baseline: ActionPolicy,
+  descriptor: ToolDescriptor,
+  action: ToolAction,
+): boolean {
+  return (
+    baseline === 'auto' &&
+    descriptor.baselineEffect === 'read' &&
+    descriptor.reversibility === 'reversible' &&
+    !descriptor.requiresChangeReview &&
+    descriptor.requiredScopes.length === 0 &&
+    !action.accountRef &&
+    action.dataLabels.every((label) => label === 'public')
+  );
+}
+
+/**
+ * The descriptor-only policy, with no Jev call. Used where the full policy is
+ * evaluated later with more information (a prepared browser target), so an
+ * early hard deny stops preparation without spending a second Jev round trip.
+ */
+export function baselineAuthorization(
+  descriptor: ToolDescriptor,
+  action: ToolAction,
+  at: string,
+): AuthorizationDecision {
+  const baseline = deterministicActionPolicy(descriptor, action);
+  return {
+    actionId: action.id,
+    recommendation: fallbackRecommendation(baseline, 'deterministic-pre-review'),
+    finalPolicy: baseline,
+    allowed: baseline === 'auto' || baseline === 'verify',
+    reasonCodes: ['descriptor-baseline-' + baseline, 'deterministic-pre-review'],
+    at,
+  };
 }
 
 function fallbackRecommendation(
@@ -133,14 +176,8 @@ export class DecisionService {
         reasonCodes: ['jev-returned-ineligible-model', 'deterministic-model-fallback'],
       };
     }
-    if (result.data.confidence < this.minimumConfidence) {
-      return {
-        selectedRouteId: fallback.id,
-        confidence: result.data.confidence,
-        probabilities: result.data.probabilities,
-        reasonCodes: [...result.data.reasonCodes, 'low-confidence-model-fallback'],
-      };
-    }
+    // An eligible pick stands at any confidence. Swapping a low-confidence pick
+    // for the cheapest route changed the model mid-task for no policy reason.
     return result.data;
   }
 
@@ -232,6 +269,11 @@ export class DecisionService {
 
     if (this.adapter.mode === 'live' && !canSendToRemoteDecisionModel(state)) {
       recommendation = fallbackRecommendation(baseline, 'deterministic-local-action-policy');
+    } else if (isPlainPublicRead(baseline, descriptor, action)) {
+      // Jev can only make a policy stricter, and a public, reversible,
+      // scope-free read is already `auto` with nothing to protect. Skipping
+      // the round trip keeps authorization deterministic, not absent.
+      recommendation = fallbackRecommendation(baseline, 'deterministic-public-read');
     } else {
       const result = await this.adapter.recommendActionPolicy({ state, action, descriptor }, ctx);
       recommendation = result.ok
@@ -239,10 +281,13 @@ export class DecisionService {
         : fallbackRecommendation('deny', 'jev-action-policy-failed');
     }
 
-    const confidencePolicy =
-      recommendation.confidence < this.minimumConfidence
-        ? escalateLowConfidence(recommendation.policy)
-        : recommendation.policy;
+    // Model uncertainty/risk is a human-review boundary, not a retryable tool
+    // rejection. Deterministic privacy/permission denials and failed policy
+    // evaluation still cannot be overridden by a receipt.
+    const failedPolicy = recommendation.reasonCodes.includes('jev-action-policy-failed');
+    const confidencePolicy = failedPolicy ? 'deny'
+      : recommendation.confidence < this.minimumConfidence || recommendation.policy === 'deny'
+        ? 'ask_user' : recommendation.policy;
     const finalPolicy = strictestActionPolicy(baseline, confidencePolicy);
     return {
       actionId: action.id,
@@ -280,35 +325,24 @@ export class DecisionService {
       judgment = result.ok
         ? result.data
         : {
-            status: this.fallbackCompletion(checkpoint),
+            status:
+              verificationFailures.length === 0 ? 'done' : this.fallbackCompletion(checkpoint),
             confidence: 0,
             probabilities: {},
             reasonCodes: ['jev-completion-failed', 'deterministic-completion-fallback'],
           };
     }
 
-    if (
-      judgment.status === 'done' &&
-      (verificationFailures.length > 0 || judgment.confidence < this.minimumConfidence)
-    ) {
-      return {
-        ...judgment,
-        status: this.fallbackCompletion(checkpoint),
-        verified: false,
-        verificationFailures: [
-          ...verificationFailures,
-          ...(judgment.confidence < this.minimumConfidence
-            ? ['completion-confidence-too-low']
-            : []),
-        ],
-        reasonCodes: [...judgment.reasonCodes, 'done-rejected-by-verifier'],
-      };
-    }
-
+    // Jev's verdict stands at any confidence and is never rewritten. Rewriting
+    // a low-confidence or unverified `done` into `continue` bought another full
+    // agent turn that redid finished work. A failed deterministic check is
+    // reported beside the verdict (`verified: false`), not substituted for it.
+    const unverifiedDone = judgment.status === 'done' && verificationFailures.length > 0;
     return {
       ...judgment,
       verified: judgment.status === 'done' && verificationFailures.length === 0,
       verificationFailures,
+      ...(unverifiedDone ? { reasonCodes: [...judgment.reasonCodes, 'done-unverified'] } : {}),
     };
   }
 

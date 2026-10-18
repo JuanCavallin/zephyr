@@ -11,6 +11,7 @@
 import type { ProviderAdapter, ProviderResult } from '@htn/shared';
 import type { ProviderConfig } from '../../config.js';
 import { mockBase } from '../_mock.js';
+import { credentials } from '../../services/credentials.js';
 
 const DEFAULT_BASE_URL = 'https://generativelanguage.googleapis.com/v1beta';
 
@@ -35,6 +36,13 @@ export function create(cfg: ProviderConfig): ProviderAdapter {
 
     async health(): Promise<ProviderResult<{ detail?: string }>> {
       const started = Date.now();
+      if (credentials.source === 'user') {
+        return {
+          ok: true,
+          data: { detail: 'User-funded Gemini; credentials checked per run.' },
+          meta: { ...meta(cfg, 'health', started), destination: 'local://credential-status' },
+        };
+      }
       try {
         // Listing models validates the key AND surfaces a stale model id: the
         // configured routes are checked against what the account can actually

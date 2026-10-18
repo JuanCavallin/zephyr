@@ -3047,3 +3047,250 @@ progress::-moz-progress-bar {
 .react-flow__attribution a {
   color: var(--faint);
 }
+
+/* ---- Debug log under the graph ------------------------------------------------------- */
+/* The region becomes a column: the graph (and any action workspace) keeps its old
+   row layout inside .route-map-main, and the log docks beneath it. */
+.route-map-region {
+  flex-direction: column;
+  gap: 12px;
+}
+.route-map-main {
+  display: flex;
+  flex: 1 1 0;
+  min-width: 0;
+  min-height: 0;
+}
+.debug-log {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  max-height: 46%;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--panel);
+  overflow: hidden;
+}
+.debug-log[data-open='true'] {
+  flex: 0 1 340px;
+}
+.debug-log-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border-bottom: 1px solid transparent;
+}
+.debug-log[data-open='true'] .debug-log-head {
+  border-bottom-color: var(--line);
+}
+.debug-log-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  background: none;
+  border: 0;
+  color: var(--text);
+  padding: 0;
+  cursor: pointer;
+}
+.debug-count {
+  color: var(--faint);
+  font-size: 12px;
+}
+.debug-spacer {
+  flex: 1;
+}
+.debug-pill,
+.debug-action,
+.debug-kind {
+  border: 1px solid var(--line-3);
+  background: var(--panel-2);
+  color: var(--secondary);
+  border-radius: 999px;
+  padding: 3px 10px;
+  font-size: 12px;
+  cursor: pointer;
+}
+.debug-pill-error {
+  color: var(--danger-text);
+  border-color: var(--danger-line);
+  background: var(--danger-soft);
+}
+.debug-pill-warn {
+  color: var(--amber-text);
+  border-color: var(--amber-line-dim);
+}
+.debug-pill-ok {
+  color: var(--accent-text);
+  cursor: default;
+}
+.debug-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 14px;
+  padding: 8px 12px 4px;
+}
+.debug-search {
+  flex: 1 1 200px;
+  min-width: 160px;
+  background: var(--panel-sunken);
+  border: 1px solid var(--line-3);
+  border-radius: 8px;
+  color: var(--text);
+  padding: 5px 9px;
+  font-size: 12.5px;
+}
+.debug-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--secondary);
+  font-size: 12px;
+  white-space: nowrap;
+}
+.debug-kinds {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  padding: 4px 12px 8px;
+}
+.debug-kind[aria-pressed='false'] {
+  opacity: 0.45;
+}
+.debug-kind[aria-pressed='true'] {
+  color: var(--accent-text);
+  border-color: var(--accent-line);
+}
+.debug-body {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  border-top: 1px solid var(--line);
+  font-size: 12.5px;
+}
+.debug-empty {
+  margin: 0;
+  padding: 18px 14px;
+  color: var(--faint);
+}
+.debug-row {
+  border-bottom: 1px solid var(--line);
+}
+.debug-row[data-level='error'] {
+  background: var(--danger-soft);
+  box-shadow: inset 3px 0 0 var(--danger-line);
+}
+.debug-row[data-level='warn'] {
+  box-shadow: inset 3px 0 0 var(--amber-line);
+}
+.debug-row-main {
+  display: grid;
+  grid-template-columns: 52px 14px 82px minmax(0, 1fr);
+  align-items: baseline;
+  gap: 8px;
+  width: 100%;
+  text-align: left;
+  background: none;
+  border: 0;
+  padding: 6px 12px;
+  color: var(--text-2);
+  cursor: pointer;
+}
+.debug-row-main:disabled {
+  cursor: default;
+}
+.debug-row-main:hover:not(:disabled) {
+  background: var(--hover);
+}
+.debug-time {
+  color: var(--faint);
+  font-variant-numeric: tabular-nums;
+  font-family: ui-monospace, 'Cascadia Mono', Consolas, monospace;
+  font-size: 11.5px;
+}
+.debug-level {
+  font-weight: 700;
+  text-align: center;
+}
+.debug-row[data-level='ok'] .debug-level {
+  color: var(--accent);
+}
+.debug-row[data-level='warn'] .debug-level {
+  color: var(--amber);
+}
+.debug-row[data-level='error'] .debug-level {
+  color: var(--danger);
+}
+.debug-row[data-level='pending'] .debug-level,
+.debug-row[data-level='info'] .debug-level {
+  color: var(--faint);
+}
+.debug-kind-tag {
+  color: var(--quiet);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.debug-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.debug-row-title {
+  overflow-wrap: anywhere;
+}
+.debug-row-summary {
+  color: var(--quiet);
+  overflow-wrap: anywhere;
+}
+.debug-row[data-level='error'] .debug-row-summary {
+  color: var(--danger-text);
+}
+.debug-details {
+  margin: 0;
+  padding: 2px 12px 10px 76px;
+  display: grid;
+  gap: 8px;
+}
+.debug-details dt {
+  color: var(--faint);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin-bottom: 2px;
+}
+.debug-details dd {
+  margin: 0;
+}
+.debug-details pre {
+  margin: 0;
+  max-height: 220px;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  background: var(--panel-sunken);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 8px 10px;
+  color: var(--text-2);
+  font-family: ui-monospace, 'Cascadia Mono', Consolas, monospace;
+  font-size: 11.5px;
+  line-height: 1.5;
+}
+@media (max-width: 900px) {
+  .debug-log,
+  .debug-log[data-open='true'] {
+    max-height: none;
+    flex: 0 0 auto;
+  }
+  .debug-body {
+    max-height: 420px;
+  }
+  .debug-details {
+    padding-left: 12px;
+  }
+}

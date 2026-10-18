@@ -8,7 +8,9 @@
  * this package is bundled into the browser.
  */
 
+export * from './actionEvidence.js';
 export * from './analytics.js';
+export * from './benchmark.js';
 export * from './browser.js';
 export * from './control.js';
 export * from './delegation.js';
@@ -17,6 +19,8 @@ export * from './events.js';
 export * from './executors.js';
 export * from './mcp.js';
 export * from './policy.js';
+export * from './pricing.js';
+export * from './reuse.js';
 export * from './providers.js';
 export * from './scheduling.js';
 export * from './schemas/index.js';

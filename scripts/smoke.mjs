@@ -12,6 +12,7 @@
 const BASE = process.env.SMOKE_BASE ?? 'http://localhost:8787';
 
 let failures = 0;
+let controlCookie = '';
 
 function check(label, condition, detail = '') {
   const mark = condition ? 'PASS' : 'FAIL';
@@ -22,7 +23,12 @@ function check(label, condition, detail = '') {
 async function api(path, init) {
   const res = await fetch(BASE + path, {
     ...init,
-    headers: { 'content-type': 'application/json', ...(init?.headers ?? {}) },
+    headers: {
+      'content-type': 'application/json',
+      Origin: new URL(BASE).origin,
+      ...(controlCookie ? { Cookie: controlCookie } : {}),
+      ...(init?.headers ?? {}),
+    },
   });
   const body = await res.json().catch(() => null);
   return { status: res.status, body };
@@ -40,6 +46,24 @@ async function waitFor(runId, predicate, timeoutMs = 20_000) {
 
 async function main() {
   console.log('Smoke test against ' + BASE + '\n');
+  const setup = await fetch(BASE + '/api/credentials/session', {
+    method: 'POST',
+    headers: { Origin: new URL(BASE).origin },
+  });
+  controlCookie = setup.headers.get('set-cookie')?.split(';')[0] ?? '';
+  check('local control session established', setup.ok && Boolean(controlCookie));
+  const unauthenticated = await fetch(BASE + '/api/conversations', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', Origin: new URL(BASE).origin },
+    body: '{}',
+  });
+  check('graph authoring requires authenticated local control', unauthenticated.status === 401);
+  const foreignOrigin = await api('/api/graphs', {
+    method: 'POST',
+    headers: { Origin: 'https://example.com' },
+    body: JSON.stringify({ name: 'Must not be created' }),
+  });
+  check('cross-origin dashboard mutations are denied', foreignOrigin.status === 403);
 
   console.log('1. Health and providers');
   const health = await api('/api/health');
@@ -97,7 +121,9 @@ async function main() {
   const needsInput = advertised.filter((p) => !p.directLaunch);
   check(
     'a playbook needing configuration is flagged rather than offered blindly',
-    needsInput.every((p) => p.kind === 'graph' || p.kind === 'agent'),
+    needsInput.every(
+      (p) => p.kind === 'graph' || p.kind === 'agent' || p.kind === 'baseline_agent',
+    ),
     needsInput.map((p) => p.kind).join(',') || 'none',
   );
 
@@ -377,13 +403,6 @@ async function main() {
       withNode.length + ' of ' + gBlocked.steps.length,
     );
 
-    const swarmSteps = gBlocked.steps.filter((s) => s.nodeId === 'verify');
-    check(
-      'a swarm parent and its workers share one nodeId',
-      swarmSteps.length === 4,
-      swarmSteps.length + ' steps on the swarm node',
-    );
-
     const dispatched = gBlocked.scheduleDecisions.find(
       (d) => d.rule === 'dispatch-selected-single-tool',
     );
@@ -393,20 +412,39 @@ async function main() {
       dispatched ? dispatched.availableTools.length + ' -> 1' : 'no dispatch decision',
     );
 
-    const gApproval = gBlocked.approvals.find((a) => a.status === 'pending');
-    await api('/api/approvals/' + gApproval.id + '/decide', {
-      method: 'POST',
-      body: JSON.stringify({ decision: 'approved' }),
-    });
-    const gDone = await waitFor(
-      gRunId,
-      (run) => run.status === 'succeeded' || run.status === 'failed',
-      60_000,
-    );
+    // Each external mutation has its own receipt, including background writes.
+    // Approving one gate cannot approve a later submit implicitly.
+    let gDone = gBlocked;
+    const graphDeadline = Date.now() + 60_000;
+    const decided = new Set();
+    while (
+      gDone &&
+      !['succeeded', 'failed', 'cancelled'].includes(gDone.run.status) &&
+      Date.now() < graphDeadline
+    ) {
+      for (const approval of gDone.approvals.filter(
+        (a) => a.status === 'pending' && !decided.has(a.id),
+      )) {
+        const result = await api('/api/approvals/' + approval.id + '/decide', {
+          method: 'POST',
+          body: JSON.stringify({ decision: 'approved' }),
+        });
+        check('each graph mutation receives explicit approval', result.status === 200);
+        decided.add(approval.id);
+      }
+      await new Promise((r) => setTimeout(r, 250));
+      gDone = (await api('/api/runs/' + gRunId)).body;
+    }
     check(
       'the graph run completed',
       gDone?.run?.status === 'succeeded',
       gDone?.run?.status ?? 'timed out',
+    );
+    const swarmSteps = gDone?.steps.filter((s) => s.nodeId === 'verify') ?? [];
+    check(
+      'a swarm parent and its workers share one nodeId',
+      swarmSteps.length === 4,
+      swarmSteps.length + ' steps on the swarm node',
     );
 
     const gAnalytics = await api('/api/runs/' + gRunId + '/analytics');

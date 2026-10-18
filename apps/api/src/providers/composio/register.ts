@@ -10,6 +10,7 @@ import type {
 import type { ProviderConfig } from '../../config.js';
 import type { InMemoryToolExecutorRegistry } from '../../core/tools/executors.js';
 import type { InMemoryToolRegistry } from '../../core/tools/registry.js';
+import { conditionalWriteField, isOfficeToolkit, normalizeComposioResult } from './results.js';
 
 export interface ClassifiedTool {
   toolId: string;
@@ -22,6 +23,30 @@ export interface ClassifiedTool {
 
 /** Explicit overrides are the reviewed security boundary for demo-critical operations. */
 const REVIEWED: Record<string, ClassifiedTool> = {
+  'forms.submit': {
+    toolId: 'forms.submit',
+    wireName: 'forms_submit',
+    family: 'forms',
+    baselineEffect: 'write',
+    reversibility: 'irreversible',
+    allowedDataLabels: ['public', 'private'],
+  },
+  'sheets.append': {
+    toolId: 'sheets.append',
+    wireName: 'sheets_append',
+    family: 'spreadsheet',
+    baselineEffect: 'write',
+    reversibility: 'recoverable',
+    allowedDataLabels: ['public', 'private'],
+  },
+  'calendar.create': {
+    toolId: 'calendar.create',
+    wireName: 'calendar_create',
+    family: 'calendar',
+    baselineEffect: 'write',
+    reversibility: 'recoverable',
+    allowedDataLabels: ['public', 'private'],
+  },
   GMAIL_SEND_EMAIL: {
     toolId: 'mail.send',
     wireName: 'mail_send',
@@ -165,6 +190,7 @@ export interface ComposioDiscoveryInput {
  * schemas and provider-native identifiers remain inside AgentOS.
  */
 export class ComposioToolCatalog {
+  private readonly registeredExecutors = new Map<string, string>();
   constructor(
     private readonly adapter: ToolboxAdapter,
     private readonly cfg: ProviderConfig,
@@ -173,7 +199,7 @@ export class ComposioToolCatalog {
   ) {}
 
   async bootstrapReviewed(): Promise<ComposioRegistrationReport> {
-    if (this.adapter.mode !== 'live') return emptyReport(this.cfg.toolSlugs ?? []);
+    if (this.adapter.mode === 'disabled') return emptyReport(this.cfg.toolSlugs ?? []);
     const result = await this.adapter.listTools({
       runId: 'sys_composio_bootstrap',
       policyRule: 'reviewed-tool-registry-bootstrap',
@@ -183,23 +209,36 @@ export class ComposioToolCatalog {
   }
 
   async discoverForTask(input: ComposioDiscoveryInput): Promise<ComposioRegistrationReport> {
-    if (this.adapter.mode !== 'live') return emptyReport();
+    if (this.adapter.mode === 'disabled') return emptyReport();
     const ctx: ProviderCallContext = {
       runId: input.runId,
       stepId: input.stepId,
       policyRule: 'task-scoped-tool-catalog-discovery',
       signal: input.signal,
     };
-    const result = await this.adapter.searchTools(
-      {
-        // Search by intent, not recipients or message bodies. This improves
-        // relevance and prevents task payloads entering provider query URLs.
-        query: catalogIntentQuery(input.query),
-        toolkits: input.toolkits ?? this.cfg.toolkits,
-        limit: input.limit ?? this.cfg.discoveryLimit,
-      },
-      ctx,
-    );
+    const search = (query: string) =>
+      this.adapter.searchTools(
+        {
+          query,
+          toolkits: input.toolkits ?? this.cfg.toolkits,
+          limit: input.limit ?? this.cfg.discoveryLimit,
+        },
+        ctx,
+      );
+    // Search by intent, not recipients or message bodies. This improves
+    // relevance and prevents task payloads entering provider query URLs.
+    // Composio's catalog search wants a short phrase: the full sentence found
+    // nothing for a question ("find out how many labels I have") and only
+    // noise for a detailed request (a calendar event "called 'X' tomorrow at
+    // 10am" matched 22 tools, none of them create_event). So the request's
+    // content words go first, then the sentence, then single words, stopping
+    // at the first that matches. Every query only drops words from the first.
+    let result: Awaited<ReturnType<typeof search>> | undefined;
+    for (const query of catalogSearchQueries(catalogIntentQuery(input.query))) {
+      result = await search(query);
+      if (!result.ok || result.data.length > 0) break;
+    }
+    if (!result) return emptyReport();
     if (!result.ok) return failureReport([], result.error.message);
     return this.register(result.data);
   }
@@ -216,10 +255,16 @@ export class ComposioToolCatalog {
       const connectedScope = 'composio:connected:' + tool.toolkit;
       const requiredScopes = [connectedScope, ...(tool.requiredScopes ?? [])];
       const grantedScopes = tool.connectedAccountId ? requiredScopes : [];
-      const executorRef = 'composio://' + tool.name + '@' + tool.version;
+      const accountBinding = createHash('sha256')
+        .update(tool.connectedAccountId ?? 'unconnected')
+        .digest('hex')
+        .slice(0, 16);
+      const executorRef = 'composio://' + tool.name + '@' + tool.version + '/' + accountBinding;
       const descriptor: ToolDescriptor = {
         id: classified.toolId,
-        version: tool.version,
+        // Provider execution retains tool.version below; AgentOS metadata also
+        // versions the trusted account binding so refresh invalidates old grants.
+        version: tool.version + '@' + accountBinding,
         providerId: 'composio',
         family: classified.family,
         description: trustedDescription(tool),
@@ -231,8 +276,12 @@ export class ComposioToolCatalog {
         allowedDataLabels: classified.allowedDataLabels,
         availability: tool.connectedAccountId ? 'available' : 'requires_connection',
         executorRef,
-        credentialRef: 'composio-connected-account:' + tool.toolkit,
+        credentialRef: 'composio-connected-account:' + accountBinding,
+        ...(tool.connectedAccountId ? { accountRef: 'composio:' + tool.connectedAccountId } : {}),
+        requiresChangeReview: classified.baselineEffect !== 'read',
+        executionMode: this.adapter.mode === 'live' ? 'live' : 'mock',
       };
+      const priorExecutor = this.registeredExecutors.get(descriptor.id);
       this.registry.register({
         descriptor,
         wireName: classified.wireName,
@@ -240,12 +289,29 @@ export class ComposioToolCatalog {
         grantedScopes,
       });
 
+      if (priorExecutor && priorExecutor !== executorRef) this.executors.unregister(priorExecutor);
+      this.registeredExecutors.set(descriptor.id, executorRef);
       this.executors.unregister(executorRef);
       this.executors.register({
         ref: executorRef,
         destinationFor: ({ arguments: args }) =>
           destinationFrom(args) ?? 'composio://' + tool.toolkit + '/' + tool.name,
         execute: async (action, ctx) => {
+          const conditionalField =
+            isOfficeToolkit(tool) && classified.baselineEffect !== 'read'
+              ? conditionalWriteField(tool)
+              : null;
+          if (
+            conditionalField &&
+            (!isRecord(action.arguments) ||
+              typeof action.arguments[conditionalField] !== 'string' ||
+              !String(action.arguments[conditionalField]).trim() ||
+              String(action.arguments[conditionalField]).trim() === '*')
+          ) {
+            throw new Error(
+              'RESOURCE_VERSION_REQUIRED: supply the discovered conditional-write field before reviewing this Office edit.',
+            );
+          }
           const called = await this.adapter.callTool(
             {
               name: tool.name,
@@ -260,19 +326,29 @@ export class ComposioToolCatalog {
           if (isRecord(called.data) && called.data.successful === false) {
             throw new Error('Composio reported that the tool execution failed.');
           }
-          const summary = 'Completed ' + classified.toolId + ' through the connected account.';
-          const outputLabels =
-            classified.baselineEffect === 'read'
-              ? mergeLabels(action.dataLabels, ['private'])
-              : [...action.dataLabels];
+          const summary =
+            (called.meta.mode === 'live' ? 'Completed ' : 'Mock completed ') +
+            classified.toolId +
+            (called.meta.mode === 'live'
+              ? ' through the connected account.'
+              : '; no external resource changed.');
+          const normalized = normalizeComposioResult(
+            tool,
+            called.data,
+            action.dataLabels,
+            called.meta.mode === 'live' ? 'live' : 'mock',
+            [this.cfg.apiKey ?? ''],
+          );
           return {
-            output: toJson(called.data),
+            // Only the receipt is persisted; bounded result data travels on
+            // local MCP after the broker tightens canonical session labels.
+            output: normalized.receipt,
+            modelOutput: normalized.modelOutput,
             summary,
-            sanitizedSummary: outputLabels.every((label) => label === 'public')
-              ? summary
-              : undefined,
-            dataLabels: outputLabels,
-            verified: true,
+            dataLabels: normalized.dataLabels,
+            verified: classified.baselineEffect === 'read',
+            evidenceVerified: false,
+            executionMode: called.meta.mode === 'live' ? 'live' : 'mock',
           };
         },
       });
@@ -300,6 +376,47 @@ export function catalogIntentQuery(value: string): string {
   return query || 'find relevant tools';
 }
 
+/**
+ * Words that phrase a request, or give its details, rather than name what it
+ * is about: "find out how many", "called", "tomorrow at 10am for 30 minutes".
+ */
+const QUERY_FILLER = new Set(
+  (
+    'a an the and or but of for to in on at by with from about into over this that these those ' +
+    'is are was were be been am do does did have has had can could would should will may might must ' +
+    'i me my mine we us our you your it its they them their he she his her there here ' +
+    'what which who whom whose when where why how many much ' +
+    'please find out tell show give let know want need like using use via through ' +
+    'connected account number some any all every each just also then than so if as up now ' +
+    'called named titled saying today tomorrow tonight yesterday morning afternoon evening night ' +
+    'noon midnight pm minute minutes hour hours day days week weeks month months year years next ' +
+    'last monday tuesday wednesday thursday friday saturday sunday ' +
+    // what "don't", "isn't", "won't" leave behind once split on the apostrophe
+    'don doesn didn isn aren wasn weren won wouldn shouldn couldn haven hasn'
+  ).split(' '),
+);
+
+/**
+ * The searches to try, in order: the request's content words ("create google
+ * calendar event", "gmail labels") -- quoted names, numbers and filler
+ * removed -- then the intent sentence itself, then the last two content words
+ * alone, last first: the thing a request is about usually follows the app it
+ * names.
+ */
+export function catalogSearchQueries(intent: string): string[] {
+  const words = [
+    ...new Set(
+      intent
+        // A quoted name ("called 'AgentOS loop test'") is content, not intent.
+        .replace(/(^|\s)(['"‘“])[^'"‘’“”]{1,80}['"’”](?=[\s.,;:!?]|$)/g, '$1')
+        .toLowerCase()
+        .split(/[^a-z0-9]+/)
+        .filter((word) => word.length > 1 && !/\d/.test(word) && !QUERY_FILLER.has(word)),
+    ),
+  ].slice(0, 6);
+  return [...new Set([words.join(' '), intent, ...words.slice(-2).reverse()])].filter(Boolean);
+}
+
 /** Compatibility entry point used by provider bootstrap and refresh routes. */
 export async function registerReviewedComposioTools(
   adapter: ToolboxAdapter,
@@ -312,6 +429,7 @@ export async function registerReviewedComposioTools(
 
 /** Unknown verbs deliberately return null and never become executable tools. */
 export function classifyComposioTool(tool: ToolboxToolDefinition): ClassifiedTool | null {
+  if (/^COMPOSIO_(MULTI_EXECUTE|REMOTE_WORKBENCH|REMOTE_BASH)/i.test(tool.name)) return null;
   const reviewed = REVIEWED[tool.name];
   if (reviewed) return reviewed;
   if (!tool.toolkit) return null;
@@ -475,4 +593,29 @@ function toJson(value: unknown): Json {
     return Object.fromEntries(Object.entries(value).map(([key, child]) => [key, toJson(child)]));
   }
   return String(value);
+}
+
+/** Allowlisted receipt fields only; document bodies and tool instructions are untrusted. */
+function executionReceipt(tool: string, raw: unknown): Json {
+  const result: Record<string, Json> = { tool, providerReported: true };
+  if (!isRecord(raw)) return result;
+  for (const key of ['log_id', 'execution_log_id']) {
+    const value = raw[key];
+    if (typeof value === 'string' && value.length > 0 && value.length < 300) result[key] = value;
+  }
+  const source = isRecord(raw.data) ? raw.data : raw;
+  for (const key of [
+    'id',
+    'message_id',
+    'document_id',
+    'spreadsheet_id',
+    'file_id',
+    'version',
+    'etag',
+    'status',
+  ]) {
+    const value = source[key];
+    if (typeof value === 'string' && value.length < 300) result[key] = value;
+  }
+  return result;
 }

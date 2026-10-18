@@ -95,9 +95,39 @@ try {
   });
   assert.deepEqual([event1.seq, event2.seq], [1, 2]);
 
+  const remembered = {
+    key: 'g|n|CLICK|https://shop.example/p/*|add bag',
+    scope: 'g|n',
+    origin: 'https://shop.example',
+    pathTemplate: '/p/*',
+    operation: 'CLICK' as const,
+    role: 'button',
+    label: 'Add to bag',
+    ordinal: 0,
+    source: 'human' as const,
+    hits: 2,
+    misses: 0,
+    consecutiveMisses: 0,
+    createdAt: at,
+    lastSeen: at,
+  };
+  await store.putTargetMemory(remembered);
+  await store.recordSiteBlock('https://www.google.com', 'browser_challenge', at);
+  await store.recordSiteBlock('https://www.google.com', 'browser_challenge', at);
+
   store.close();
   store = createSqliteStore(path);
   await store.hydrate();
+  assert.deepEqual(
+    await store.getTargetMemory(remembered.key),
+    remembered,
+    'target memory persists',
+  );
+  assert.equal((await store.listTargetMemory('g|n')).length, 1);
+  assert.equal((await store.listTargetMemory('other')).length, 0);
+  assert.equal((await store.listSiteBlocks())[0]?.count, 2, 'site blocks accumulate and persist');
+  await store.deleteTargetMemory(remembered.key);
+  assert.equal(await store.getTargetMemory(remembered.key), null);
 
   assert.equal((await store.getRun(run.id))?.status, 'running');
   assert.deepEqual(

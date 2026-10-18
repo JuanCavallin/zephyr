@@ -812,10 +812,16 @@ function ToolNameField({
         onChange={(e) => onCommit(e.target.value)}
       >
         {allowEmpty && <option value="">(none)</option>}
-        {!tools.some((t) => t.name === value) && value && <option value={value}>{value}</option>}
+        {!tools.some((t) => t.name === value) && value && (
+          <option value={value}>
+            {value}
+            {value.startsWith('browserbase.') ? ' · Deprecated compatibility' : ''}
+          </option>
+        )}
         {tools.map((tool) => (
           <option key={tool.name} value={tool.name} title={tool.description}>
             {tool.name}
+            {tool.name.startsWith('browserbase.') ? ' · Deprecated compatibility' : ''}
           </option>
         ))}
       </select>

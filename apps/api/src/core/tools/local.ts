@@ -20,6 +20,7 @@ const descriptor: ToolDescriptor = {
   allowedDataLabels: ['public', 'private', 'secret', 'local_only'],
   availability: 'available',
   executorRef: 'local://agentos.runtime_status',
+  executionMode: 'live',
 };
 
 /** Register one real, side-effect-free executor used to prove the complete MCP path. */
@@ -50,6 +51,7 @@ export function registerCoreLocalTools(
         sanitizedSummary: publicOnly ? summary : undefined,
         dataLabels: [...action.dataLabels],
         verified: true,
+        executionMode: 'live',
       };
     },
   });

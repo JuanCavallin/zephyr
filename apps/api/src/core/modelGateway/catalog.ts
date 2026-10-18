@@ -1,5 +1,17 @@
 import type { ModelRoute, TextModelAdapter } from '@htn/shared';
 
+const BOUND_ROUTE_PREFIX = 'bound-text-model-';
+
+/**
+ * Bound routes carry the bound adapter's providerId but a placeholder modelId
+ * ('bound-cheap'). Direct provider backends must leave them to the bound
+ * adapter, or a provider that is both bound and direct (Anthropic) sends the
+ * placeholder upstream and gets a 404.
+ */
+export function isBoundTextRoute(route: ModelRoute): boolean {
+  return route.id.startsWith(BOUND_ROUTE_PREFIX);
+}
+
 /**
  * Logical routes backed by the currently-bound text model capability.
  */
@@ -7,7 +19,7 @@ export function modelRoutesFor(adapter: TextModelAdapter): ModelRoute[] {
   if (adapter.mode !== 'live') {
     return [
       {
-        id: 'bound-text-model-local-cheap',
+        id: BOUND_ROUTE_PREFIX + 'local-cheap',
         providerId: adapter.id,
         modelId: 'mock-local-cheap',
         costTier: 'cheap',
@@ -23,7 +35,7 @@ export function modelRoutesFor(adapter: TextModelAdapter): ModelRoute[] {
   }
 
   return (['cheap', 'standard', 'frontier'] as const).map((costTier) => ({
-    id: 'bound-text-model-cloud-' + costTier,
+    id: BOUND_ROUTE_PREFIX + 'cloud-' + costTier,
     providerId: adapter.id,
     modelId: 'bound-' + costTier,
     costTier,

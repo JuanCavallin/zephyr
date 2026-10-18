@@ -6,7 +6,6 @@ import {
   type CreateRunRequest,
   type ListRunsQuery,
 } from '@htn/shared';
-import { providers } from '../services/runtime.js';
 import {
   availablePlaybooks,
   cancelRun,
@@ -19,6 +18,11 @@ import {
 } from '../services/runs.service.js';
 import { listEgress } from '../services/egress.service.js';
 import { HttpError, param, valid, validate } from './middleware/validate.js';
+import {
+  assertRunAccess,
+  getLocalPrincipal,
+  requireLocalControl,
+} from '../services/localControl.js';
 
 export const runsRouter: Router = Router();
 
@@ -32,13 +36,23 @@ runsRouter.get('/runs', validate(listRunsQuerySchema, 'query'), async (req, res)
   res.json({ runs: await listRuns(query) });
 });
 
-runsRouter.post('/runs', validate(createRunRequestSchema), async (req, res) => {
-  const body = valid<CreateRunRequest>(req, 'body');
-  // Returns as soon as the run is persisted. Execution continues in the
-  // background and is observed over SSE.
-  const run = await createRun({ kind: body.kind, input: body.input, title: body.title });
-  res.status(201).json({ run });
-});
+runsRouter.post(
+  '/runs',
+  requireLocalControl,
+  validate(createRunRequestSchema),
+  async (req, res) => {
+    const body = valid<CreateRunRequest>(req, 'body');
+    // Returns as soon as the run is persisted. Execution continues in the
+    // background and is observed over SSE.
+    const run = await createRun({
+      kind: body.kind,
+      input: body.input,
+      title: body.title,
+      principalId: getLocalPrincipal(req),
+    });
+    res.status(201).json({ run });
+  },
+);
 
 runsRouter.get('/runs/:id', async (req, res) => {
   const detail = await getRunDetail(param(req, 'id'));
@@ -60,19 +74,22 @@ runsRouter.get('/runs/:id/events', async (req, res) => {
  * returns the run as it is NOW, and the client learns the run actually stopped
  * from the `run.updated` event that carries status 'paused'.
  */
-runsRouter.post('/runs/:id/pause', async (req, res) => {
+runsRouter.post('/runs/:id/pause', requireLocalControl, async (req, res) => {
+  assertRunAccess(req, param(req, 'id'));
   const run = await pauseRun(param(req, 'id'));
   if (!run) throw new HttpError(404, 'NOT_FOUND', 'Run not found');
   res.json({ run });
 });
 
-runsRouter.post('/runs/:id/resume', async (req, res) => {
+runsRouter.post('/runs/:id/resume', requireLocalControl, async (req, res) => {
+  assertRunAccess(req, param(req, 'id'));
   const run = await resumeRun(param(req, 'id'));
   if (!run) throw new HttpError(404, 'NOT_FOUND', 'Run not found');
   res.json({ run });
 });
 
-runsRouter.post('/runs/:id/cancel', async (req, res) => {
+runsRouter.post('/runs/:id/cancel', requireLocalControl, async (req, res) => {
+  assertRunAccess(req, param(req, 'id'));
   const run = await cancelRun(param(req, 'id'));
   if (!run) throw new HttpError(404, 'NOT_FOUND', 'Run not found');
   res.json({ run });
@@ -101,40 +118,6 @@ runsRouter.get('/runs/:id/egress', async (req, res) => {
  * mocked browsers have no viewer, and a session that has since closed cannot
  * produce one. The UI renders that state rather than a dead link.
  */
-runsRouter.get('/runs/:id/browser/:sessionId/live-view', async (req, res) => {
-  const runId = param(req, 'id');
-  const sessionId = param(req, 'sessionId');
-
-  const detail = await getRunDetail(runId);
-  if (!detail) throw new HttpError(404, 'NOT_FOUND', 'Run not found');
-
-  const adapter = providers.provider('browser');
-  if (!adapter.liveView) {
-    // Same shape on every path: a caller that reads `pageUrl` must not get
-    // `undefined` from one branch and `null` from the others.
-    res.json({ liveViewUrl: null, pageUrl: null, interactive: false });
-    return;
-  }
-
-  const result = await adapter.liveView(sessionId, {
-    runId,
-    policyRule: 'handoff-live-view-refresh',
-  });
-
-  res.json(
-    result.ok
-      ? {
-          liveViewUrl: result.data.liveViewUrl ?? null,
-          // 'about:blank' here means the session is open but nothing is loaded
-          // -- almost always an `open` node with no url. The UI says so rather
-          // than handing over a white box.
-          pageUrl: result.data.pageUrl ?? null,
-          interactive: result.data.interactive,
-        }
-      : { liveViewUrl: null, pageUrl: null, interactive: false },
-  );
-});
-
 runsRouter.get('/runs/:id/analytics', async (req, res) => {
   const detail = await getRunDetail(param(req, 'id'));
   if (!detail) throw new HttpError(404, 'NOT_FOUND', 'Run not found');

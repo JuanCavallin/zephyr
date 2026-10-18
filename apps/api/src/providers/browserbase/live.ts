@@ -53,6 +53,7 @@
 import { browserbase, Stagehand, type StagehandBrowser } from '@browserbasehq/stagehand';
 import type {
   BrowserAdapter,
+  BrowserViewer,
   BrowserPerformResult,
   ElementRow,
   ElementTable,
@@ -62,6 +63,21 @@ import type {
 } from '@htn/shared';
 import { BROWSERBASE_API_DESTINATION, needsTarget } from '@htn/shared';
 import { config, type ProviderConfig } from '../../config.js';
+import { browserLocation, browserFailure } from '../browserSafety.js';
+import {
+  COLLECT_ROWS,
+  INTERACTIVE_SELECTOR,
+  NON_TEXT_INPUT,
+  inferRole,
+  truncate,
+  rejectionFor,
+  validateTargetScript,
+  type RawRow,
+  type TargetState,
+} from '../browserPage.js';
+import { notifyBrowserSessionClosed } from '../withBrowserOwnership.js';
+
+import { credentials, type ResolvedCredential } from '../../services/credentials.js';
 
 /**
  * The live-view URL comes from Browserbase's REST API, called directly.
@@ -96,155 +112,9 @@ interface Handle {
   startUrl?: string;
   /** Region-specific where known; approvals bind to this. */
   destination: string;
+  credential: ResolvedCredential;
+  runId: string;
   snapshot?: Snapshot;
-}
-
-/** One row as the in-page collector returns it. Serialisable, no DOM types. */
-interface RawRow {
-  domIndex: number;
-  tag: string;
-  role: string | null;
-  type: string | null;
-  name: string;
-  value: string;
-  visible: boolean;
-}
-
-const INTERACTIVE_SELECTOR = [
-  'a[href]',
-  'button',
-  'input:not([type="hidden"])',
-  'select',
-  'textarea',
-  '[role="button"]',
-  '[role="link"]',
-  '[role="checkbox"]',
-  '[role="radio"]',
-  '[role="combobox"]',
-  '[role="textbox"]',
-  '[role="menuitem"]',
-  '[role="tab"]',
-  '[contenteditable="true"]',
-].join(',');
-
-/**
- * Identical in shape to the local adapter's collector, and a string IIFE for
- * the same two reasons: this package has no `dom` lib, and Stagehand's
- * `evaluate` string form evaluates an EXPRESSION — a string holding
- * arrow-function source comes back `undefined`, silently.
- */
-const COLLECT_ROWS = `(() => {
-  const SEL = ${JSON.stringify(INTERACTIVE_SELECTOR)};
-  const out = [];
-  document.querySelectorAll(SEL).forEach((el, domIndex) => {
-    const style = window.getComputedStyle(el);
-    const visible =
-      el.getClientRects().length > 0 &&
-      style.visibility !== 'hidden' &&
-      style.display !== 'none' &&
-      Number(style.opacity) !== 0;
-    out.push({
-      domIndex,
-      tag: el.tagName.toLowerCase(),
-      role: el.getAttribute('role'),
-      type: el.getAttribute('type'),
-      name: (
-        el.getAttribute('aria-label') ||
-        (el.innerText || '').trim() ||
-        el.getAttribute('placeholder') ||
-        el.getAttribute('title') ||
-        el.getAttribute('alt') ||
-        ''
-      ),
-      value: (el.value === undefined || el.value === null) ? '' : String(el.value),
-      visible,
-    });
-  });
-  return out;
-})()`;
-
-/**
- * PRE-FLIGHT VALIDATION IN ONE PROTOCOL CALL — see the local adapter for the
- * full reasoning. Against Browserbase this matters more, not less: every
- * protocol call is a round trip to their cloud, so four checks per click is
- * four network hops. `browser-use/jev-ultrafast` reports cutting median
- * protocol calls from 1,092 to 101 by making reads atomic like this.
- */
-function validateTargetScript(domIndex: number): string {
-  return `(() => {
-     const SEL = ${JSON.stringify(INTERACTIVE_SELECTOR)};
-     const el = document.querySelectorAll(SEL)[${domIndex}];
-     if (!el) return { exists: false };
-
-     const rect = el.getBoundingClientRect();
-     const style = window.getComputedStyle(el);
-     const visible =
-       rect.width > 0 && rect.height > 0 &&
-       style.visibility !== 'hidden' && style.display !== 'none' &&
-       Number(style.opacity) !== 0;
-
-     const enabled = !el.disabled && el.getAttribute('aria-disabled') !== 'true';
-
-     let occluded = true;
-     if (visible) {
-       const hit = document.elementFromPoint(
-         rect.left + rect.width / 2,
-         rect.top + rect.height / 2,
-       );
-       occluded = !hit || !(hit === el || el.contains(hit) || hit.contains(el));
-     }
-
-     return { exists: true, visible, enabled, occluded };
-   })()`;
-}
-
-interface TargetState {
-  exists: boolean;
-  visible?: boolean;
-  enabled?: boolean;
-  occluded?: boolean;
-}
-
-/** Everything unproven is treated as not-actionable. */
-function rejectionFor(state: TargetState | null): TargetRejection | null {
-  if (!state || typeof state !== 'object') return 'occluded';
-  if (!state.exists) return 'detached';
-  if (!state.visible || !state.enabled) return 'not_interactable';
-  if (state.occluded !== false) return 'occluded';
-  return null;
-}
-
-const MAX_LABEL_CHARS = 80;
-
-function truncate(text: string, max = MAX_LABEL_CHARS): string {
-  const clean = text.replace(/\s+/g, ' ').trim();
-  return clean.length > max ? clean.slice(0, max - 1) + '…' : clean;
-}
-
-const NON_TEXT_INPUT = new Set([
-  'checkbox',
-  'radio',
-  'submit',
-  'button',
-  'reset',
-  'file',
-  'image',
-  'range',
-  'color',
-]);
-
-function inferRole(tag: string, type: string | null): string {
-  if (tag === 'a') return 'link';
-  if (tag === 'button') return 'button';
-  if (tag === 'select') return 'combobox';
-  if (tag === 'textarea') return 'textbox';
-  if (tag === 'input') {
-    if (type === 'checkbox') return 'checkbox';
-    if (type === 'radio') return 'radio';
-    if (type === 'submit' || type === 'button' || type === 'reset') return 'button';
-    return 'textbox';
-  }
-  return tag || 'element';
 }
 
 function meta(op: string, started: number, destination: string | null) {
@@ -268,7 +138,7 @@ function failure<T>(
     ok: false,
     error: {
       code,
-      message: err instanceof Error ? err.message : String(err),
+      message: browserFailure(err),
       retryable: code === 'UPSTREAM',
     },
     meta: meta(op, started, destination),
@@ -302,6 +172,39 @@ async function bbGet<T>(apiKey: string, path: string): Promise<T | null> {
       signal: AbortSignal.timeout(8_000),
     });
     return res.ok ? ((await res.json()) as T) : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Why Browserbase refused a session. Stagehand catches the API error and
+ * rethrows a bare "Failed to create a Browserbase session", which hid a 402
+ * "Free plan browser minutes limit reached" for a whole debugging session.
+ * Runs ONLY after a failed create: a refused create costs nothing, and the
+ * rare one that now succeeds (a transient failure) is released at once.
+ */
+async function explainCreateFailure(apiKey: string, projectId: string): Promise<string | null> {
+  try {
+    const res = await fetch(BROWSERBASE_API + '/sessions', {
+      method: 'POST',
+      headers: { 'X-BB-API-Key': apiKey, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ projectId }),
+      signal: AbortSignal.timeout(8_000),
+    });
+    const body = (await res.json().catch(() => ({}))) as { id?: string; message?: string };
+    if (res.ok) {
+      if (body.id) {
+        await fetch(BROWSERBASE_API + '/sessions/' + body.id, {
+          method: 'POST',
+          headers: { 'X-BB-API-Key': apiKey, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ projectId, status: 'REQUEST_RELEASE' }),
+          signal: AbortSignal.timeout(8_000),
+        }).catch(() => undefined);
+      }
+      return 'transient; a retry may succeed';
+    }
+    return 'Browserbase HTTP ' + res.status + (body.message ? ': ' + body.message : '');
   } catch {
     return null;
   }
@@ -342,9 +245,10 @@ function sameUrl(a: string, b: string): boolean {
  * WHICH TAB the live view should show.
  *
  * The top-level `debuggerFullscreenUrl` points at the session's FIRST page,
- * and that is the wrong one whenever a start URL was given: openSession calls
- * `context.newPage(startUrl)`, which leaves page 0 sitting on about:blank and
- * puts the real page second. Measured on a live session -- page 0
+ * and that was the wrong one when openSession called `context.newPage(startUrl)`,
+ * which left page 0 on about:blank and put the real page second. openSession
+ * now navigates page 0 instead, but a site can still open popups or new tabs,
+ * so the selection stays. Measured on a live session -- page 0
  * `about:blank`, page 1 `https://example.com/` -- so someone following the
  * handoff link landed on a blank tab and had no idea why.
  *
@@ -396,6 +300,15 @@ async function liveViewUrl(
 
 export function createLiveBrowserbase(cfg: ProviderConfig): BrowserAdapter {
   const sessions = new Map<string, Handle>();
+  credentials.onInvalidate((reference, providerId) => {
+    if (providerId !== 'browserbase') return;
+    for (const [sessionId, handle] of sessions) {
+      if (handle.credential.reference !== reference) continue;
+      sessions.delete(sessionId);
+      notifyBrowserSessionClosed(sessionId);
+      void handle.browser.close().catch(() => undefined);
+    }
+  });
 
   /**
    * `model` is OPTIONAL on Stagehand.create, and that one fact is what makes
@@ -430,8 +343,15 @@ export function createLiveBrowserbase(cfg: ProviderConfig): BrowserAdapter {
   }
 
   async function activePage(handle: Handle) {
-    const page = await handle.browser.context.activePage();
-    return page ?? (await handle.browser.context.newPage());
+    credentials.assertCurrent(handle.credential.reference, {
+      runId: handle.runId,
+      providerId: 'browserbase',
+      purpose: 'browser',
+    });
+    const page =
+      (await handle.browser.context.activePage()) ?? (await handle.browser.context.newPage());
+    await page.setViewportSize(1280, 720);
+    return page;
   }
 
   async function buildTable(
@@ -472,7 +392,7 @@ export function createLiveBrowserbase(cfg: ProviderConfig): BrowserAdapter {
       table: {
         snapshotId: id,
         sessionId,
-        url: await page.url(),
+        url: browserLocation(await page.url()),
         title: await page.title().catch(() => ''),
         capturedAt: new Date().toISOString(),
         rows,
@@ -482,30 +402,6 @@ export function createLiveBrowserbase(cfg: ProviderConfig): BrowserAdapter {
     };
   }
 
-  /** Same probe as the local adapter. Anything but `false` fails closed. */
-  async function isOccluded(handle: Handle, domIndex: number): Promise<boolean> {
-    try {
-      const page = await activePage(handle);
-      const result = await page.evaluate<boolean | null, undefined>(
-        `(() => {
-           const SEL = ${JSON.stringify(INTERACTIVE_SELECTOR)};
-           const el = document.querySelectorAll(SEL)[${domIndex}];
-           if (!el) return null;
-           const rect = el.getBoundingClientRect();
-           if (rect.width === 0 || rect.height === 0) return true;
-           const x = rect.left + rect.width / 2;
-           const y = rect.top + rect.height / 2;
-           const hit = document.elementFromPoint(x, y);
-           if (!hit) return true;
-           return !(hit === el || el.contains(hit) || hit.contains(el));
-         })()`,
-      );
-      return typeof result === 'boolean' ? result : true;
-    } catch {
-      return true;
-    }
-  }
-
   return {
     id: 'browserbase',
     mode: 'live',
@@ -513,7 +409,7 @@ export function createLiveBrowserbase(cfg: ProviderConfig): BrowserAdapter {
 
     async health() {
       const started = Date.now();
-      if (!cfg.apiKey || !cfg.projectId) {
+      if (config.credentials.browserSource === 'operator' && (!cfg.apiKey || !cfg.projectId)) {
         return {
           ok: false,
           error: {
@@ -546,7 +442,7 @@ export function createLiveBrowserbase(cfg: ProviderConfig): BrowserAdapter {
       );
     },
 
-    async openSession(input, _ctx: ProviderCallContext) {
+    async openSession(input, ctx: ProviderCallContext) {
       const started = Date.now();
 
       if (sessions.size >= config.browser.maxSessions) {
@@ -564,36 +460,45 @@ export function createLiveBrowserbase(cfg: ProviderConfig): BrowserAdapter {
         );
       }
 
-      if (!cfg.apiKey || !cfg.projectId) {
-        return failure(
-          'openSession',
-          started,
-          new Error('BROWSERBASE_API_KEY / BROWSERBASE_PROJECT_ID not configured'),
-          null,
-          'AUTH',
-        );
-      }
-
       let browser: StagehandBrowser | undefined;
       let stagehand: Stagehand | undefined;
+      let credential: ResolvedCredential | undefined;
       try {
-        browser = await browserbase.launch({ apiKey: cfg.apiKey, projectId: cfg.projectId });
+        credential = await credentials.require({
+          runId: ctx.runId,
+          providerId: 'browserbase',
+          purpose: 'browser',
+        });
+        const projectId = credential.metadata?.projectId;
+        if (!projectId)
+          throw new Error('Browserbase project ID is required with the browser credential.');
+        browser = await browserbase.launch({ apiKey: credential.secret, projectId });
 
         // Stagehand MUST be attached before `browser.context` is usable — the
         // handle alone raises "Browser context is unavailable". So it is
         // created here, but WITHOUT a model unless we have a key. See
         // modelOptions().
         stagehand = await Stagehand.create({ browser, ...modelOptions() });
+        const current = await browser.context.activePage();
+        if (current) await current.setViewportSize(1280, 720);
 
         if (input.startUrl) {
-          await browser.context.newPage(input.startUrl);
+          // Navigate the session's existing first tab. newPage(startUrl) left
+          // that tab on about:blank and opened a second one, so the live view,
+          // the human at a handoff, and the agent could each end up on a
+          // different tab.
+          const [first] = await browser.context.pages();
+          if (first) {
+            await first.setViewportSize(1280, 720);
+            await first.goto(input.startUrl);
+          } else await browser.context.newPage(input.startUrl);
         }
 
         const remoteSessionId = browser.sessionId;
         // Capture the live-view URL NOW. sessions.debug() returns 410 Gone once
         // the session stops, so there is no second chance at this.
         const view = remoteSessionId
-          ? await liveViewUrl(cfg.apiKey, remoteSessionId, input.startUrl)
+          ? await liveViewUrl(credential.secret, remoteSessionId, input.startUrl)
           : {};
 
         const destination = view.region
@@ -607,6 +512,8 @@ export function createLiveBrowserbase(cfg: ProviderConfig): BrowserAdapter {
           browser,
           stagehand,
           destination,
+          credential,
+          runId: ctx.runId,
           ...(remoteSessionId ? { remoteSessionId } : {}),
           ...(input.startUrl ? { startUrl: input.startUrl } : {}),
         });
@@ -615,11 +522,8 @@ export function createLiveBrowserbase(cfg: ProviderConfig): BrowserAdapter {
           ok: true as const,
           data: {
             sessionId,
-            // `debuggerFullscreenUrl` is Browserbase's INTERACTIVE debug view,
-            // not a recording: a person can genuinely click and type in it.
-            // That is what makes a `handoff` node possible, so the flag is
-            // tied to having that exact URL and nothing else.
-            ...(view.url ? { liveViewUrl: view.url, interactive: true } : {}),
+            // Input is mediated by AgentOS's owner-checked stream bridge.
+            interactive: true,
           },
           meta: meta('openSession', started, destination),
         };
@@ -627,6 +531,21 @@ export function createLiveBrowserbase(cfg: ProviderConfig): BrowserAdapter {
         // A half-launched browser is a RUNNING Browserbase session nobody holds
         // an id for. Release it here or it burns a slot until it times out.
         await browser?.close().catch(() => {});
+        if (err instanceof Error && err.name === 'BrowserbaseSessionError') {
+          const reason = credential?.metadata?.projectId
+            ? await explainCreateFailure(credential.secret, credential.metadata.projectId)
+            : undefined;
+          if (reason) {
+            return failure(
+              'openSession',
+              started,
+              new Error(err.message + ' (' + reason + ')'),
+              BROWSERBASE_API_DESTINATION,
+              // Quota and auth refusals do not clear on retry.
+              /HTTP 40[0-3]/.test(reason) ? 'AUTH' : 'UPSTREAM',
+            );
+          }
+        }
         return failure('openSession', started, err);
       }
     },
@@ -645,11 +564,31 @@ export function createLiveBrowserbase(cfg: ProviderConfig): BrowserAdapter {
         const page = await handle.browser.context.activePage();
         return {
           ok: true as const,
-          data: { url: (await page?.url()) ?? '' },
+          data: { url: browserLocation((await page?.url()) ?? '') },
           meta: meta('act', started, handle.destination),
         };
       } catch (err) {
         return failure('act', started, err, handle.destination);
+      }
+    },
+
+    async navigate(input, _ctx) {
+      const started = Date.now();
+      const handle = sessions.get(input.sessionId);
+      if (!handle) {
+        return failure('navigate', started, new Error('Unknown sessionId'), null, 'BAD_INPUT');
+      }
+      try {
+        handle.snapshot = undefined;
+        const page = await activePage(handle);
+        await page.goto(input.url);
+        return {
+          ok: true as const,
+          data: { url: browserLocation(await page.url()) },
+          meta: meta('navigate', started, handle.destination),
+        };
+      } catch (err) {
+        return failure('navigate', started, err, handle.destination);
       }
     },
 
@@ -683,7 +622,7 @@ export function createLiveBrowserbase(cfg: ProviderConfig): BrowserAdapter {
           return {
             ok: true as const,
             data: {
-              url: await page.url(),
+              url: browserLocation(await page.url()),
               title: await page.title().catch(() => ''),
               text: truncate(text ?? '', 4000),
             } as T,
@@ -759,7 +698,11 @@ export function createLiveBrowserbase(cfg: ProviderConfig): BrowserAdapter {
           handle.snapshot = undefined;
           return {
             ok: true as const,
-            data: { operation: input.operation, url: await page.url(), navigated: false },
+            data: {
+              operation: input.operation,
+              url: browserLocation(await page.url()),
+              navigated: false,
+            },
             meta: meta('perform', started, handle.destination),
           };
         }
@@ -816,7 +759,9 @@ export function createLiveBrowserbase(cfg: ProviderConfig): BrowserAdapter {
         // every call is a network hop. Collapsing them is the single cheapest
         // latency win available here.
         const state = await page
-          .evaluate<TargetState | null, undefined>(validateTargetScript(domIndex))
+          .evaluate<TargetState | null, undefined>(
+            validateTargetScript(domIndex, { label: row.label, role: row.role }),
+          )
           .catch(() => null);
 
         const rejection = rejectionFor(state);
@@ -851,7 +796,7 @@ export function createLiveBrowserbase(cfg: ProviderConfig): BrowserAdapter {
           data: {
             operation: input.operation,
             index: input.index,
-            url,
+            url: browserLocation(url),
             navigated: url !== urlBefore,
           },
           meta: meta('perform', started, handle.destination),
@@ -871,30 +816,122 @@ export function createLiveBrowserbase(cfg: ProviderConfig): BrowserAdapter {
      * accepts no input; a freshly minted one for the SAME session renders the
      * live page and is interactive.
      */
-    async liveView(sessionId, _ctx) {
+    async viewer(input, _ctx) {
       const started = Date.now();
-      const handle = sessions.get(sessionId);
-      // No key means no REST call, so no viewer -- same normal, non-error state
-      // as a session we do not hold.
-      if (!handle?.remoteSessionId || !cfg.apiKey) {
-        // Not an error: a session we do not hold, or one with no remote id,
-        // simply has no viewer. The caller renders that state.
+      const handle = sessions.get(input.sessionId);
+      if (!handle)
+        return failure('viewer', started, new Error('Unknown sessionId'), null, 'BAD_INPUT');
+      try {
+        const page = await activePage(handle);
         return {
           ok: true as const,
-          data: { interactive: false },
-          meta: meta('liveView', started, handle?.destination ?? null),
+          data: {
+            providerId: 'browserbase' as const,
+            mode: 'live' as const,
+            kind: 'stream' as const,
+            owner: 'agent' as const,
+            revision: 0,
+            phase: 'agent_running' as const,
+            pageUrl: browserLocation(await page.url()),
+            interactive: input.mode === 'control',
+            canWatch: true,
+            canControl: true,
+            width: 1280,
+            height: 720,
+          },
+          meta: meta('viewer', started, handle.destination),
         };
+      } catch (err) {
+        return failure('viewer', started, err, handle.destination);
       }
-
-      const view = await liveViewUrl(cfg.apiKey, handle.remoteSessionId, handle.startUrl);
+    },
+    async liveView(sessionId, _ctx) {
+      const handle = sessions.get(sessionId);
+      if (!handle)
+        return failure('liveView', Date.now(), new Error('Unknown sessionId'), null, 'BAD_INPUT');
+      const page = await activePage(handle);
       return {
         ok: true as const,
-        data: {
-          ...(view.url ? { liveViewUrl: view.url } : {}),
-          ...(view.pageUrl ? { pageUrl: view.pageUrl } : {}),
-          interactive: Boolean(view.url),
-        },
-        meta: meta('liveView', started, handle.destination),
+        data: { pageUrl: browserLocation(await page.url()), interactive: true },
+        meta: meta('liveView', Date.now(), handle.destination),
+      };
+    },
+    async captureFrame(sessionId, _ctx) {
+      const handle = sessions.get(sessionId);
+      if (!handle)
+        return failure(
+          'captureFrame',
+          Date.now(),
+          new Error('Unknown sessionId'),
+          null,
+          'BAD_INPUT',
+        );
+      try {
+        const page = await activePage(handle);
+        const bytes = await page.screenshot({ type: 'jpeg', quality: 65, fullPage: false });
+        return {
+          ok: true as const,
+          data: { bytes, width: 1280, height: 720 },
+          meta: meta('captureFrame', Date.now(), handle.destination),
+        };
+      } catch (err) {
+        return failure('captureFrame', Date.now(), err, handle.destination);
+      }
+    },
+    async humanInput(input, _ctx) {
+      const handle = sessions.get(input.sessionId);
+      if (!handle)
+        return failure('humanInput', Date.now(), new Error('Unknown sessionId'), null, 'BAD_INPUT');
+      try {
+        const page = await activePage(handle);
+        const entry = input.input;
+        if (entry.type === 'click') await page.click(entry.x, entry.y);
+        else if (entry.type === 'key') await page.keyPress(entry.key);
+        else if (entry.type === 'text') await page.type(entry.text);
+        else await page.scroll(0, 0, entry.deltaX, entry.deltaY);
+        handle.snapshot = undefined;
+        return {
+          ok: true as const,
+          data: null,
+          meta: meta('humanInput', Date.now(), handle.destination),
+        };
+      } catch (err) {
+        return failure('humanInput', Date.now(), err, handle.destination);
+      }
+    },
+    async revokeControl(sessionId, _ctx) {
+      const handle = sessions.get(sessionId);
+      if (!handle)
+        return failure(
+          'revokeControl',
+          Date.now(),
+          new Error('Unknown sessionId'),
+          null,
+          'BAD_INPUT',
+        );
+      // No provider-native interactive link is ever issued. The wrapper changes
+      // phase before drain, so every old HTTP input is rejected server-side.
+      return {
+        ok: true as const,
+        data: null,
+        meta: meta('revokeControl', Date.now(), handle.destination),
+      };
+    },
+    async invalidateSnapshot(sessionId, _ctx) {
+      const handle = sessions.get(sessionId);
+      if (!handle)
+        return failure(
+          'invalidateSnapshot',
+          Date.now(),
+          new Error('Unknown sessionId'),
+          null,
+          'BAD_INPUT',
+        );
+      handle.snapshot = undefined;
+      return {
+        ok: true as const,
+        data: null,
+        meta: meta('invalidateSnapshot', Date.now(), handle.destination),
       };
     },
 

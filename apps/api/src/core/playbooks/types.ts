@@ -13,6 +13,7 @@ import type { ZodType } from 'zod';
 import type {
   Capability,
   CapabilityMap,
+  CompiledNodeDecision,
   CompletionDecision,
   DataLabel,
   IntelligenceLevel,
@@ -100,6 +101,22 @@ export interface AgentTaskSpec {
   maxDurationMs?: number;
   /** Give up once this many of the task's tool calls have failed. */
   maxFailedToolCalls?: number;
+  /**
+   * 'jev' (default): Jev picks the tools and each turn's model.
+   * 'all_tools_frontier': the BASELINE arm only. Every registered tool that
+   * passes eligibility is exposed and every turn runs on a frontier route —
+   * the "frontier model, all tools" comparison point the design spec's
+   * evaluation criterion names. Eligibility, data labels and per-action
+   * approval still apply; only the Jev narrowing is skipped.
+   */
+  routing?: 'jev' | 'all_tools_frontier';
+  /**
+   * Graph agent nodes only. The node's frozen route (see core/graph/compile.ts)
+   * and the identity it must match; the orchestrator reuses it only when the
+   * resolved candidate set and decision mode still match, and otherwise asks
+   * Jev and records the answer for `graphId`.
+   */
+  compiledRoute?: { graphId: string; nodeHash: string; entry?: CompiledNodeDecision };
 }
 
 export interface AgentTaskResult {
@@ -145,6 +162,8 @@ export interface PlaybookContext {
 
   /** Get a provider by capability — never by vendor name. */
   provider<C extends Capability>(capability: C): CapabilityMap[C];
+  /** Existing resources stay bound to the backend that created them. */
+  browserForSession?(sessionId: string): import('@htn/shared').BrowserAdapter;
 
   /**
    * Which vendor is currently bound to a capability.
@@ -175,6 +194,16 @@ export interface PlaybookContext {
   judgeCompletion(checkpoint: SessionCheckpoint, stepId?: string): Promise<CompletionDecision>;
 
   /**
+   * Keep a graph-level Jev decision this run had to make (no usable frozen
+   * entry existed), so the next run of the graph reuses it. Best effort.
+   */
+  recordCompiledDecision?(
+    graphId: string,
+    nodeId: string,
+    entry: CompiledNodeDecision,
+  ): Promise<void>;
+
+  /**
    * Record a routing decision made OUTSIDE runAgentTask.
    *
    * runAgentTask records its own, but the `dispatch` node -- where the decision
@@ -198,6 +227,7 @@ export interface PlaybookContext {
    * around this, or a person is asked twice for one action.
    */
   callBrokeredTool(input: {
+    forceApproval?: boolean;
     dataLabels?: DataLabel[];
     stepId: string;
     toolId: string;

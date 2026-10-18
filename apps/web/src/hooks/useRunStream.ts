@@ -25,6 +25,19 @@ export function runReducer(state: RunView, event: RunEvent | { type: 'reset' }):
     case 'reset':
       return emptyRunView;
     case 'run.updated':
+      // A finished run holds no live browser: AgentOS releases every session a
+      // run opened as it ends. Those `browser.session.closed` events can land
+      // after the terminal update, when this stream has already closed, so a
+      // finished run kept offering "Watch browser & take control".
+      if (isTerminal(event.run.status)) {
+        return {
+          ...state,
+          run: event.run,
+          browserSessions: state.browserSessions.map((session) =>
+            session.closedAt ? session : { ...session, closedAt: event.run.updatedAt },
+          ),
+        };
+      }
       return { ...state, run: event.run };
 
     case 'step.upserted':
@@ -157,8 +170,16 @@ export function useRunStream(runId: string | undefined, reconnectKey = 0): RunSt
     source.onerror = () => setConnected(false);
     source.onmessage = (message) => {
       try {
-        dispatch(JSON.parse(message.data) as RunEvent);
+        const event = JSON.parse(message.data) as RunEvent;
+        dispatch(event);
         setLastEventAt(Date.now());
+        // REST may return a completed run before SSE replays its actions. Close only
+        // after the terminal stream event so refreshes retain the full decision trail.
+        if (event.type === 'run.updated' && isTerminal(event.run.status)) {
+          source.close();
+          sourceRef.current = null;
+          setConnected(false);
+        }
       } catch {
         // A malformed frame must not tear down the stream.
       }
@@ -170,16 +191,6 @@ export function useRunStream(runId: string | undefined, reconnectKey = 0): RunSt
       setConnected(false);
     };
   }, [runId, reconnectKey]);
-
-  // Close the stream once the run can produce no more events. Leaving it open
-  // would hold one of the browser's ~6 connections per origin for nothing.
-  useEffect(() => {
-    if (view.run && isTerminal(view.run.status) && sourceRef.current) {
-      sourceRef.current.close();
-      sourceRef.current = null;
-      setConnected(false);
-    }
-  }, [view.run]);
 
   return { ...view, connected, lastEventAt };
 }

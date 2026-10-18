@@ -303,6 +303,32 @@ execution; overlay status, measurements, scope/resource markers and expandable t
 traces. Do not replace logical nodes with unrelated runtime nodes or infer dependencies
 from event arrival order. Preserve selection and layout across updates.
 
+## Fewer Jev round trips
+
+Built:
+
+- The model is chosen once per agent task; public reversible reads and pre-review
+  browser checks use the deterministic policy.
+- Saved graphs freeze agent tool grants and tiers and fixed dispatch choices
+  (`compiled`, `apps/api/src/core/graph/compile.ts`; `GRAPH_COMPILE=off` disables it).
+- Browser actions are approved by consequence, not Jev's confidence
+  (`core/tools/browserRisk.ts`): `submit` and clicks on buy/pay/send/delete-style labels
+  always ask; everything else follows Jev's pick at any confidence.
+- Cross-run target memory (`core/tools/targetMemory.ts`): per graph node, page template
+  and normalized goal, identity only, public pages only, never permission. Approval
+  cards let a person pick another element; that correction is remembered.
+- Reuse reporting: Jev calls and warm/cold per run (`packages/shared/src/reuse.ts`),
+  `GET /api/benchmarks?warmth=cold`, and the Graph Editor's Reuse panel with site-change
+  and blocked-site alerts and suggestions to turn stable agent nodes into fixed steps
+  (also fed to "Suggest an improvement").
+
+Still open:
+
+- **Keep the remaining run-time decisions live.** Judge verdicts, completion verdicts,
+  dispatch goals with `{{refs}}` and browser picks on new pages judge evidence the run
+  produces; do not freeze them. Revisit only with measurements showing which of these
+  dominate latency, and prefer making each call cheaper over skipping it.
+
 ## Manual checks for the first batch
 
 Start with `pnpm dev` and **Build a workflow** (not **Run as agent task**, which

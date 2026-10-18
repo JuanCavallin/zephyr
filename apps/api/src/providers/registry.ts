@@ -23,6 +23,7 @@ import { withBrowserOwnership } from './withBrowserOwnership.js';
 import { create as createHermes } from './hermes/index.js';
 import { create as createJev } from './jev/index.js';
 import { create as createBrowserbase } from './browserbase/index.js';
+import { create as createBrowserless } from './browserless/index.js';
 import { create as createLocalBrowser } from './localbrowser/index.js';
 import { create as createComposio } from './composio/index.js';
 import { create as createOllama } from './ollama/index.js';
@@ -37,6 +38,7 @@ const FACTORIES: Record<ProviderId, Factory> = {
   hermes: createHermes,
   jev: createJev,
   browserbase: createBrowserbase,
+  browserless: createBrowserless,
   localbrowser: createLocalBrowser,
   composio: createComposio,
   ollama: createOllama,
@@ -50,7 +52,7 @@ const FACTORIES: Record<ProviderId, Factory> = {
 const BINDINGS: Record<Capability, ProviderId> = {
   'agent.runtime': 'hermes',
   decision: 'jev',
-  browser: 'browserbase',
+  browser: config.browser.backend,
   // Two browser capabilities on purpose. Policy — not config, and not the
   // executor — chooses between them per step, and the two bindings produce two
   // distinct egress destinations. That is what makes "local-only data never
@@ -62,6 +64,8 @@ const BINDINGS: Record<Capability, ProviderId> = {
 };
 
 export interface ProviderRegistry {
+  /** Explicit provider tools and existing sessions never follow a changed preferred binding. */
+  byId(id: ProviderId): ProviderAdapter;
   /** Get the adapter serving a capability. Already wrapped for the egress ledger. */
   provider<C extends Capability>(capability: C): CapabilityMap[C];
   all(): ProviderAdapter[];
@@ -77,7 +81,7 @@ export function createProviderRegistry(record: RecordEgress): ProviderRegistry {
     if (cached) return cached;
     const raw = FACTORIES[id](config.providers[id]);
     const owned =
-      id === 'browserbase' || id === 'localbrowser'
+      id === 'browserbase' || id === 'browserless' || id === 'localbrowser'
         ? withBrowserOwnership(raw as BrowserAdapter)
         : raw;
     const adapter = withEgress(owned, record, newId);
@@ -86,6 +90,7 @@ export function createProviderRegistry(record: RecordEgress): ProviderRegistry {
   }
 
   return {
+    byId: get,
     provider<C extends Capability>(capability: C): CapabilityMap[C] {
       return get(BINDINGS[capability]) as CapabilityMap[C];
     },

@@ -210,7 +210,7 @@ export interface EgressEvent {
   runId: string;
   stepId?: string;
   at: Iso;
-  providerId: ProviderId;
+  providerId: ProviderId | 'tavily';
   op: string;
   /** Host contacted, or `mock://<provider>`, or `hermes-internal://<tool>` for
    *  a call reported after the fact rather than made directly (see
@@ -223,7 +223,16 @@ export interface EgressEvent {
   /** Cost accounting, when the provider reported it. See ProviderMeta. */
   tokensIn?: number;
   tokensOut?: number;
+  /**
+   * Absent means UNPRICED (model with no known rate), not free. The rollup
+   * counts those calls separately instead of summing them as zero.
+   */
   estimatedCostCents?: number;
+  /** The model that actually answered, as the provider reported it. */
+  model?: string;
+  /** Prompt-cache input tokens, already included in `tokensIn`. */
+  cacheReadTokens?: number;
+  cacheWriteTokens?: number;
 }
 
 /* -------------------------------------------------------------------------- */

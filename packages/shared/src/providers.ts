@@ -12,6 +12,7 @@ export type ProviderId =
   | 'hermes' // agent runtime (Nous Research)
   | 'jev' // fast / cheap decision layer
   | 'browserbase' // cloud browser automation
+  | 'browserless' // supervised cloud CDP browser
   | 'localbrowser' // local browser automation for private/local-only work
   | 'composio' // SaaS tools + OAuth brokering
   | 'ollama' // local/private model runtime
@@ -24,6 +25,7 @@ export const PROVIDER_IDS = [
   'hermes',
   'jev',
   'browserbase',
+  'browserless',
   'localbrowser',
   'composio',
   'ollama',
@@ -92,6 +94,10 @@ export interface ProviderMeta {
   tokensIn?: number;
   tokensOut?: number;
   estimatedCostCents?: number;
+  /** The model that actually answered; see EgressEvent.model. */
+  model?: string;
+  cacheReadTokens?: number;
+  cacheWriteTokens?: number;
 }
 
 export type ProviderErrorCode =
@@ -237,9 +243,33 @@ export interface DecisionAdapter extends ProviderAdapter {
 }
 
 export interface BrowserAdapter extends ProviderAdapter {
+  /** Freeze human control and verify/revoke it before an approval is committed. */
+  prepareResume?(input: { sessionId: string; expectedUrl?: string }, ctx: ProviderCallContext): Promise<void>;
+  ownershipStatus?(
+    sessionId: string,
+    ctx: ProviderCallContext,
+  ): Promise<import('./browser.js').BrowserControlState>;
+  viewer?(
+    input: { sessionId: string; mode: 'watch' | 'control' },
+    ctx: ProviderCallContext,
+  ): Promise<ProviderResult<import('./browser.js').BrowserViewer>>;
+  captureFrame?(
+    sessionId: string,
+    ctx: ProviderCallContext,
+  ): Promise<ProviderResult<{ bytes: Uint8Array; width: number; height: number }>>;
+  humanInput?(
+    input: {
+      sessionId: string;
+      input: import('./browser.js').BrowserHumanInput;
+      expectedRevision?: number;
+    },
+    ctx: ProviderCallContext,
+  ): Promise<ProviderResult<null>>;
+  revokeControl?(sessionId: string, ctx: ProviderCallContext): Promise<ProviderResult<null>>;
+  invalidateSnapshot?(sessionId: string, ctx: ProviderCallContext): Promise<ProviderResult<null>>;
   /** Change who may control a run-owned session. Human ownership blocks agent I/O. */
   setOwnership?(
-    input: { sessionId: string; owner: 'agent' | 'human' },
+    input: { sessionId: string; owner: 'agent' | 'human'; expectedRevision?: number },
     ctx: ProviderCallContext,
   ): Promise<void>;
   /** Close all browser sessions still owned by a run. */
@@ -270,6 +300,15 @@ export interface BrowserAdapter extends ProviderAdapter {
     ctx: ProviderCallContext,
   ): Promise<ProviderResult<T>>;
   closeSession(sessionId: string, ctx: ProviderCallContext): Promise<ProviderResult<null>>;
+  /**
+   * Point an open session's page at a new URL. Optional: lets stateless
+   * research reuse one session instead of opening (and paying for) one per
+   * call. Callers without it fall back to a session per call.
+   */
+  navigate?(
+    input: { sessionId: string; url: string },
+    ctx: ProviderCallContext,
+  ): Promise<ProviderResult<{ url: string }>>;
 
   /**
    * Mint a CURRENT viewer URL for a running session.

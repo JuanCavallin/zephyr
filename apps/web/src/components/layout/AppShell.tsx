@@ -116,7 +116,9 @@ export function AppShell({ children }: { children: ReactNode }) {
                         ? 'Connections'
                         : location.pathname === '/compare'
                           ? 'Compare'
-                          : 'Conversation'}
+                          : location.pathname === '/benchmarks'
+                            ? 'Benchmarks'
+                            : 'Conversation'}
               </strong>
             </div>
             <button

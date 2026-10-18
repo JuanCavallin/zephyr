@@ -68,8 +68,16 @@ The agent proposes the exact send. The run **pauses**:
   and the rule that allowed it. Sensitive spans were replaced with `[[PII_n]]` before any
   cloud call — point at the placeholders in the Claude step.
 - **Compare:** on `/graphs`, open the demo workflow and press **Run + compare to baseline**. It runs the
-  supervised graph and a single-LLM-call baseline side by side, then opens `/compare`:
-  tokens, cost, latency.
+  supervised graph and a single-LLM-call baseline (B0) side by side **on the same task** — the
+  baseline is sent the graph's own prompt, inputs and source text — then opens `/compare`:
+  active time (human wait shown separately), tokens, cost, assertions. **Run + compare to both
+  baselines** adds B1: one frontier agent with every tool and no Jev routing, the fair
+  "no orchestration" control (a full agent run — it costs real money in live mode).
+- **Benchmarks (`/benchmarks`):** every graph-vs-baseline run pooled. Success rate, cost per
+  success, and the paired cost saving with a 95% interval — counted only on pairs where both
+  sides succeeded. A `≥` cost is a lower bound (some call had no known price). Mock runs are
+  hidden unless you tick the box; their numbers are not real. For a measured result rather than
+  an anecdote, run `pnpm --filter @htn/api benchmark -- --graph <id> --repeats 5` first.
 - **Pause / resume / cancel** from the run header. When the completion judge says `blocked`,
   the run pauses for you instead of failing.
 

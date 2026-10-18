@@ -1,5 +1,6 @@
 import { Router } from 'express';
 import { providers, refreshComposioTools } from '../services/runtime.js';
+import { config } from '../config.js';
 
 export const providersRouter: Router = Router();
 
@@ -11,6 +12,7 @@ export const providersRouter: Router = Router();
  */
 providersRouter.get('/providers', async (_req, res) => {
   res.json({
+    mockAll: config.mock.all,
     providers: await providers.statuses(),
     bindings: providers.bindings(),
   });

@@ -11,6 +11,7 @@ import { InMemoryToolExecutorRegistry } from '../src/core/tools/executors.js';
 import { InMemoryToolRegistry } from '../src/core/tools/registry.js';
 import { createLiveComposio } from '../src/providers/composio/live.js';
 import {
+  catalogSearchQueries,
   catalogIntentQuery,
   classifyComposioTool,
   ComposioToolCatalog,
@@ -92,10 +93,49 @@ const report = await catalog.discoverForTask({
   runId: 'run_check',
 });
 
-assert.deepEqual(searched, ['read my profile and send an email']);
+// Content words first: the catalog search wants a short phrase.
+assert.deepEqual(searched, ['read profile send email']);
 assert.deepEqual(report.registered.sort(), ['gmail.get_profile', 'mail.send']);
 assert.deepEqual(report.skipped, ['GMAIL_MAGICALIZE_EMAIL']);
 assert.deepEqual(report.requiresConnection, []);
+
+// Composio's catalog search wants a short phrase. Observed live: "Using my
+// connected Gmail account, find out how many labels I have..." matched no
+// tools and "gmail labels" twelve; a calendar request with its title and time
+// matched 22 tools without create_event, "create calendar event" found it.
+const question =
+  'Using my connected Gmail account, find out how many labels I have and tell me the number.';
+assert.deepEqual(catalogSearchQueries(question), ['gmail labels', question, 'labels', 'gmail']);
+assert.equal(
+  catalogSearchQueries(
+    "Create a Google Calendar event called 'AgentOS loop test' tomorrow at 10am for 30 minutes.",
+  )[0],
+  'create google calendar event',
+);
+assert.equal(catalogSearchQueries("Don't send it, just draft an email")[0], 'send draft email');
+{
+  const tried: string[] = [];
+  const labels = definition('GMAIL_LIST_LABELS', 'gmail');
+  const picky = new ComposioToolCatalog(
+    {
+      ...adapter,
+      searchTools: async (input) => {
+        tried.push(input.query);
+        return ok('searchTools', input.query === 'labels' ? [labels] : []);
+      },
+    },
+    cfg,
+    new InMemoryToolRegistry(),
+    new InMemoryToolExecutorRegistry(),
+  );
+  const found = await picky.discoverForTask({ query: question, runId: 'run_check' });
+  assert.deepEqual(found.registered, ['gmail.list_labels']);
+  assert.deepEqual(
+    tried,
+    ['gmail labels', question, 'labels'],
+    'tries shorter queries in order and stops at the first that matches',
+  );
+}
 
 const registered = await registry.get('mail.send');
 assert.ok(registered);

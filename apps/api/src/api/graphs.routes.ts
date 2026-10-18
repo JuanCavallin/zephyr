@@ -8,7 +8,7 @@
  */
 
 import { Router } from 'express';
-import { graphEdgeSchema, graphNodeSchema } from '@htn/shared';
+import { graphAssertionSchema, graphEdgeSchema, graphNodeSchema } from '@htn/shared';
 import { z } from 'zod';
 import {
   addEdge,
@@ -23,6 +23,7 @@ import {
   removeNode,
 } from '../services/graphs.service.js';
 import { optimizeGraph } from '../services/optimization.service.js';
+import { graphReuseReport } from '../services/reuse.service.js';
 import { HttpError, param, valid, validate } from './middleware/validate.js';
 
 export const graphsRouter: Router = Router();
@@ -32,6 +33,8 @@ const createGraphSchema = z.object({
   description: z.string().max(2000).optional(),
   nodes: z.array(z.unknown()).optional(),
   edges: z.array(z.unknown()).optional(),
+  /** Post-run checks; these are what a benchmark grades every arm by. */
+  assertions: z.array(graphAssertionSchema).optional(),
 });
 
 /** Optimistic concurrency. Omit to force the write through. */
@@ -42,6 +45,8 @@ const putGraphSchema = z.object({
   description: z.string().max(2000).optional(),
   nodes: z.array(z.unknown()),
   edges: z.array(z.unknown()),
+  /** Omit to keep the graph's current assertions. */
+  assertions: z.array(graphAssertionSchema).optional(),
   version: z.number().int().min(1).optional(),
 });
 
@@ -65,6 +70,13 @@ graphsRouter.post('/graphs', validate(createGraphSchema), async (req, res) => {
   res.status(201).json({ graph: await createGraph(body) });
 });
 
+/** Reuse across recent runs: frozen decisions, remembered targets, site alerts. */
+graphsRouter.get('/graphs/:id/reuse', async (req, res) => {
+  const report = await graphReuseReport(param(req, 'id'));
+  if (!report) throw new HttpError(404, 'NOT_FOUND', 'Graph not found');
+  res.json(report);
+});
+
 graphsRouter.get('/graphs/:id', async (req, res) => {
   const graph = await getGraph(param(req, 'id'));
   if (!graph) throw new HttpError(404, 'NOT_FOUND', 'Graph not found');
@@ -79,6 +91,7 @@ graphsRouter.put('/graphs/:id', validate(putGraphSchema), async (req, res) => {
     description: body.description ?? current.description,
     nodes: body.nodes as typeof current.nodes,
     edges: body.edges as typeof current.edges,
+    assertions: body.assertions ?? current.assertions,
   }));
   res.json({ graph });
 });

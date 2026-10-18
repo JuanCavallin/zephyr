@@ -36,6 +36,7 @@ export class ApprovalRejectedError extends Error {
 }
 
 interface Waiter {
+  cleanup: () => void;
   resolve: (outcome: ApprovalOutcome) => void;
   reject: (err: Error) => void;
   /**
@@ -62,16 +63,18 @@ export function waitForApproval(
       return;
     }
 
-    waiters.set(approvalId, { resolve, reject, action });
-
-    signal?.addEventListener(
-      'abort',
-      () => {
-        waiters.delete(approvalId);
-        reject(new Error('Run aborted while awaiting approval'));
-      },
-      { once: true },
-    );
+    const abort = () => {
+      waiters.delete(approvalId);
+      signal?.removeEventListener('abort', abort);
+      reject(new Error('Run aborted while awaiting approval'));
+    };
+    waiters.set(approvalId, {
+      resolve,
+      reject,
+      action,
+      cleanup: () => signal?.removeEventListener('abort', abort),
+    });
+    signal?.addEventListener('abort', abort, { once: true });
   });
 }
 
@@ -84,6 +87,7 @@ export function settleApproval(approvalId: string, outcome: ApprovalOutcome): bo
   const waiter = waiters.get(approvalId);
   if (!waiter) return false;
   waiters.delete(approvalId);
+  waiter.cleanup();
   waiter.resolve(outcome);
   return true;
 }

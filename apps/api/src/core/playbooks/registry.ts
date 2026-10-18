@@ -8,6 +8,7 @@
 import type { Playbook } from './types.js';
 import { agentPlaybook } from './agent.playbook.js';
 import { baselinePlaybook } from './baseline.playbook.js';
+import { baselineAgentPlaybook } from './baselineAgent.playbook.js';
 import { demoPlaybook } from './demo.playbook.js';
 import { graphPlaybook } from './graph.playbook.js';
 
@@ -16,6 +17,7 @@ import { graphPlaybook } from './graph.playbook.js';
 const PLAYBOOKS: Playbook<never>[] = [
   agentPlaybook as unknown as Playbook<never>,
   baselinePlaybook as unknown as Playbook<never>,
+  baselineAgentPlaybook as unknown as Playbook<never>,
   demoPlaybook as unknown as Playbook<never>,
   graphPlaybook as unknown as Playbook<never>,
 ];

@@ -21,6 +21,7 @@ import type { Approval, EgressEvent, Json, PauseSpan, Run, Step, StepStatus } fr
 import type { ModelTier } from './providers.js';
 import type { AgentGraph, GraphAssertion } from './schemas/graph.js';
 import type { ScheduleDecision } from './scheduling.js';
+import type { ToolLifecycleEvent } from './control.js';
 
 /* -------------------------------------------------------------------------- */
 /* Egress ledger summary                                                      */
@@ -34,7 +35,24 @@ export interface EgressSummary {
   rawValuesSent: number;
   totalTokensIn: number;
   totalTokensOut: number;
+  /** Sum over PRICED calls only; see `unpricedCalls` for what it leaves out. */
   estimatedCostCents: number;
+  /**
+   * Model calls (rows reporting tokens) with no cost: a model with no known
+   * rate. When non-zero, `estimatedCostCents` is a LOWER BOUND, not a total.
+   */
+  unpricedCalls: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+}
+
+/** Tokens reported, so a model was involved — tool and browser rows report none. */
+function isModelCall(e: EgressEvent): boolean {
+  return (e.tokensIn ?? 0) > 0 || (e.tokensOut ?? 0) > 0;
+}
+
+function isUnpriced(e: EgressEvent): boolean {
+  return isModelCall(e) && e.estimatedCostCents === undefined;
 }
 
 /**
@@ -60,6 +78,9 @@ export function summarise(events: EgressEvent[]): EgressSummary {
     totalTokensIn: events.reduce((sum, e) => sum + (e.tokensIn ?? 0), 0),
     totalTokensOut: events.reduce((sum, e) => sum + (e.tokensOut ?? 0), 0),
     estimatedCostCents: events.reduce((sum, e) => sum + (e.estimatedCostCents ?? 0), 0),
+    unpricedCalls: events.filter(isUnpriced).length,
+    cacheReadTokens: events.reduce((sum, e) => sum + (e.cacheReadTokens ?? 0), 0),
+    cacheWriteTokens: events.reduce((sum, e) => sum + (e.cacheWriteTokens ?? 0), 0),
   };
 }
 
@@ -85,6 +106,8 @@ export interface NodeMetrics {
   tokensIn: number;
   tokensOut: number;
   estimatedCostCents: number;
+  /** Model calls on this node with no known price; see EgressSummary. */
+  unpricedCalls: number;
   /** From the ScheduleDecision, when this node routed a subtask. */
   toolsAvailable?: number;
   toolsExposed?: number;
@@ -100,7 +123,16 @@ export interface NodeMetrics {
 }
 
 export interface RunTotals {
+  /**
+   * ACTIVE time: first step start to last step end, minus time a human held
+   * the run (pauses and approval waits). Human think time is not the system's
+   * latency, and a baseline with no approval gate would otherwise always win.
+   */
   wallMs: number;
+  /** First step start to last step end, human waits included. */
+  elapsedMs: number;
+  /** The part of `elapsedMs` spent paused or waiting on an approval. */
+  humanWaitMs: number;
   providerLatencyMs: number;
   /**
    * providerLatencyMs / wallMs. Above 1.0 means work overlapped — the payoff of
@@ -111,7 +143,10 @@ export interface RunTotals {
   llmCalls: number;
   tokensIn: number;
   tokensOut: number;
+  /** Priced calls only. A lower bound whenever `unpricedCalls` > 0. */
   estimatedCostCents: number;
+  unpricedCalls: number;
+  cacheReadTokens: number;
   stepCount: number;
   nodeCount: number;
   approvals: number;
@@ -142,6 +177,8 @@ export interface RollupInput {
   egress: EgressEvent[];
   scheduleDecisions?: ScheduleDecision[];
   approvals?: Approval[];
+  /** Trusted broker events; mock tools may perform no network call and emit no egress row. */
+  toolLifecycle?: ToolLifecycleEvent[];
 }
 
 /* -------------------------------------------------------------------------- */
@@ -219,6 +256,45 @@ export function pausedOverlapMs(
   return total;
 }
 
+/**
+ * Every stretch a human held the run: pauses, plus each approval from the
+ * moment it was requested until it was decided (or `now`, while pending).
+ * Merged, so a pause during an approval wait is not counted twice.
+ */
+export function humanWaitIntervals(
+  pauses: PauseSpan[] | undefined,
+  approvals: Approval[],
+  now: number,
+): { start: number; end: number }[] {
+  const raw: { start: number; end: number }[] = [];
+  for (const pause of pauses ?? []) {
+    const start = ms(pause.at);
+    if (start !== null) raw.push({ start, end: ms(pause.resumedAt) ?? now });
+  }
+  for (const approval of approvals) {
+    const start = ms(approval.createdAt);
+    if (start === null) continue;
+    const end = approval.status === 'pending' ? now : (ms(approval.decidedAt) ?? start);
+    raw.push({ start, end });
+  }
+  raw.sort((a, b) => a.start - b.start);
+  const merged: { start: number; end: number }[] = [];
+  for (const interval of raw) {
+    const last = merged.at(-1);
+    if (last && interval.start <= last.end) last.end = Math.max(last.end, interval.end);
+    else merged.push({ ...interval });
+  }
+  return merged;
+}
+
+/** How much of [from, to] the merged intervals cover. */
+function overlapMs(intervals: { start: number; end: number }[], from: number, to: number): number {
+  return intervals.reduce(
+    (total, i) => total + Math.max(0, Math.min(i.end, to) - Math.max(i.start, from)),
+    0,
+  );
+}
+
 /** The agent runtime writes { toolCallCount } onto its step's output. */
 function toolCallCount(steps: Step[]): number | undefined {
   let total: number | undefined;
@@ -275,10 +351,11 @@ function metricsFor(
     providerLatencyMs: rows.reduce((sum, e) => sum + (e.latencyMs ?? 0), 0),
     // Token presence is the honest test for "was a model involved": tool,
     // fetch and browser calls report latency but no tokens, so they don't count.
-    llmCalls: rows.filter((e) => (e.tokensIn ?? 0) > 0 || (e.tokensOut ?? 0) > 0).length,
+    llmCalls: rows.filter(isModelCall).length,
     tokensIn: rows.reduce((sum, e) => sum + (e.tokensIn ?? 0), 0),
     tokensOut: rows.reduce((sum, e) => sum + (e.tokensOut ?? 0), 0),
     estimatedCostCents: rows.reduce((sum, e) => sum + (e.estimatedCostCents ?? 0), 0),
+    unpricedCalls: rows.filter(isUnpriced).length,
     toolsAvailable: mine.length > 0 ? toolsAvailable : undefined,
     toolsExposed: mine.length > 0 ? toolsExposed : undefined,
     toolCallsActual: toolCallCount(steps),
@@ -320,15 +397,18 @@ export function rollup(input: RollupInput, now: number = Date.now()): RunAnalyti
   const unattributed = orphans.length > 0 ? metricsFor('', orphans, egress, decisions, now) : null;
 
   const egressSummary = summarise(egress);
-  // Paused time is excluded: a run left paused for an hour did not take an hour,
-  // and counting it would wreck the parallelism factor (provider time / wall time),
-  // which is a headline number.
+  // Human time is excluded: a run left paused for an hour, or waiting on an
+  // approval overnight, did not take that long. Counting it would wreck the
+  // parallelism factor (provider time / wall time), which is a headline
+  // number, and hand every comparison to the baseline, which has no gates.
   const bounds = spanBounds(steps, now);
-  const activeSpan = bounds
-    ? Math.max(0, bounds.last - bounds.first - pausedOverlapMs(run.pauses, bounds.first, bounds.last, now))
+  const elapsedMs = bounds
+    ? Math.max(0, bounds.last - bounds.first)
+    : Math.max(0, (ms(run.updatedAt) ?? now) - (ms(run.createdAt) ?? now));
+  const humanWaitMs = bounds
+    ? overlapMs(humanWaitIntervals(run.pauses, approvals, now), bounds.first, bounds.last)
     : 0;
-  const wallMs =
-    activeSpan || Math.max(0, (ms(run.updatedAt) ?? now) - (ms(run.createdAt) ?? now));
+  const wallMs = Math.max(0, elapsedMs - humanWaitMs);
   const providerLatencyMs = egress.reduce((sum, e) => sum + (e.latencyMs ?? 0), 0);
 
   const toolsAvailable = decisions.reduce((sum, d) => sum + d.availableTools.length, 0);
@@ -342,12 +422,16 @@ export function rollup(input: RollupInput, now: number = Date.now()): RunAnalyti
     unattributed,
     totals: {
       wallMs,
+      elapsedMs,
+      humanWaitMs,
       providerLatencyMs,
       parallelismFactor: wallMs > 0 ? providerLatencyMs / wallMs : 0,
-      llmCalls: egress.filter((e) => (e.tokensIn ?? 0) > 0 || (e.tokensOut ?? 0) > 0).length,
+      llmCalls: egress.filter(isModelCall).length,
       tokensIn: egressSummary.totalTokensIn,
       tokensOut: egressSummary.totalTokensOut,
       estimatedCostCents: egressSummary.estimatedCostCents,
+      unpricedCalls: egressSummary.unpricedCalls,
+      cacheReadTokens: egressSummary.cacheReadTokens,
       stepCount: steps.length,
       nodeCount: nodes.length,
       approvals: approvals.length,
@@ -489,7 +573,8 @@ const OUTLIER_RATIO = 1.5;
 const COST_OUTLIER_FLOOR_CENTS = 5;
 const LATENCY_OUTLIER_FLOOR_MS = 500;
 
-function median(values: number[]): number {
+/** Middle value, or the mean of the two middle values; 0 for no values. */
+export function median(values: number[]): number {
   if (values.length === 0) return 0;
   const sorted = [...values].sort((a, b) => a - b);
   const mid = Math.floor(sorted.length / 2);
@@ -522,7 +607,11 @@ export function buildGraphCritique(input: BuildGraphCritiqueInput): GraphCritiqu
   const tally = new Map<string, { description: string; passed: number; total: number }>();
   for (const { steps } of analyzed) {
     for (const result of evaluateAssertions(assertions, steps)) {
-      const entry = tally.get(result.id) ?? { description: result.description, passed: 0, total: 0 };
+      const entry = tally.get(result.id) ?? {
+        description: result.description,
+        passed: 0,
+        total: 0,
+      };
       entry.total += 1;
       if (result.passed) entry.passed += 1;
       tally.set(result.id, entry);
@@ -570,7 +659,10 @@ export function buildGraphCritique(input: BuildGraphCritiqueInput): GraphCritiqu
           median: costMedian,
         });
       }
-      if (sample.latency > latencyMedian * OUTLIER_RATIO && sample.latency > LATENCY_OUTLIER_FLOOR_MS) {
+      if (
+        sample.latency > latencyMedian * OUTLIER_RATIO &&
+        sample.latency > LATENCY_OUTLIER_FLOOR_MS
+      ) {
         latencyOutliers.push({
           nodeId,
           label: sample.label,
@@ -620,7 +712,9 @@ export function buildGraphCritique(input: BuildGraphCritiqueInput): GraphCritiqu
         egress: lookupByRun(input.baselineEgressByRun, run.id),
       }),
     );
-    const graphTokens = analyzed.map((a) => a.analytics.totals.tokensIn + a.analytics.totals.tokensOut);
+    const graphTokens = analyzed.map(
+      (a) => a.analytics.totals.tokensIn + a.analytics.totals.tokensOut,
+    );
     const baselineTokens = baselineAnalytics.map((a) => a.totals.tokensIn + a.totals.tokensOut);
 
     baselineComparison = {

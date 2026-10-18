@@ -22,6 +22,12 @@ interface Latch {
   release: () => void;
   /** Set when a paused run is cancelled, so waiters unwind rather than hang. */
   released: boolean;
+  /**
+   * When the first checkpoint actually parked on this latch. Unset while the
+   * run is still draining (`pausing`): that time was real work, and analytics
+   * must only exclude the stretch where nothing ran. See PauseSpan.
+   */
+  heldAt?: string;
 }
 
 const latches = new Map<string, Latch>();
@@ -45,6 +51,11 @@ export function resumeRun(runId: string): boolean {
   latch.released = true;
   latch.release();
   return true;
+}
+
+/** When the current pause actually took hold, or undefined if it has not yet. */
+export function pauseHeldSince(runId: string): string | undefined {
+  return latches.get(runId)?.heldAt;
 }
 
 export function isPaused(runId: string): boolean {
@@ -71,6 +82,7 @@ export async function waitWhilePaused(
   if (!latch) return;
   if (signal?.aborted) return;
 
+  latch.heldAt ??= new Date().toISOString();
   await onPause?.();
 
   await Promise.race([

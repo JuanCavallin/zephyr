@@ -278,6 +278,7 @@ export class McpConnectionManager {
       availability: executable ? 'available' : 'unavailable',
       executorRef,
       credentialRef: 'mcp-connection:' + connection.id,
+      requiresChangeReview: classification.effect !== 'read',
     };
     this.registry.register({
       descriptor,
@@ -293,24 +294,29 @@ export class McpConnectionManager {
         execute: async (action, ctx) => {
           const started = Date.now();
           try {
-            const result = await this.withClient(connection, 45_000, (client) =>
-              client.callTool({
-                name: tool.name,
-                arguments: asArguments(action.arguments),
-              }),
+            const result = await this.withClient(
+              connection,
+              45_000,
+              (client) =>
+                client.callTool({
+                  name: tool.name,
+                  arguments: asArguments(action.arguments),
+                }),
+              ctx.signal,
             );
             if (result.isError) throw new Error('MCP server reported tool failure.');
             return {
-              output: toJson({
-                content: result.content,
-                ...('structuredContent' in result
-                  ? { structuredContent: result.structuredContent }
-                  : {}),
-              }),
+              output: { tool: descriptor.id, providerReported: true },
               summary: 'Completed ' + descriptor.id + ' through ' + connection.name + '.',
               dataLabels: [...action.dataLabels],
-              verified: true,
+              verified: classification.effect === 'read',
+              evidenceVerified: false,
+              executionMode: 'live',
             };
+          } catch {
+            // Remote error payloads can echo document bodies or credentials.
+            // The broker records outcome uncertainty without exposing that text.
+            throw new Error('MCP tool request failed or was cancelled.');
           } finally {
             await this.recordEgress({
               id: newId('egr'),
@@ -335,17 +341,20 @@ export class McpConnectionManager {
     connection: McpConnection,
     timeoutMs: number,
     work: (client: Client) => Promise<T>,
+    signal?: AbortSignal,
   ): Promise<T> {
     const headers = resolveHeaders(connection.headerEnv);
     const client = new Client({ name: 'agentos-' + connection.id, version: '1.0.0' });
     const transport = new StreamableHTTPClientTransport(new URL(connection.url), {
       requestInit: {
         headers,
-        signal: AbortSignal.timeout(timeoutMs),
+        signal: signal
+          ? AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)])
+          : AbortSignal.timeout(timeoutMs),
       },
     });
-    await client.connect(transport);
     try {
+      await client.connect(transport);
       return await work(client);
     } finally {
       await client.close().catch(() => undefined);
@@ -368,6 +377,12 @@ function classifyName(name: string): {
   effect: ToolDescriptor['baselineEffect'];
   reversibility: ToolDescriptor['reversibility'];
 } {
+  if (
+    /COMPOSIO_(?:MULTI_EXECUTE|REMOTE_WORKBENCH|REMOTE_BASH)|(?:^|_)RUN_CODE(?:_|$)|(?:^|_)EXECUTE_CODE(?:_|$)/i.test(
+      name,
+    )
+  )
+    return { effect: 'unknown', reversibility: 'irreversible' };
   const tokens = name
     .replace(/([a-z0-9])([A-Z])/g, '$1_$2')
     .toUpperCase()

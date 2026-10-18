@@ -35,7 +35,12 @@ const FIXTURES: GraphFixture[] = [
           position: { x: 0, y: 0 },
           config: {
             goal: 'Visit each vendor portal and list invoices that are past due.',
-            availableTools: ['browser.navigate', 'browser.extract', 'web.search', 'docs.read'],
+            availableTools: [
+              'browserbase.search',
+              'browserbase.read',
+              'web.search',
+              'agentos.document_read',
+            ],
           },
         },
         {
@@ -58,12 +63,12 @@ const FIXTURES: GraphFixture[] = [
             goal: 'Record the overdue invoice findings where the team will see them.',
             candidateTools: ['sheets.append', 'calendar.create', 'mail.send'],
             args: {
-              'sheets.append': { row: '{{collect.result}}' },
+              'sheets.append': { row: 'Invoice findings: {{collect.result}}' },
               'calendar.create': { title: 'Review overdue invoices' },
               'mail.send': {
                 to: 'avery.chen@example.edu',
                 subject: 'Overdue invoices found',
-                body: '{{collect.result}}',
+                body: 'Invoice findings: {{collect.result}}',
               },
             },
           },
@@ -75,7 +80,11 @@ const FIXTURES: GraphFixture[] = [
           position: { x: 0, y: 390 },
           config: {
             tool: 'mail.send',
-            args: { subject: 'Overdue invoice summary' },
+            args: {
+              to: 'avery.chen@example.edu',
+              subject: 'Overdue invoice summary',
+              body: 'Invoice findings: {{collect.result}}',
+            },
             description: 'Send the overdue invoice summary by email?',
             actionKind: 'send_email',
           },
@@ -122,10 +131,14 @@ const FIXTURES: GraphFixture[] = [
           position: { x: 0, y: 390 },
           config: {
             goal: 'Put the summary somewhere the team can find it.',
-            candidateTools: ['sheets.append', 'docs.draft', 'mail.send'],
+            candidateTools: ['sheets.append', 'agentos.document_update', 'mail.send'],
             args: {
               'sheets.append': { row: '{{summarise.text}}' },
-              'docs.draft': { body: '{{summarise.text}}' },
+              'agentos.document_update': {
+                artifactId: 'summary',
+                expectedVersion: 'new',
+                content: '{{summarise.text}}',
+              },
               'mail.send': {
                 to: 'avery.chen@example.edu',
                 subject: 'Document summary',
@@ -156,7 +169,12 @@ const DEFAULT_FIXTURE: Record<string, unknown> = {
       position: { x: 0, y: 0 },
       config: {
         goal: 'Investigate the request and gather what is needed to act on it.',
-        availableTools: ['browser.navigate', 'browser.extract', 'web.search', 'docs.read'],
+        availableTools: [
+          'browserbase.search',
+          'browserbase.read',
+          'web.search',
+          'agentos.document_read',
+        ],
       },
     },
     {
@@ -179,12 +197,12 @@ const DEFAULT_FIXTURE: Record<string, unknown> = {
         goal: 'Act on the findings using the most appropriate tool.',
         candidateTools: ['sheets.append', 'calendar.create', 'mail.send'],
         args: {
-          'sheets.append': { row: '{{investigate.result}}' },
+          'sheets.append': { row: 'Research findings: {{investigate.result}}' },
           'calendar.create': { title: 'Follow up' },
           'mail.send': {
             to: 'avery.chen@example.edu',
             subject: 'Action required',
-            body: '{{investigate.result}}',
+            body: 'Research findings: {{investigate.result}}',
           },
         },
       },
@@ -284,7 +302,10 @@ function applyOptimizeMutation(current: Record<string, unknown>): Record<string,
  * conversational editing looks like a swap in mock mode. Worth knowing before
  * demoing an edit without keys.
  */
-export function mockGraphFor(prompt: string): string {
+export function mockGraphFor(
+  prompt: string,
+  browserBackend: 'browserbase' | 'browserless' | 'localbrowser' = 'browserbase',
+): string {
   const request = requestPortion(prompt);
 
   if (request.trimStart().toUpperCase().startsWith('OPTIMIZE:')) {
@@ -294,5 +315,12 @@ export function mockGraphFor(prompt: string): string {
 
   const haystack = request.toLowerCase();
   const hit = FIXTURES.find((fixture) => fixture.match.some((word) => haystack.includes(word)));
-  return JSON.stringify(hit ? hit.body : DEFAULT_FIXTURE);
+  const graph = structuredClone(hit ? hit.body : DEFAULT_FIXTURE);
+  for (const node of graph.nodes as { config: Record<string, unknown> }[]) {
+    if (Array.isArray(node.config.availableTools))
+      node.config.availableTools = node.config.availableTools.map((id: string) =>
+        id.replace(/^browserbase\./, browserBackend + '.'),
+      );
+  }
+  return JSON.stringify(graph);
 }

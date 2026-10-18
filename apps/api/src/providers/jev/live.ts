@@ -17,6 +17,8 @@ import type {
   ProviderResult,
 } from '@htn/shared';
 import type { ProviderConfig } from '../../config.js';
+import { CredentialRequiredError, type CredentialStore } from '../../services/credentials.js';
+import { costCents } from '../pricing.js';
 
 const MODEL_ID = 'typesafe-ai/jev';
 const DEFAULT_BASE_URL = 'https://ai-gateway.vercel.sh/v4/ai';
@@ -39,7 +41,13 @@ function statusCode(error: unknown): number | undefined {
 
 function providerError(error: unknown): ProviderError {
   const status = statusCode(error);
-  const message = error instanceof Error ? error.message : String(error);
+  const message =
+    error instanceof CredentialRequiredError
+      ? error.message
+      : status
+        ? 'Jev returned HTTP ' + status + '.'
+        : 'Jev evaluation failed.';
+  if (error instanceof CredentialRequiredError) return { code: 'AUTH', message, retryable: false };
 
   if (status === 401 || status === 403) {
     return { code: 'AUTH', message, retryable: false };
@@ -57,11 +65,33 @@ function providerError(error: unknown): ProviderError {
   };
 }
 
+const JEV_MODEL_ID = 'typesafe-ai/jev';
+
+/**
+ * Cents for one Jev call. The AI Gateway reports a per-call cost in its
+ * provider metadata (USD); that is the real bill, so it wins. Otherwise a
+ * MODEL_PRICES_JSON rate for 'typesafe-ai/jev' applies, and failing both the
+ * call stays UNPRICED (undefined) rather than reading as free.
+ */
+export function jevCostCents(
+  usage: { inputTokens?: number; outputTokens?: number } | undefined,
+  providerMetadata: unknown,
+): number | undefined {
+  const gateway = (providerMetadata as { gateway?: { cost?: unknown } } | undefined)?.gateway;
+  const reported = typeof gateway?.cost === 'string' ? Number(gateway.cost) : gateway?.cost;
+  if (typeof reported === 'number' && Number.isFinite(reported)) return reported * 100;
+  return costCents(JEV_MODEL_ID, {
+    inputTokens: usage?.inputTokens ?? 0,
+    outputTokens: usage?.outputTokens ?? 0,
+  });
+}
+
 function meta(
   op: string,
   startedAt: number,
   destination: string,
   usage?: { inputTokens?: number; outputTokens?: number },
+  providerMetadata?: unknown,
 ) {
   return {
     provider: 'jev' as const,
@@ -71,6 +101,10 @@ function meta(
     destination,
     tokensIn: usage?.inputTokens,
     tokensOut: usage?.outputTokens,
+    // Only a call that reached the model has a model and a bill.
+    ...(usage
+      ? { model: JEV_MODEL_ID, estimatedCostCents: jevCostCents(usage, providerMetadata) }
+      : {}),
   };
 }
 
@@ -87,14 +121,27 @@ function average(values: number[]): number {
   return values.reduce((sum, value) => sum + value, 0) / values.length;
 }
 
-export function createLiveJev(cfg: ProviderConfig): DecisionAdapter {
+export function createLiveJev(
+  cfg: ProviderConfig,
+  credentialResolver?: CredentialStore,
+): DecisionAdapter {
   const baseURL = cfg.baseUrl ?? DEFAULT_BASE_URL;
   const destination = baseURL + '/evaluation-model';
-  const gateway = createGateway({
-    apiKey: cfg.apiKey,
-    ...(cfg.baseUrl ? { baseURL: cfg.baseUrl } : {}),
-  });
-  const model = gateway.evaluationModel(MODEL_ID);
+  const maxRetries = credentialResolver?.source === 'user' ? 0 : 2;
+  const gatewayFor = (apiKey: string) =>
+    createGateway({ apiKey, ...(cfg.baseUrl ? { baseURL: cfg.baseUrl } : {}) });
+  const modelFor = async (ctx: ProviderCallContext) => {
+    const credential = credentialResolver
+      ? await credentialResolver.require({
+          runId: ctx.runId,
+          providerId: 'jev',
+          purpose: 'decision',
+        })
+      : null;
+    const apiKey = credential?.secret ?? cfg.apiKey;
+    if (!apiKey) throw new CredentialRequiredError('jev');
+    return gatewayFor(apiKey).evaluationModel(MODEL_ID);
+  };
 
   const decide: DecisionAdapter['decide'] = async (input, ctx) => {
     const startedAt = Date.now();
@@ -115,7 +162,7 @@ export function createLiveJev(cfg: ProviderConfig): DecisionAdapter {
         input.options.map((option) => [option, 'Select when the evidence best supports ' + option]),
       );
       const result = await evaluate({
-        model,
+        model: await modelFor(ctx),
         state: {
           question: input.question,
           evidence: input.evidence ?? null,
@@ -127,7 +174,7 @@ export function createLiveJev(cfg: ProviderConfig): DecisionAdapter {
             criteria,
           },
         },
-        maxRetries: 2,
+        maxRetries,
         abortSignal: decisionSignal(ctx.signal),
       });
       const answer = result.answers.decision;
@@ -140,7 +187,7 @@ export function createLiveJev(cfg: ProviderConfig): DecisionAdapter {
           confidence,
           rationale: `Jev selected ${answer.choice} with probability ${confidence.toFixed(3)}.`,
         },
-        meta: meta('decide', startedAt, destination, result.usage),
+        meta: meta('decide', startedAt, destination, result.usage, result.providerMetadata),
       };
     } catch (error) {
       return {
@@ -167,7 +214,7 @@ export function createLiveJev(cfg: ProviderConfig): DecisionAdapter {
 
     try {
       const result = await evaluate({
-        model,
+        model: await modelFor(ctx),
         state: {
           task: input.state.taskSummary,
           context: input.state.contextSummary ?? null,
@@ -191,7 +238,7 @@ export function createLiveJev(cfg: ProviderConfig): DecisionAdapter {
             ),
           },
         },
-        maxRetries: 2,
+        maxRetries,
         abortSignal: decisionSignal(ctx.signal),
       });
       const answer = result.answers.modelRoute;
@@ -207,7 +254,7 @@ export function createLiveJev(cfg: ProviderConfig): DecisionAdapter {
           probabilities: answer.probabilities ?? {},
           reasonCodes: ['jev-model-route-choice'],
         },
-        meta: meta('select_model', startedAt, destination, result.usage),
+        meta: meta('select_model', startedAt, destination, result.usage, result.providerMetadata),
       };
     } catch (error) {
       return {
@@ -237,14 +284,14 @@ export function createLiveJev(cfg: ProviderConfig): DecisionAdapter {
         };
       });
       const result = await evaluate({
-        model,
+        model: await modelFor(ctx),
         state: {
           task: input.state.taskSummary,
           context: input.state.contextSummary ?? null,
           candidateFamilies: input.candidateFamilies,
         },
         questions,
-        maxRetries: 2,
+        maxRetries,
         abortSignal: decisionSignal(ctx.signal),
       });
       const confidences = Object.fromEntries(
@@ -262,7 +309,13 @@ export function createLiveJev(cfg: ProviderConfig): DecisionAdapter {
           confidences,
           reasonCodes: ['jev-tool-family-filter'],
         },
-        meta: meta('select_tool_families', startedAt, destination, result.usage),
+        meta: meta(
+          'select_tool_families',
+          startedAt,
+          destination,
+          result.usage,
+          result.providerMetadata,
+        ),
       };
     } catch (error) {
       return {
@@ -294,7 +347,7 @@ export function createLiveJev(cfg: ProviderConfig): DecisionAdapter {
         };
       });
       const result = await evaluate({
-        model,
+        model: await modelFor(ctx),
         state: {
           task: input.state.taskSummary,
           context: input.state.contextSummary ?? null,
@@ -306,7 +359,7 @@ export function createLiveJev(cfg: ProviderConfig): DecisionAdapter {
           })),
         },
         questions,
-        maxRetries: 2,
+        maxRetries,
         abortSignal: decisionSignal(ctx.signal),
       });
       const confidences = Object.fromEntries(
@@ -332,7 +385,7 @@ export function createLiveJev(cfg: ProviderConfig): DecisionAdapter {
           confidences,
           reasonCodes: ['jev-tool-filter'],
         },
-        meta: meta('select_tools', startedAt, destination, result.usage),
+        meta: meta('select_tools', startedAt, destination, result.usage, result.providerMetadata),
       };
     } catch (error) {
       return {
@@ -346,10 +399,14 @@ export function createLiveJev(cfg: ProviderConfig): DecisionAdapter {
   const recommendActionPolicy: DecisionAdapter['recommendActionPolicy'] = async (input, ctx) => {
     const startedAt = Date.now();
     try {
+      const target = browserTargetOf(input.action.review);
       const result = await evaluate({
-        model,
+        model: await modelFor(ctx),
         state: {
           operation: input.action.operation,
+          // The exact element a browser action will hit, so a confident click
+          // on "Place order" is judged as a purchase, not as "a click".
+          ...(target ? { target } : {}),
           destination: input.action.destination ?? null,
           dataLabels: input.action.dataLabels,
           tool: {
@@ -369,12 +426,13 @@ export function createLiveJev(cfg: ProviderConfig): DecisionAdapter {
               auto: 'A reversible, read-only, low-impact action that may run automatically.',
               verify: 'An action that may run but requires deterministic result verification.',
               ask_user:
-                'An external side effect or consequential action requiring exact-action user approval.',
+                'An external side effect or consequential action requiring exact-action user approval, ' +
+                'including a browser target that buys, pays, sends, posts, deletes or confirms something.',
               deny: 'An unsafe, unknown, disallowed, or policy-incompatible action.',
             },
           },
         },
-        maxRetries: 2,
+        maxRetries,
         abortSignal: decisionSignal(ctx.signal),
       });
       const answer = result.answers.actionPolicy;
@@ -391,7 +449,13 @@ export function createLiveJev(cfg: ProviderConfig): DecisionAdapter {
           probabilities: answer.probabilities ?? {},
           reasonCodes: ['jev-semantic-action-policy'],
         },
-        meta: meta('recommend_action_policy', startedAt, destination, result.usage),
+        meta: meta(
+          'recommend_action_policy',
+          startedAt,
+          destination,
+          result.usage,
+          result.providerMetadata,
+        ),
       };
     } catch (error) {
       return {
@@ -409,7 +473,7 @@ export function createLiveJev(cfg: ProviderConfig): DecisionAdapter {
         .filter((step) => step.required && step.status !== 'succeeded')
         .map((step) => ({ id: step.id, label: step.label, status: step.status }));
       const result = await evaluate({
-        model,
+        model: await modelFor(ctx),
         state: {
           objective: input.sanitizedState.taskSummary,
           context: input.sanitizedState.contextSummary ?? null,
@@ -466,7 +530,7 @@ export function createLiveJev(cfg: ProviderConfig): DecisionAdapter {
               }
             : {}),
         },
-        maxRetries: 2,
+        maxRetries,
         abortSignal: decisionSignal(ctx.signal),
       });
       const answer = result.answers.completion;
@@ -487,7 +551,13 @@ export function createLiveJev(cfg: ProviderConfig): DecisionAdapter {
           suggestedNextStepId:
             status === 'continue' && nextStep?.type === 'choice' ? nextStep.choice : undefined,
         },
-        meta: meta('judge_completion', startedAt, destination, result.usage),
+        meta: meta(
+          'judge_completion',
+          startedAt,
+          destination,
+          result.usage,
+          result.providerMetadata,
+        ),
       };
     } catch (error) {
       return {
@@ -536,14 +606,14 @@ export function createLiveJev(cfg: ProviderConfig): DecisionAdapter {
       });
 
       const result = await evaluate({
-        model,
+        model: await modelFor(ctx),
         state: {
           task: input.task,
           context: input.context ?? null,
           availableTools: input.availableTools,
         },
         questions,
-        maxRetries: 2,
+        maxRetries,
         abortSignal: decisionSignal(ctx.signal),
       });
 
@@ -600,7 +670,7 @@ export function createLiveJev(cfg: ProviderConfig): DecisionAdapter {
             `and exposed ${exposedTools.length} of ` +
             `${input.availableTools.length} tools at p >= ${TOOL_THRESHOLD}.`,
         },
-        meta: meta('route', startedAt, destination, result.usage),
+        meta: meta('route', startedAt, destination, result.usage, result.providerMetadata),
       };
     } catch (error) {
       return {
@@ -618,6 +688,15 @@ export function createLiveJev(cfg: ProviderConfig): DecisionAdapter {
     async health() {
       const startedAt = Date.now();
       try {
+        if (credentialResolver?.source === 'user') {
+          return {
+            ok: true,
+            data: {
+              detail: 'User-funded Jev; missing credentials use deterministic policy fallback.',
+            },
+            meta: meta('health', startedAt, 'local://credential-status'),
+          };
+        }
         if (!cfg.apiKey) {
           return {
             ok: false,
@@ -625,7 +704,7 @@ export function createLiveJev(cfg: ProviderConfig): DecisionAdapter {
             meta: meta('health', startedAt, baseURL),
           };
         }
-        await gateway.getCredits();
+        await gatewayFor(cfg.apiKey).getCredits();
         return {
           ok: true,
           data: { detail: `Vercel AI Gateway · ${MODEL_ID}` },
@@ -699,5 +778,21 @@ export function createLiveJev(cfg: ProviderConfig): DecisionAdapter {
     recommendActionPolicy,
     judgeCompletion,
     route,
+  };
+}
+
+/** The prepared browser target on an action's review, reduced to what the policy needs. */
+function browserTargetOf(
+  review: unknown,
+): { operation: string; role: string; label: string; page: string } | undefined {
+  if (!review || typeof review !== 'object' || Array.isArray(review)) return undefined;
+  const value = review as Record<string, unknown>;
+  if (value.kind !== 'browser_target') return undefined;
+  const text = (key: string) => (typeof value[key] === 'string' ? (value[key] as string) : '');
+  return {
+    operation: text('operation'),
+    role: text('role'),
+    label: text('label'),
+    page: text('pageUrl'),
   };
 }

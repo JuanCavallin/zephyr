@@ -393,6 +393,7 @@ async function requestJson<T>(
   try {
     const response = await fetch(requestUrl, {
       ...init,
+      redirect: 'error',
       headers: {
         'Content-Type': 'application/json',
         'x-api-key': cfg.apiKey ?? '',
@@ -417,7 +418,28 @@ async function requestJson<T>(
         destination,
       };
     }
-    return { ok: true, data: (await response.json()) as T, destination };
+    const limit = 1_048_576;
+    if (Number(response.headers.get('content-length')) > limit)
+      throw new Error('Response too large.');
+    const reader = response.body?.getReader();
+    if (!reader) throw new Error('Empty response.');
+    const chunks: Uint8Array[] = [];
+    let size = 0;
+    try {
+      for (;;) {
+        const part = await reader.read();
+        if (part.done) break;
+        size += part.value.byteLength;
+        if (size > limit) {
+          await reader.cancel();
+          throw new Error('Response too large.');
+        }
+        chunks.push(part.value);
+      }
+    } finally {
+      reader.releaseLock();
+    }
+    return { ok: true, data: JSON.parse(Buffer.concat(chunks).toString('utf8')) as T, destination };
   } catch (error) {
     return {
       ok: false,
