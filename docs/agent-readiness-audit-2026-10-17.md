@@ -21,6 +21,8 @@ The P0/P1 findings below are fixed in code with offline regression coverage. No 
 
 Still open from this audit: the Graph Editor comparison still hardcodes demo variables; the CLI still defaults to `graph,baseline` (pass `--arms graph,baseline,baseline_agent`); `graph_demo` remains a system demo, not a fair quality fixture (`agentos.benchmark_fixture`, a synthetic public order dataset, is registered for building one); all hosted/live limits in the last two sections are unchanged.
 
+**Addendum, evening of 2026-10-17: see [Live-run findings](#live-run-findings-addendum) and [What can be claimed](#what-can-be-claimed-resume-and-essays).** The setup table below describes the machine the original audit ran on. On the machine used for the addendum the Hermes checkout and `uv` were absent and Hermes ran as mock.
+
 Scope: current source/configuration inspection, passive local-service checks, offline checks and synthetic in-memory reproductions. No paid model completion, live ACP task, hosted browser session or external app action was launched. Credentials were inspected only for presence and non-secret configuration. Runtime code and `.env` were not changed.
 
 ## Progress delivered
@@ -151,3 +153,72 @@ pnpm --filter @htn/api benchmark -- --graph YOUR_READ_ONLY_GRAPH_ID --arms graph
 ```
 
 Use the graph comparison controls for a single paired run, the run links for live intervention, and `/benchmarks` for aggregate measurements. Keep mock rehearsal results separate from live benchmark evidence.
+
+## Live-run findings (addendum)
+
+Observed while running the workflow builder and graph runner by hand against live Jev, Anthropic,
+Gemini and Composio, with the local browser. Hermes and Browserbase were not usable (below). These
+are single manual runs, not benchmarks.
+
+### Fixed
+
+| Finding | Evidence | Change |
+| --- | --- | --- |
+| Graph synthesis failed on truncated JSON | Both attempts reported `3072 out`, exactly the `direct` cap, with 1.4k and 2.9k chars of output, and parse errors at the last characters (position 1418 of 1460, 2923 of 2946). Reasoning tokens consumed the budget. | [synthesizer.ts](../apps/api/src/core/graph/synthesizer.ts): caps raised to 8192 (`direct`) and 12288 (adaptive); a truncated reply now gets a "cut off, return a shorter document" repair hint instead of "not valid JSON". Afterwards synthesis was accepted at 3613 and 5105 output tokens. Not re-run enough times to give a success rate. |
+| Browser tool nodes used the wrong argument names | `localbrowser.type` failed validation: missing `text`, unexpected `value`. The synthesizer sees only a tool's name and description, and the browser descriptions did not list their args. | [browserDescriptors.ts](../apps/api/src/core/tools/browserDescriptors.ts): each description now ends with `Args: name*, ...` derived from the tool's own input schema. A later run executed the type step. `tsc` clean; no new automated test covers either change. |
+
+### Open
+
+- **A mock agent result counts as a success.** With Hermes in mock, an `agent_task` returns a placeholder note, the step is marked `succeeded` ([orchestrator.ts:1469](../apps/api/src/core/orchestrator.ts#L1469)), and the next node consumes it. The downstream report correctly said "no usable data", but the run itself still showed success.
+- **Blocked completion is invisible at run level.** Jev judged the agent task `blocked` (confidence 0.54, below the 0.70 floor) and the graph continued by design. The card shows it; the run status does not.
+- **A bad `HERMES_CWD` downgrades to mock with one boot line.** `HERMES_MODE=live` plus a missing path, or a missing `uv`, silently runs mock. On this machine `HERMES_CWD` pointed at `Local_Dev\HTN-2026\hermes-agent`, which does not exist; no checkout exists on this machine.
+- **The synthesizer ignored an explicit "no agent" instruction twice** and kept an `agent_task`. Its prompt also steers toward `browserbase.*` regardless of which providers are live.
+- **`SynthesisError` returns an unhandled 500** ([conversations.routes.ts:88](../apps/api/src/api/conversations.routes.ts#L88)).
+- **Report nodes can overstate.** A report listed a form as filled from a single `TYPE_TEXT` action (Jev p=0.56 on one field); another report was cut mid-sentence by a low `maxTokens`. Neither is checked against outcome assertions.
+- **Composio registered only `mail.send`** on this setup. `sheets.append` and `calendar.create` need their toolkits connected.
+- **Browser sessions can leak.** The default cap is two; a graph that opens a session and never closes it can starve a parallel branch.
+- **Browserbase quota is exhausted**; the local browser is the working live backend on this machine.
+
+## What can be claimed (resume and essays)
+
+Rule used here: a claim is listed as safe only if a number or behaviour was reproduced from a file in
+this repo or observed in a log. Items that exist only as design intent are listed separately. Fill in
+your own role and share of the work; this file does not know who built what.
+
+### Safe to state, with the number
+
+| Claim | Source | Wording that stays accurate |
+| --- | --- | --- |
+| The browser request Jev receives stays about 1.5K tokens regardless of page size | [browser-benchmark-2026-10-09.json](metrics/browser-benchmark-2026-10-09.json), recomputed: median 1,517, range 1,234 to 2,045 tokens across 13 live sites | "per browser step, measured on 13 live sites" |
+| That is 81.7% fewer tokens than a full accessibility-tree snapshot (median; 60.9% to 98.1%) | same file, recomputed | Use this as the headline. It is the fair comparison. |
+| Page snapshotting about 191x faster (median; lowest 92x); pre-action target check about 15x | same file, recomputed | "local Chrome, snapshot step only; the 'before' is a re-implementation of the earlier per-element approach" |
+| Diagnosed and fixed a token-budget truncation in the workflow synthesizer from the token logs | Logs in the addendum above | "found that reasoning tokens exhausted the output cap; raised the budget and gave the retry a specific repair hint" |
+| Found and closed a model-privacy bypass: a pinned model route skipped the data-label eligibility check | Audit P0, with a six-case offline reproduction and `check:model-gateway` regression | Say it was found by audit and closed with offline tests. No live egress occurred. |
+| Exact-action approval on irreversible tools (for example `GMAIL_SEND_EMAIL`), failing closed on 14 broker error codes | [metrics.md](metrics.md) "Read from the code" table | A design property read from code, not a measured outcome |
+| 942 test assertions across 29 files | [metrics.md](metrics.md) with the `grep` command given there | Re-run the command before quoting the number. It was not re-run for this audit. |
+
+### Do not claim
+
+- **Any end-to-end token, cost or latency saving.** The audit states no benchmark result has been produced since the fixes, and `graph_demo` is not a fair quality fixture. Only per-step input size is measured.
+- **"98.5% fewer tokens" as a headline.** It is against raw DOM, which no real browser agent sends to a model. It is accurate but easy to read as a strawman.
+- **Accuracy.** Jev sees at most 60 elements per page; on Wikipedia that is 60 of 2,235. The benchmark measures prompt size and does not report how often the right target is in the table.
+- **"Agents that get cheaper"** ([DEVPOST.md](DEVPOST.md)). No number backs it.
+- **A working Hermes agent end to end.** Hermes ran as mock on the machine used here, so no agent result from it has been observed. The adapter code is complete and was verified against a real install by its author, per its header, but that was not reproduced here.
+- **Tool narrowing as a token saving** ("at most 8 of 1,000+ tools"). It is a code constant, not a measurement.
+- **Live Composio or hosted-browser reliability.** Not rehearsed; Browserbase quota is exhausted.
+
+### Essay angles that hold up
+
+1. **"Make the decision model small, not the context large."** Jev cannot generate text; it picks an index from a table the system builds. The measured consequence is a roughly constant 1.5K-token request instead of a page-sized one. This is the strongest technical story and it is backed by data.
+2. **Why a fast model still needs a gate.** The privacy bypass came from a pin that skipped eligibility. "A tool that cannot generate an action still cannot be trusted to have chosen an authorized one" is supported by the audit reproduction.
+3. **Honest measurement.** The audit found its own benchmark could overstate savings (mock tools counted as live, baselines failing by construction, unpriced calls in savings) and recorded the fixes. A candid account of that is more credible than a headline number.
+4. **Debugging with token logs.** The truncation bug looked like a malformed-JSON bug; `tokensOut` equal to the cap showed it was not. Short, concrete and true.
+5. **Failure that looks like success.** A mock agent returned a placeholder, the run went green, and only the report model's wording revealed it. It motivates the open items above.
+
+### Resume bullets (templates; adjust the verbs to what you actually did)
+
+- Reduced the per-step browser-agent decision input to about 1.5K tokens (median), 82% below a full accessibility-tree snapshot across 13 live sites, by giving a classifier model an indexed element table instead of the page.
+- Diagnosed workflow-generation failures from token logs (output pinned at the 3,072-token cap), fixed the budget and retry hint, and derived tool-argument docs from the schema so generated graphs pass validation.
+- Audited an agent platform's benchmarking and privacy controls; reproduced and closed a model-routing privacy bypass and measurement-validity gaps with offline regression checks.
+
+Do not put a cost-saving percentage on a resume until the repeat-run benchmark in the previous section has produced one.
