@@ -481,7 +481,16 @@ await test('the broker denies an out-of-lease edit with the lease reason; board-
     sessionId: 'sess',
     taskId: 't1',
   } as NativeToolRequest);
-  assert.equal(read.verdict, 'allow');
+  assert.equal(read.verdict, 'allow', 'reads inside the repo ignore leases');
+  const outside = await bridge.decide({
+    harness: 'claudecode',
+    toolName: 'Read',
+    rawInput: { file_path: join(scratch, '..', 'outside.txt') },
+    sessionId: 'sess',
+    taskId: 't1',
+  } as NativeToolRequest);
+  assert.equal(outside.verdict, 'deny', 'a read outside the worktree still follows step 3');
+  assert.equal(outside.lease, undefined, 'and is not a lease decision');
   assert.equal((await bridge.decide(write('src/b/x.ts'))).verdict, 'allow', 'no taskId: not a board task');
 });
 
