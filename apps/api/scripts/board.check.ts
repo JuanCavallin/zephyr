@@ -868,7 +868,7 @@ await test('a revised approval records a signal and sends a fix task back', asyn
 
 console.log('7. service, routes and inbox');
 
-const { BoardService, BoardError, mockHarnessExecutor, BOARD_KIND, BOARD_TASK_KIND, MERGE_POLICY_RULE } = await import(
+const { BoardService, BoardError, mockHarnessExecutor, defaultTaskScript, BOARD_KIND, BOARD_TASK_KIND, MERGE_POLICY_RULE } = await import(
   '../src/services/tasks.service.js'
 );
 const { createMemoryStore } = await import('../src/store/memory.js');
@@ -1149,6 +1149,76 @@ await test('routes: POST /tasks decomposes only (201), PATCH edits, 404 / 409 / 
     assert.equal((await svc.getBoard(board.run.id)).run.status, 'succeeded');
   } finally {
     server.close();
+  }
+});
+
+console.log('8. end to end (the done condition)');
+
+await test('three tasks at once, an out-of-lease edit denied, two package.json intents land, all green merged', async () => {
+  const deps: Record<string, { name: string; version: string }> = {
+    parser: { name: 'zod', version: '^4.0.0' },
+    printer: { name: 'express', version: '^5.1.0' },
+  };
+  const { svc, events, repo, boardId, view } = await svcBoard('e2e', '- add parser\n- add printer\n- add cli', {
+    executor: mockHarnessExecutor({
+      authorize: allowAuth,
+      // The cli task also tries to write into the parser's scope: the broker must refuse it.
+      script: (task) => [
+        ...defaultTaskScript(task),
+        ...(task.title.includes('cli') ? [{ tool: 'Write' as const, path: 'src/parser/stolen.ts', content: 'export {};\n' }] : []),
+      ],
+      intents: (task) => {
+        const dep = Object.entries(deps).find(([k]) => task.title.includes(k))?.[1];
+        return dep ? [{ path: 'package.json', kind: 'add_dependency' as const, description: 'add ' + dep.name, payload: dep }] : [];
+      },
+    }),
+  });
+  // A package.json on main for the intents to land in. The integration branch is cut at Run.
+  await writeText(join(repo, 'package.json'), JSON.stringify({ name: 'fixture', dependencies: {} }, null, 2) + '\n');
+  await mqGit(repo, 'add', '-A');
+  await mqGit(repo, 'commit', '-q', '-m', 'package.json');
+  assert.equal(view.tasks.length, 3);
+  assert.equal(view.waves.length, 1, 'disjoint scopes: one wave');
+
+  await svc.runReady(boardId, { concurrency: 3, autoMergeGreen: true });
+  await svc.whenIdle(boardId);
+  const v = await svc.getBoard(boardId);
+  assert.equal(v.run.status, 'succeeded', v.run.summary ?? '');
+  assert.ok(v.tasks.every((t) => t.status === 'done'), v.tasks.map((t) => t.title + ': ' + t.status + ' ' + (t.reason ?? '')).join('; '));
+
+  // Three at once: at some point every task was running.
+  const running = new Set<string>();
+  let peak = 0;
+  for (const e of events) {
+    if (e.event.type !== 'task.status') continue;
+    const s = e.event as { taskId: string; to: string };
+    if (s.to === 'running') running.add(s.taskId);
+    else running.delete(s.taskId);
+    peak = Math.max(peak, running.size);
+  }
+  assert.equal(peak, 3, 'three tasks ran concurrently');
+
+  // The out-of-lease edit was denied and never reached any branch.
+  const cli = v.tasks.find((t) => t.title.includes('cli'))!;
+  const denied = events.filter((e) => e.event.type === 'lease.denied').map((e) => e.event as { taskId: string; path: string });
+  assert.ok(denied.some((d) => d.taskId === cli.id && d.path.endsWith('src/parser/stolen.ts')), JSON.stringify(denied));
+  const integration = 'zephyr/' + boardId;
+  const files = (await mqGit(repo, 'ls-tree', '-r', '--name-only', integration)).split(/\r?\n/);
+  assert.ok(!files.includes('src/parser/stolen.ts'), 'denied write not merged');
+
+  // Both package.json intents landed, serially, in one file.
+  const pkg = JSON.parse(await mqGit(repo, 'show', integration + ':package.json'));
+  assert.deepEqual(pkg.dependencies, { express: '^5.1.0', zod: '^4.0.0' });
+  const applied = events.filter((e) => e.event.type === 'intent.updated' && (e.event as { intent: { status: string } }).intent.status === 'applied');
+  assert.equal(applied.length, 2);
+
+  // The merge queue merged every green task.
+  const merges = events.filter((e) => e.event.type === 'merge.result').map((e) => e.event as { taskId: string; outcome: string });
+  assert.deepEqual(merges.map((m) => m.outcome), ['merged', 'merged', 'merged']);
+  assert.equal(new Set(merges.map((m) => m.taskId)).size, 3);
+  for (const t of v.tasks) {
+    const f = t.writeScope[0]!.replace('/**', '/main.ts');
+    assert.ok(files.includes(f), f + ' merged');
   }
 });
 
