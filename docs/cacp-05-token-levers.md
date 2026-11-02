@@ -38,35 +38,39 @@ buildContextPack(task: string, repo: RepoIndex, opts: { maxCandidates: 40; topK:
 ## Tasks
 
 ### L1 shaped tools
-- [ ] Parsers with fixtures: JUnit XML, TAP, and raw fallback (keep lines near
+- [x] Parsers with fixtures: JUnit XML, TAP, and raw fallback (keep lines near
       `FAIL`/`Error`/`expected`). Test: a 10k-line raw log → digest under a token cap that
       still contains every failing test id.
-- [ ] `outputStore`: `zephyr.test_output(handle, testId)` returns the full failure; bad or
+- [x] `outputStore`: `zephyr.test_output(handle, testId)` returns the full failure; bad or
       expired handle → clear error, not empty success.
-- [ ] Executors run in the worktree with the scrubbed env, timeout and output cap; test
+- [x] Executors run in the worktree with the scrubbed env, timeout and output cap; test
       timeout and runaway-output behavior.
-- [ ] Classifier deny reason for raw commands; test that the denial is a logged broker
+- [x] Classifier deny reason for raw commands; test that the denial is a logged broker
       decision and that the shaped tool itself is auto-allowed (`verify`).
 
 ### L2 context pack
-- [ ] Deterministic candidates: identifiers from task text, recent commits on related
+- [x] Deterministic candidates: identifiers from task text, recent commits on related
       paths, imports, covering tests; hard cap 40. Test on a fixture repo.
-- [ ] One Jev `score` question per file in a **single request** (state = task + one-line
+- [x] One Jev `score` question per file in a **single request** (state = task + one-line
       summary per file). Fallback = deterministic rank. Test both paths; every pick emits
       a decision event with `source`.
-- [ ] Prompt assembly: compact map + full text of top 2–3 under a token cap.
-- [ ] Cache context-pack decisions by (task hash, tree hash). Test cache hit skips Jev.
+- [x] Prompt assembly: compact map + full text of top 2–3 under a token cap.
+- [x] Cache context-pack decisions by (task hash, tree hash). Test cache hit skips Jev.
 
 ### L3 schema minimization
-- [ ] Strict MCP config and per-task-class native-tool disable list; the tool set is chosen
+- [x] Strict MCP config and per-task-class native-tool disable list; the tool set is chosen
       **once at session start** and never changed mid-session. Test: tool list identical on
       every gateway request in a run (inspect via the step 4 replay harness).
 
 ### Verification
-- [ ] `pnpm check:levers`: digest/parsers, classifier denial, context pack fallback and Jev
+- [x] `pnpm check:levers`: digest/parsers, classifier denial, context pack fallback and Jev
       path (stubbed), stable-tool-set assertion.
 - [ ] Manual: run one real task with and without the levers; record input tokens for both
       (feeds step 9).
+      **Blocked (2026-11-02):** needs the `claude-agent-acp` binary and an Anthropic key,
+      neither available on the dev machine. Also unverified until then: that the adapter
+      applies the L3 `session/new` `_meta` (`disallowedTools`, `--strict-mcp-config`); the
+      `settings.json` deny rules carry the same list as a second path.
 
 ## Done when
 
