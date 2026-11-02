@@ -35,6 +35,8 @@ export interface EvidenceResult {
   markdown: string;
   /** Where evidence.json was written, when it was. */
   path?: string;
+  /** Where evidence.md (the PR body) was written, when it was. */
+  markdownPath?: string;
 }
 
 export interface EvidenceService {
@@ -90,8 +92,9 @@ export function createEvidenceService(deps: EvidenceServiceDeps): EvidenceServic
       await mkdir(dir, { recursive: true });
       const path = join(dir, 'evidence.json');
       await writeFile(path, JSON.stringify(bundle, null, 2) + '\n');
-      await writeFile(join(dir, 'evidence.md'), markdown);
-      return { bundle, markdown, path };
+      const markdownPath = join(dir, 'evidence.md');
+      await writeFile(markdownPath, markdown);
+      return { bundle, markdown, path, markdownPath };
     },
   };
 }

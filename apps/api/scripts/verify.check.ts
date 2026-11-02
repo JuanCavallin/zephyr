@@ -10,6 +10,9 @@
  *   2. selectTests: Jev and fallback sources; unavailable Jev never shrinks the set.
  *   3. Completion verdict and flaky-vs-real.
  *   4. Protected paths and the permission-bridge rule.
+ *   5. Evidence bundle assembly and markdown rendering.
+ *   6. Publish: full suite gate, one git.publish approval, PR body = evidence.md; an
+ *      end-to-end mock-harness run over a real git worktree and a local bare remote.
  */
 
 process.env.PERSIST_TO_DISK = 'false';
@@ -801,6 +804,316 @@ await test('render: stays under the host limit by truncating sections, never the
   const tiny = renderEvidence(b, { limit: 10 });
   assert.ok(tiny.startsWith(header), 'a limit below the header still emits the header whole');
 });
+
+// ---------------------------------------------------------------------------
+// 6. Publish: full suite gate, one approval through the bridge, body = evidence.md
+// ---------------------------------------------------------------------------
+console.log('publish');
+
+const { publishRun, publishCommands, displayCommand } = await import('../src/core/verify/publish.js');
+const { ApprovalRejectedError } = await import('../src/core/approvalGate.js');
+type PublishDeps = import('../src/core/verify/publish.js').PublishDeps;
+type PublishInput = import('../src/core/verify/publish.js').PublishInput;
+type CodingEvent = import('@htn/shared').CodingEvent;
+
+const PUB_RUN = 'run_publish';
+const HASH = 'd'.repeat(64);
+const pubInput = (over: Partial<PublishInput> = {}): PublishInput => ({
+  runId: PUB_RUN,
+  worktree: scratch,
+  branch: 'zephyr/' + PUB_RUN,
+  base: 'main',
+  title: 'Add the calculator',
+  ...over,
+});
+
+function publishHarness(opts: {
+  reject?: boolean;
+  suite?: { passed: number; failed: number; skipped?: number; failedTests?: string[]; exitCode?: number | null };
+  failExec?: string;
+  dirty?: boolean;
+  /** Change the worktree hash once the approval is granted. */
+  driftAfterApproval?: boolean;
+} = {}) {
+  let hash = HASH;
+  const asked: ToolAction[] = [];
+  const calls: [string, string[]][] = [];
+  const events: CodingEvent[] = [];
+  const lifecycle: string[] = [];
+  const suiteCalls: number[] = [];
+  const binding = async () => ({ branch: 'zephyr/' + PUB_RUN, diffHash: hash });
+  const bridge = createPermissionBridge({
+    harness: 'claudecode',
+    worktree: scratch,
+    run: { runId: PUB_RUN, stepId: 'step_pub' },
+    publishBinding: binding,
+    approvals: {
+      async request({ action }) {
+        asked.push(action);
+        if (opts.reject) throw new ApprovalRejectedError('apr_pub', 'not yet');
+        if (opts.driftAfterApproval) hash = 'e'.repeat(64);
+        return { approvalId: 'apr_pub' };
+      },
+    },
+    onLifecycle: async (l) => {
+      lifecycle.push(l.phase);
+    },
+  });
+  const deps: PublishDeps = {
+    bridge,
+    sessionId: 'ses_pub',
+    binding,
+    evidence: async () => ({ bundleId: 'evb_1', diffHash: HASH, bodyPath: join(scratch, 'evidence.md') }),
+    exec: async (file, args) => {
+      calls.push([file, args]);
+      if (opts.failExec && args[0] === opts.failExec) return { code: 1, stdout: '', stderr: 'rejected: non-fast-forward' };
+      return file === 'gh'
+        ? { code: 0, stdout: 'Creating pull request\nhttps://github.com/acme/app/pull/7\n', stderr: '' }
+        : { code: 0, stdout: '', stderr: '' };
+    },
+    emit: async (e) => {
+      events.push(e);
+    },
+    ...(opts.dirty !== undefined ? { dirty: async () => opts.dirty! } : {}),
+    ...(opts.suite
+      ? {
+          runFullSuite: async () => {
+            suiteCalls.push(1);
+            const s = opts.suite!;
+            return {
+              tally: { passed: s.passed, failed: s.failed, skipped: s.skipped ?? 0 },
+              ...(s.failedTests ? { failedTests: s.failedTests } : {}),
+              ...(s.exitCode !== undefined ? { exitCode: s.exitCode } : {}),
+            };
+          },
+        }
+      : {}),
+  };
+  return { deps, asked, calls, events, lifecycle, suiteCalls };
+}
+
+const fullSuite = { fullSuiteBeforePublish: true };
+
+await test('publish: a failing full suite blocks before approval and before any git call', async () => {
+  const h = publishHarness({ suite: { passed: 40, failed: 2, failedTests: ['src/a.test.ts', 'src/b.test.ts'], exitCode: 1 } });
+  const r = await publishRun(pubInput({ policy: fullSuite }), h.deps);
+  assert.equal(r.status, 'blocked');
+  assert.equal(r.status === 'blocked' && r.stage, 'full-suite');
+  assert.match(r.status === 'blocked' ? r.reason : '', /2 tests failing: src\/a\.test\.ts, src\/b\.test\.ts/);
+  assert.deepEqual(r.fullSuite, { passed: 40, failed: 2, skipped: 0 });
+  assert.equal(h.asked.length, 0, 'no approval is requested');
+  assert.equal(h.calls.length, 0, 'nothing is pushed');
+  const ev = h.events.find((e) => e.type === 'verify.tests');
+  assert.ok(ev && ev.type === 'verify.tests');
+  assert.equal(ev.phase, 'full');
+  assert.equal(ev.source, 'full');
+  assert.deepEqual(ev.failedTests, ['src/a.test.ts', 'src/b.test.ts']);
+});
+
+await test('publish: a runner that exits non-zero with no counted failure still blocks', async () => {
+  const h = publishHarness({ suite: { passed: 0, failed: 0, exitCode: 2 } });
+  const r = await publishRun(pubInput({ policy: fullSuite }), h.deps);
+  assert.equal(r.status === 'blocked' && r.stage, 'full-suite');
+  assert.match(r.status === 'blocked' ? r.reason : '', /exited 2/);
+  assert.equal(h.calls.length, 0);
+});
+
+await test('publish: the policy needs the full suite but no runner is bound → blocked', async () => {
+  const h = publishHarness();
+  const r = await publishRun(pubInput({ policy: fullSuite }), h.deps);
+  assert.equal(r.status === 'blocked' && r.stage, 'full-suite');
+  assert.equal(h.asked.length + h.calls.length, 0);
+});
+
+await test('publish: green full suite → one git.publish approval bound to the diff, push, PR with --body-file', async () => {
+  const h = publishHarness({ suite: { passed: 42, failed: 0, exitCode: 0 } });
+  const r = await publishRun(pubInput({ policy: fullSuite }), h.deps);
+  assert.equal(r.status, 'published', JSON.stringify(r));
+  assert.ok(r.status === 'published');
+  assert.equal(r.prUrl, 'https://github.com/acme/app/pull/7');
+  assert.equal(r.approvalId, 'apr_pub');
+  assert.equal(r.diffHash, HASH);
+  assert.deepEqual(r.fullSuite, { passed: 42, failed: 0, skipped: 0 });
+
+  assert.equal(h.asked.length, 1, 'exactly one approval');
+  const action = h.asked[0]!;
+  assert.equal(action.toolId, 'git.publish');
+  assert.equal(action.operation, 'pr.create');
+  assert.deepEqual(action.review, { operation: 'pr.create', branch: 'zephyr/' + PUB_RUN, diffHash: HASH });
+  const approvedText = String((action.arguments as { command?: string }).command);
+  assert.ok(approvedText.includes('git push -u origin zephyr/run_publish && gh pr create'), approvedText);
+  assert.ok(approvedText.includes("--title 'Add the calculator'"), 'the title is quoted in the approved text');
+
+  const bodyPath = join(scratch, 'evidence.md');
+  assert.deepEqual(h.calls, publishCommands(pubInput(), bodyPath));
+  assert.deepEqual(h.calls.map(([f, a]) => f + ' ' + a[0]), ['git push', 'gh pr']);
+  const gh = h.calls[1]![1];
+  assert.equal(gh[gh.indexOf('--body-file') + 1], bodyPath, 'the PR body is evidence.md');
+  assert.ok(h.lifecycle.includes('awaiting_approval') && h.lifecycle.includes('approved') && h.lifecycle.includes('succeeded'));
+});
+
+await test('publish: policy off never runs the suite', async () => {
+  const h = publishHarness({ suite: { passed: 0, failed: 5 } });
+  const r = await publishRun(pubInput({ policy: { fullSuiteBeforePublish: false } }), h.deps);
+  assert.equal(r.status, 'published');
+  assert.equal(h.suiteCalls.length, 0);
+  assert.equal(h.events.length, 0);
+});
+
+await test('publish: a dirty worktree is committed first, inside the same approval', async () => {
+  const h = publishHarness({ dirty: true });
+  const r = await publishRun(pubInput(), h.deps);
+  assert.equal(r.status, 'published');
+  assert.deepEqual(h.calls.map(([f, a]) => f + ' ' + a[0]), ['git add', 'git commit', 'git push', 'gh pr']);
+  assert.equal(h.asked.length, 1);
+  const text = String((h.asked[0]!.arguments as { command?: string }).command);
+  assert.ok(text.startsWith("git add -A -- . && git commit -m 'Add the calculator' && git push"), text);
+});
+
+await test('publish: a reviewer rejection blocks with no git call', async () => {
+  const h = publishHarness({ reject: true });
+  const r = await publishRun(pubInput(), h.deps);
+  assert.equal(r.status === 'blocked' && r.stage, 'approval');
+  assert.equal(r.status === 'blocked' && r.reason, 'rejected by reviewer');
+  assert.equal(h.calls.length, 0);
+  assert.ok(h.lifecycle.includes('blocked'));
+});
+
+await test('publish: a diff that moves after approval is not published', async () => {
+  const h = publishHarness({ driftAfterApproval: true });
+  const r = await publishRun(pubInput(), h.deps);
+  assert.equal(r.status === 'blocked' && r.stage, 'diff-changed');
+  assert.equal(h.calls.length, 0);
+});
+
+await test('publish: a failed push stops before the PR and reports the failure', async () => {
+  const h = publishHarness({ failExec: 'push' });
+  const r = await publishRun(pubInput(), h.deps);
+  assert.equal(r.status === 'blocked' && r.stage, 'push');
+  assert.match(r.status === 'blocked' ? r.reason : '', /non-fast-forward/);
+  assert.deepEqual(h.calls.map(([f]) => f), ['git']);
+  assert.ok(h.lifecycle.includes('failed'));
+});
+
+await test('publish: displayCommand quotes for a POSIX shell', () => {
+  assert.equal(displayCommand('git', ['push', '-u', 'origin', 'zephyr/r1']), 'git push -u origin zephyr/r1');
+  assert.equal(displayCommand('gh', ['pr', 'create', '--title', "it's done"]), "gh pr create --title 'it'\\''s done'");
+  assert.equal(displayCommand('gh', ['--body-file', 'C:\\tmp\\e.md']), "gh --body-file 'C:\\tmp\\e.md'");
+});
+
+// --- End to end: a mock-harness run edits code; evidence.json + evidence.md; the PR
+// body is evidence.md. Real git (worktree, push to a local bare remote); `gh` stubbed.
+await test('e2e: mock harness edits a worktree → evidence.json + evidence.md → push + PR body', async () => {
+  const { execArgv } = await import('../src/services/publish.service.js');
+  const { createLiveGitWorkspaces } = await import('../src/providers/git/live.js');
+  const { createMockHarness } = await import('../src/providers/mockharness/index.js');
+  const { readFile } = await import('node:fs/promises');
+  const e2e = join(scratch, 'e2e');
+  const origin = join(e2e, 'origin.git');
+  const repoRoot = join(e2e, 'repo');
+  await mkdir(repoRoot, { recursive: true });
+  const git = async (cwd: string, ...args: string[]) => {
+    const r = await execArgv('git', args, { cwd });
+    assert.equal(r.code, 0, `git ${args.join(' ')}: ${r.stderr}`);
+    return r.stdout;
+  };
+  await git(e2e, 'init', '--bare', '-q', origin);
+  await git(repoRoot, 'init', '-q', '-b', 'main');
+  await git(repoRoot, 'config', 'user.name', 'Zephyr Check');
+  await git(repoRoot, 'config', 'user.email', 'check@zephyr.invalid');
+  await git(repoRoot, 'config', 'commit.gpgsign', 'false');
+  await writeTree(repoRoot, { 'README.md': '# fixture\n', 'src/index.ts': 'export {};\n' });
+  await git(repoRoot, 'add', '-A');
+  await git(repoRoot, 'commit', '-q', '-m', 'init');
+  await git(repoRoot, 'remote', 'add', 'origin', origin);
+
+  const runId = 'run_e2e_publish';
+  const workspaces = createLiveGitWorkspaces({ repoRoot, workspacesDir: join(e2e, 'workspaces') });
+  const { path: worktree, branch } = await workspaces.create(runId, 'main');
+
+  // The harness run: every tool call goes through the bridge; reads/writes are auto.
+  const harnessBridge = createPermissionBridge({ harness: 'claudecode', worktree, authorize: allowAuth, run: { runId, stepId: 'step_e2e' } });
+  const harness = createMockHarness({ decide: (req) => harnessBridge.handler({ ...req, harness: 'claudecode' }) });
+  const hctx = { runId, policyRule: 'check' } as Parameters<typeof harness.pollTask>[1];
+  const started = await harness.startTask({ goal: 'add the calculator', context: { workspaceDir: worktree, taskId: 'task_e2e' } }, hctx);
+  assert.ok(started.ok);
+  const taskId = (started.data as { taskId: string }).taskId;
+  let status = 'running';
+  for (let i = 0; i < 10 && status === 'running'; i++) {
+    const p = await harness.pollTask(taskId, hctx);
+    assert.ok(p.ok);
+    status = (p.data as { status: string }).status;
+  }
+  assert.equal(status, 'done');
+  assert.equal(await readFile(join(worktree, 'src/add-the-calculator.ts'), 'utf8'), '// add the calculator\nexport const done = true;\n');
+
+  // Evidence from the run's events and the live worktree diff.
+  const store = createMemoryStore({ persistToDisk: false });
+  await store.createRun({ id: runId, status: 'succeeded', createdAt: at(0), updatedAt: at(20) } as unknown as Run);
+  await store.appendEvent(runId, {
+    type: 'verify.tests', runId, phase: 'after', selected: [{ id: 'src/index.test.ts', score: 0.81, fallback: false }],
+    source: 'jev', tally: { passed: 3, failed: 0, skipped: 0 }, at: at(18),
+  } as RunEvent);
+  const evidenceDir = join(e2e, 'evidence');
+  const service = createEvidenceService({ store, workspaces: async () => workspaces, evidenceDir });
+  const liveDiff = await workspaces.diff(runId);
+
+  // Publish with real git; `gh` is stubbed and reads the body file it is handed.
+  let prBody: string | undefined;
+  const binding = async () => ({ branch, diffHash: (await workspaces.diff(runId)).hash });
+  const asked: ToolAction[] = [];
+  const bridge = createPermissionBridge({
+    harness: 'claudecode',
+    worktree,
+    run: { runId, stepId: 'step_publish' },
+    publishBinding: binding,
+    approvals: { async request({ action }) { asked.push(action); return { approvalId: 'apr_e2e' }; } },
+  });
+  const r = await publishRun(
+    { runId, worktree, branch, base: 'main', title: 'Add the calculator', policy: { fullSuiteBeforePublish: false } },
+    {
+      bridge,
+      sessionId: 'ses_e2e',
+      binding,
+      evidence: async () => {
+        const out = await service.produce(runId);
+        return { bundleId: out.bundle.id, diffHash: out.bundle.diff.hash, bodyPath: out.markdownPath! };
+      },
+      dirty: async () => (await git(worktree, 'status', '--porcelain', '--untracked-files=all')).trim().length > 0,
+      exec: async (file, args, o) => {
+        if (file !== 'gh') return execArgv(file, args, o);
+        prBody = await readFile(args[args.indexOf('--body-file') + 1]!, 'utf8');
+        return { code: 0, stdout: 'https://github.com/acme/fixture/pull/1\n', stderr: '' };
+      },
+      emit: async () => {},
+    },
+  );
+  assert.equal(r.status, 'published', JSON.stringify(r));
+  assert.ok(r.status === 'published');
+  assert.equal(r.diffHash, liveDiff.hash);
+  assert.equal(asked.length, 1);
+  assert.equal((asked[0]!.review as { diffHash: string }).diffHash, liveDiff.hash, 'the approval binds the live diff hash');
+
+  const json = JSON.parse(await readFile(join(evidenceDir, runId, 'evidence.json'), 'utf8'));
+  assert.ok(evidenceBundleSchema.safeParse(json).success, 'evidence.json validates');
+  assert.equal(json.diff.hash, liveDiff.hash);
+  assert.equal(json.diff.files, 1);
+  const md = await readFile(join(evidenceDir, runId, 'evidence.md'), 'utf8');
+  assert.ok(md.startsWith('## Zephyr evidence\n'));
+  assert.ok(md.includes('| `src/index.test.ts` | 0.81 | Jev |'));
+  assert.equal(prBody, md, 'the PR body is the rendered bundle');
+
+  // The pushed branch holds exactly the approved tree.
+  const pushedTree = (await git(origin, 'rev-parse', `refs/heads/${branch}^{tree}`)).trim();
+  const baseTree = (await git(origin, 'rev-parse', 'refs/heads/main^{tree}').catch(() => '')).trim();
+  const committed = await git(repoRoot, 'diff', '--binary', '--full-index', 'main', pushedTree);
+  assert.notEqual(pushedTree, baseTree);
+  assert.equal(committed, liveDiff.patch, 'pushed diff == approved diff');
+
+  await workspaces.dispose(runId, false).catch(() => undefined);
+});
+
+await rm(scratch, { recursive: true, force: true }).catch(() => undefined);
 
 console.log(`\nverify: ${passed} passed`);
 process.exit(0);
