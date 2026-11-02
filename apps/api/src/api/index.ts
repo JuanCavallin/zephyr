@@ -20,6 +20,7 @@ import { mcpConnectionsRouter } from './mcpConnections.routes.js';
 import { actionEvidenceRouter } from './actionEvidence.routes.js';
 import { credentialsRouter } from './credentials.routes.js';
 import { browserRouter } from './browser.routes.js';
+import { tasksRouter } from './tasks.routes.js';
 import { requireLocalControl } from '../services/localControl.js';
 
 export function mountRoutes(app: Express): void {
@@ -45,6 +46,8 @@ export function mountRoutes(app: Express): void {
   // Graph vs baseline across stored runs; the Benchmarks page reads this.
   api.use(benchmarksRouter);
   api.use(approvalsRouter);
+  // Coding-agent task board (dev-only seeded demo for now).
+  api.use(tasksRouter);
   // The chat that AUTHORS a graph. This is the workspace composer's endpoint --
   // without it the app's front door returns 404 and nothing can be created.
   api.use(conversationsRouter);

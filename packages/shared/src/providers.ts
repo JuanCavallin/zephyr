@@ -7,6 +7,7 @@
  */
 
 import type { BrowserOperation, BrowserPerformResult, ElementTable } from './browser.js';
+import type { NativeToolRequest, PermissionVerdict } from './coding.js';
 
 export type ProviderId =
   | 'hermes' // agent runtime (Nous Research)
@@ -162,6 +163,15 @@ export interface AgentRuntimeAdapter extends ProviderAdapter {
     ctx: ProviderCallContext,
   ): Promise<ProviderResult<null>>;
   cancelTask(taskId: string, ctx: ProviderCallContext): Promise<ProviderResult<null>>;
+  /**
+   * Native tool the harness wants to run. Must resolve to a broker decision.
+   * Optional: adapters without native tools (today's Hermes) omit it, and unmapped
+   * requests still fail closed.
+   */
+  onPermissionRequest?(
+    req: NativeToolRequest,
+    ctx: ProviderCallContext,
+  ): Promise<PermissionVerdict>;
 }
 
 export interface DecisionAdapter extends ProviderAdapter {

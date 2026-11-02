@@ -36,17 +36,18 @@ waits on anyone.
 
 ## Tasks
 
-- [ ] Write `packages/shared/src/coding.ts` with the schemas above; export types via `z.infer`.
-- [ ] Test (`packages/shared`, existing test runner): each schema round-trips a valid
+- [x] Write `packages/shared/src/coding.ts` with the schemas above; export types via `z.infer`.
+- [x] Test (`packages/shared` has no runner, so this lives in
+      `apps/api/scripts/contracts.check.ts` like the other checks): each schema round-trips a valid
       fixture and rejects an invalid one (e.g. `Task` with unknown status, `Lease` with an
       empty glob list, `EvidenceBundle` missing the diff hash).
-- [ ] Add event types to the discriminated union in `events.ts`; test that an unknown
+- [x] Add event types to the discriminated union in `events.ts`; test that an unknown
       `type` is still rejected and the existing event fixtures still parse.
-- [ ] Add the three seam interfaces and mocks; one test per mock showing deterministic output
+- [x] Add the three seam interfaces and mocks; one test per mock showing deterministic output
       for identical input.
-- [ ] Add `api/tasks.routes.ts` with the `_demo` endpoint behind the dev flag; register in
+- [x] Add `api/tasks.routes.ts` with the `_demo` endpoint behind the dev flag; register in
       `api/index.ts`.
-- [ ] `pnpm check:contracts` runs the schema and mock tests; wire into the aggregate check.
+- [x] `pnpm check:contracts` runs the schema and mock tests; wire into the aggregate check.
 
 ## Done when
 

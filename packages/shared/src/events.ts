@@ -5,7 +5,9 @@
  * anything it doesn't recognise, so an older tab never breaks on a newer server.
  */
 
+import { z } from 'zod';
 import type { BrowserSessionRecord } from './browser.js';
+import { CODING_EVENT_TYPES, codingEventSchema, type CodingEvent } from './coding.js';
 import type { Approval, EgressEvent, Iso, PiiSpan, Run, Step } from './domain.js';
 import type {
   AgentSessionState,
@@ -41,9 +43,57 @@ export type RunEvent =
   | { type: 'harness.turn'; turn: HarnessTurnEvent }
   | { type: 'tool.lifecycle'; lifecycle: ToolLifecycleEvent }
   | { type: 'session.updated'; session: AgentSessionState }
-  | { type: 'log'; runId: string; level: 'info' | 'warn' | 'error'; message: string; at: Iso };
+  | { type: 'log'; runId: string; level: 'info' | 'warn' | 'error'; message: string; at: Iso }
+  /** Coding-agent control plane: task.*, lease.*, learning.*, harness.turn.ended. See coding.ts. */
+  | CodingEvent;
 
 export type RunEventType = RunEvent['type'];
+
+/**
+ * Event types that predate the zod contracts. Their shapes are TypeScript-only, so
+ * `runEventSchema` checks only that the type is known; the coding events are
+ * validated field by field.
+ */
+export const LEGACY_RUN_EVENT_TYPES = [
+  'run.updated',
+  'step.upserted',
+  'approval.requested',
+  'approval.resolved',
+  'egress.logged',
+  'pii.detected',
+  'schedule.decided',
+  'browser.session.opened',
+  'browser.session.closed',
+  'control.decided',
+  'model.lifecycle',
+  'harness.turn',
+  'tool.lifecycle',
+  'session.updated',
+  'log',
+] as const;
+
+/** Every RunEvent type. Compile-time checked against the union in both directions. */
+export const RUN_EVENT_TYPES = [...LEGACY_RUN_EVENT_TYPES, ...CODING_EVENT_TYPES] as RunEventType[];
+type LegacyRunEventType = (typeof LEGACY_RUN_EVENT_TYPES)[number];
+const _legacyCoversUnion: Exclude<RunEventType, LegacyRunEventType | CodingEvent['type']> extends never
+  ? true
+  : never = true;
+const _legacyIsKnown: Exclude<LegacyRunEventType, RunEventType> extends never ? true : never = true;
+void _legacyCoversUnion;
+void _legacyIsKnown;
+
+/**
+ * Runtime check for anything claiming to be a RunEvent (SSE consumers, replay, tests).
+ * Unknown `type` values are rejected; coding events must match their schema exactly.
+ */
+export const runEventSchema = z.union([
+  codingEventSchema,
+  z.looseObject({ type: z.enum(LEGACY_RUN_EVENT_TYPES) }),
+]);
+
+export function parseRunEvent(value: unknown): RunEvent {
+  return runEventSchema.parse(value) as RunEvent;
+}
 
 /** An event as persisted. `seq` is monotonic per run and powers SSE replay. */
 export interface StoredEvent {

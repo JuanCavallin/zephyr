@@ -7,6 +7,7 @@
     "dev": "tsx watch --env-file-if-exists=../../.env src/index.ts",
     "start": "tsx --env-file-if-exists=../../.env src/index.ts",
     "typecheck": "tsc --noEmit",
+    "check:contracts": "tsx scripts/contracts.check.ts",
     "check:graph": "tsx scripts/graph-schema.check.ts && tsx scripts/graph-synthesis.check.ts && tsx scripts/graph-context.check.ts && tsx scripts/graph-scopes.check.ts",
     "check:graph-scopes": "tsx scripts/graph-scopes.check.ts",
     "check:graph-synthesis": "tsx scripts/graph-synthesis.check.ts",
