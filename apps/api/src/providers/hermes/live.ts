@@ -129,6 +129,50 @@ export function hermesLaunchContext(cfg: ProviderConfig, profileDir: string): Ac
   };
 }
 
+/**
+ * The profile's config.yaml: the model behind the AgentOS gateway and the
+ * AgentOS MCP server. Secrets stay in the child env (`key_env`), never here.
+ */
+export function hermesProfileConfig(baseUrl: string, mcpUrl: string): string {
+  return [
+    'model:',
+    '  default: agentos-router',
+    '  provider: custom:agentos',
+    '  base_url: ' + JSON.stringify(baseUrl),
+    '  key_env: AGENTOS_GATEWAY_API_KEY',
+    '  context_length: 131072',
+    // Named custom providers honor key_env in the installed Hermes resolver.
+    // The secret stays in the child environment, never in the profile file.
+    'custom_providers:',
+    '  - name: agentos',
+    '    base_url: ' + JSON.stringify(baseUrl),
+    '    key_env: AGENTOS_GATEWAY_API_KEY',
+    '    api_mode: chat_completions',
+    'agent:',
+    '  max_turns: 20',
+    // AgentOS already narrows the catalog before starting Hermes and its
+    // model gateway independently filters every schema against the current
+    // Jev-selected capability set. Keep those MCP schemas eager here so
+    // Hermes cannot hide the selected tool behind its own tool-search
+    // bridge before the request reaches AgentOS.
+    'tools:',
+    '  tool_search:',
+    '    enabled: off',
+    'mcp_servers:',
+    '  agentos:',
+    '    enabled: true',
+    '    url: ' + JSON.stringify(mcpUrl),
+    '    headers:',
+    '      Authorization: "Bearer ${AGENTOS_MCP_API_KEY}"',
+    '    trust: full',
+    '    timeout: 900',
+    '    tools:',
+    '      resources: false',
+    '      prompts: false',
+    '',
+  ].join('\n');
+}
+
 function meta(op: string, started: number, destination: string | null) {
   return {
     provider: 'hermes' as const,
@@ -259,43 +303,7 @@ function createHermesProcess(cfg: ProviderConfig): AgentRuntimeAdapter {
     // still wins, for anyone who wants one shared profile on purpose.
     const profileDir = profileDirFor(cfg);
     await mkdir(profileDir, { recursive: true });
-    const configYaml = [
-      'model:',
-      '  default: agentos-router',
-      '  provider: custom:agentos',
-      '  base_url: ' + JSON.stringify(cfg.baseUrl),
-      '  key_env: AGENTOS_GATEWAY_API_KEY',
-      '  context_length: 131072',
-      // Named custom providers honor key_env in the installed Hermes resolver.
-      // The secret stays in the child environment, never in the profile file.
-      'custom_providers:',
-      '  - name: agentos',
-      '    base_url: ' + JSON.stringify(cfg.baseUrl),
-      '    key_env: AGENTOS_GATEWAY_API_KEY',
-      '    api_mode: chat_completions',
-      'agent:',
-      '  max_turns: 20',
-      // AgentOS already narrows the catalog before starting Hermes and its
-      // model gateway independently filters every schema against the current
-      // Jev-selected capability set. Keep those MCP schemas eager here so
-      // Hermes cannot hide the selected tool behind its own tool-search
-      // bridge before the request reaches AgentOS.
-      'tools:',
-      '  tool_search:',
-      '    enabled: off',
-      'mcp_servers:',
-      '  agentos:',
-      '    enabled: true',
-      '    url: ' + JSON.stringify(cfg.mcpUrl),
-      '    headers:',
-      '      Authorization: "Bearer ${AGENTOS_MCP_API_KEY}"',
-      '    trust: full',
-      '    timeout: 900',
-      '    tools:',
-      '      resources: false',
-      '      prompts: false',
-      '',
-    ].join('\n');
+    const configYaml = hermesProfileConfig(cfg.baseUrl, cfg.mcpUrl);
     await writeFile(resolve(profileDir, 'config.yaml'), configYaml, 'utf8');
     return profileDir;
   }

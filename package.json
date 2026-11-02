@@ -19,6 +19,8 @@
     "smoke:live": "node scripts/live-check.mjs",
     "check:contracts": "pnpm --filter @htn/api check:contracts",
     "check:acp": "pnpm --filter @htn/api check:acp",
+    "check:hermes-live": "pnpm --filter @htn/api check:hermes-live",
+    "check:wsl": "wsl.exe -d Ubuntu -- bash scripts/wsl-check.sh",
     "check:graph": "pnpm --filter @htn/api check:graph",
     "check:graph-critique": "pnpm --filter @htn/api check:graph-critique",
     "check:graphs": "pnpm --filter @htn/api check:graphs",

@@ -55,6 +55,16 @@ interface WorkspaceProvider {
 - [x] Cleanup on terminal status unless the branch is kept; test that a crashed run's
       worktree is reaped on next startup.
 - [x] `pnpm check:acp` = mock peer suite + git provider suite.
+- [x] `pnpm check:hermes-live` (opt-in, not in `check:all`) drives the **real** Hermes
+      checkout next to this repo (`../hermes-agent`, or `HERMES_CWD`) through both the
+      adapter and the ACP client. A scripted local OpenAI-compatible model and a fake MCP
+      server stand in for the gateways, so it needs no API key and spends nothing. Covers
+      the scoped model/MCP tokens, `continueTask`, denied and allowed `write_file`
+      permissions, an MCP tool call, `session/cancel`, and the process-tree kill.
+- [x] `pnpm check:wsl` runs `check:acp` and `check:hermes-live` on Linux in WSL Ubuntu
+      (`scripts/wsl-check.sh`). It mirrors both checkouts to the Linux filesystem and uses a
+      user-local pinned Node/pnpm/uv, so Windows `node_modules`/`.venv` are never touched.
+      Pass other root scripts to run those instead: `bash scripts/wsl-check.sh check:all`.
 
 ## Windows notes
 
@@ -65,4 +75,5 @@ that a child process spawned by the mock peer is gone after cancel.
 ## Done when
 
 Hermes behaves identically on the new client; a mock-peer run creates a worktree, writes a
-file, checkpoints each turn, rewinds, and disposes cleanly on both macOS/Linux and Windows.
+file, checkpoints each turn, rewinds, and disposes cleanly on both macOS/Linux and Windows. Windows: `pnpm check:acp` and
+`pnpm check:hermes-live`. Linux: `pnpm check:wsl`.
