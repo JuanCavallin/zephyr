@@ -28,14 +28,19 @@ import type {
   ToolDescriptor,
   ToolLifecycleEvent,
   ToolLifecyclePhase,
+  VerifyPolicy,
 } from '@htn/shared';
+import { DEFAULT_VERIFY_POLICY } from '@htn/shared';
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 import { newId, nowIso } from '../../lib/ids.js';
 import { actionFingerprint } from '../../services/actionEvidence.js';
 import { ApprovalRejectedError } from '../approvalGate.js';
 import { baselineAuthorization } from '../decisions/service.js';
 import { strictestActionPolicy } from '../decisions/eligibility.js';
 import type { ToolApprovalGate } from './approval.js';
-import { mapNativeTool, UnmappedToolError, type ExactAction } from './nativeDescriptors.js';
+import { mapNativeTool, nativeDescriptor, UnmappedToolError, type ExactAction } from './nativeDescriptors.js';
+import { isTestPath, protectionOf } from '../verify/protectedPaths.js';
 import { hostPlatform, type ShellPlatform } from './pathContainment.js';
 import type { ShapedCommandKind } from './shellClassifier.js';
 
@@ -79,6 +84,15 @@ export interface PermissionBridgeOptions {
   onLifecycle?: (event: ToolLifecycleEvent) => void | Promise<void>;
   log?: (message: string) => void;
   now?: () => number;
+  /** Step 6 protected paths. Defaults to DEFAULT_VERIFY_POLICY (defaults guarded). */
+  verifyPolicy?: Pick<VerifyPolicy, 'protectDefaults' | 'protectedGlobs'>;
+  /**
+   * Files this run created. The bridge adds new test files it allows; tests and
+   * snapshots in the set stay editable without approval.
+   */
+  runCreated?: Set<string>;
+  /** Current content of a worktree file, or null when it does not exist. */
+  readWorktreeFile?: (relative: string) => string | null;
 }
 
 export interface PermissionBridge {
@@ -114,6 +128,25 @@ export function createPermissionBridge(opts: PermissionBridgeOptions): Permissio
   const clock = opts.now ?? Date.now;
   const grants = new Map<string, { approvalId: string; expiresAt: number }>();
   const log = opts.log ?? (() => {});
+  const verifyPolicy = opts.verifyPolicy ?? DEFAULT_VERIFY_POLICY;
+  const runCreated = opts.runCreated ?? new Set<string>();
+  const readFile =
+    opts.readWorktreeFile ??
+    ((relative: string): string | null => {
+      try {
+        return readFileSync(resolve(opts.worktree, relative), 'utf8');
+      } catch {
+        return null;
+      }
+    });
+
+  /** Record a newly created test file once it is allowed, so later edits stay free. */
+  function noteCreated(decision: BridgeDecision): void {
+    const path = (decision.action?.arguments as Record<string, Json> | undefined)?.path;
+    if (decision.verdict === 'allow' && decision.exact?.reasonCodes.includes('new-test-file') && typeof path === 'string') {
+      runCreated.add(path.replace(/\\/g, '/'));
+    }
+  }
 
   async function emit(
     phase: ToolLifecyclePhase,
@@ -179,6 +212,38 @@ export function createPermissionBridge(opts: PermissionBridgeOptions): Permissio
       exact = { ...exact, arguments: args };
     }
 
+    // Step 6: protected paths. An edit to one is irreversible and needs an approval
+    // that carries the exact diff; a new test file is allowed and flagged.
+    let protectedReview: Json | undefined;
+    if (exact.toolId === 'fs.write' && exact.defaultPolicy !== 'deny' && typeof args.path === 'string') {
+      const relative = args.path.replace(/\\/g, '/');
+      const current = readFile(relative);
+      // A file that does not exist yet is the run's own: only always-guarded paths
+      // (lockfiles, CI, lint, policy globs) are protected for it.
+      const created = current === null ? new Set([...runCreated, relative]) : runCreated;
+      const protection = protectionOf(relative, verifyPolicy, created);
+      if (protection) {
+        exact = {
+          ...exact,
+          descriptor: nativeDescriptor('fs.write', {
+            effect: 'write',
+            reversibility: 'irreversible',
+            requiresChangeReview: true,
+          }),
+          defaultPolicy: 'ask_user',
+          reasonCodes: [...exact.reasonCodes, 'protected-path', 'protected-' + protection],
+        };
+        protectedReview = {
+          protectedPath: relative,
+          protection,
+          ...(typeof args.contentSha256 === 'string' ? { contentSha256: args.contentSha256 } : {}),
+          diff: protectedWriteDiff(relative, req.rawInput, current),
+        };
+      } else if (current === null && isTestPath(relative)) {
+        exact = { ...exact, reasonCodes: [...exact.reasonCodes, 'new-test-file'] };
+      }
+    }
+
     const action: ToolAction = {
       id: newId('act'),
       runId: opts.run?.runId ?? 'unbound',
@@ -193,6 +258,7 @@ export function createPermissionBridge(opts: PermissionBridgeOptions): Permissio
       ...(exact.toolId === 'git.publish'
         ? { review: { operation: exact.operation, branch: args.branch!, diffHash: args.diffHash! } }
         : {}),
+      ...(protectedReview !== undefined ? { review: protectedReview } : {}),
     };
     action.previewFingerprint = actionFingerprint(action);
     return { exact, action };
@@ -263,7 +329,10 @@ export function createPermissionBridge(opts: PermissionBridgeOptions): Permissio
       });
       return decision;
     }
-    if (decision.policy !== 'ask_user') return decision;
+    if (decision.policy !== 'ask_user') {
+      noteCreated(decision);
+      return decision;
+    }
 
     const fingerprint = action.previewFingerprint!;
     const reused = liveGrant(fingerprint);
@@ -334,4 +403,53 @@ export function createPermissionBridge(opts: PermissionBridgeOptions): Permissio
       });
     },
   };
+}
+
+/** Review diffs above this are cut; `contentSha256` still binds the exact content. */
+const MAX_REVIEW_DIFF_CHARS = 16_000;
+
+function prefixed(text: string, mark: '-' | '+'): string[] {
+  if (text === '') return [];
+  return text.replace(/\n$/, '').split('\n').map((line) => mark + line);
+}
+
+/**
+ * The exact change a protected-path write makes, as a unified-style diff for the
+ * reviewer: Edit (old/new string), MultiEdit (edits[]), Write (whole file against the
+ * current content), or a raw patch.
+ */
+export function protectedWriteDiff(path: string, rawInput: unknown, current: string | null): string {
+  const fields =
+    rawInput && typeof rawInput === 'object' && !Array.isArray(rawInput) ? (rawInput as Record<string, unknown>) : {};
+  const header = [current === null ? '--- /dev/null' : '--- a/' + path, '+++ b/' + path];
+  const body: string[] = [];
+  const hunk = (oldText: string, newText: string): void => {
+    body.push('@@', ...prefixed(oldText, '-'), ...prefixed(newText, '+'));
+  };
+  if (typeof fields.patch === 'string') {
+    return clip(fields.patch);
+  }
+  if (typeof fields.old_string === 'string' && typeof fields.new_string === 'string') {
+    hunk(fields.old_string, fields.new_string);
+    if (fields.replace_all === true) body.push('(replace_all: every occurrence)');
+  } else if (Array.isArray(fields.edits)) {
+    for (const edit of fields.edits as Record<string, unknown>[]) {
+      if (edit && typeof edit.old_string === 'string' && typeof edit.new_string === 'string') {
+        hunk(edit.old_string, edit.new_string);
+      }
+    }
+  } else if (typeof fields.content === 'string') {
+    hunk(current ?? '', fields.content);
+  } else if (typeof fields.new_source === 'string') {
+    hunk('', fields.new_source);
+  } else {
+    body.push('(no textual change in the request: ' + JSON.stringify(Object.keys(fields)) + ')');
+  }
+  return clip([...header, ...body].join('\n'));
+}
+
+function clip(text: string): string {
+  return text.length <= MAX_REVIEW_DIFF_CHARS
+    ? text
+    : text.slice(0, MAX_REVIEW_DIFF_CHARS) + '\n… (' + (text.length - MAX_REVIEW_DIFF_CHARS) + ' more chars; contentSha256 binds the full change)';
 }

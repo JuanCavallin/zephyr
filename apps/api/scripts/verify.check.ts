@@ -9,6 +9,7 @@
  *      name heuristic, coverage map.
  *   2. selectTests: Jev and fallback sources; unavailable Jev never shrinks the set.
  *   3. Completion verdict and flaky-vs-real.
+ *   4. Protected paths and the permission-bridge rule.
  */
 
 process.env.PERSIST_TO_DISK = 'false';
@@ -387,6 +388,159 @@ await test('flakyVerdict: Jev probability from history; default treats failures 
     assert.deepEqual([v.flaky, v.probability, v.source], [false, 0, 'fallback']);
     assert.ok(v.reasonCodes.includes('treat-failure-as-real'));
   }
+});
+
+/* ------------------------- 4. protected paths ------------------------- */
+
+console.log('protected paths');
+const { isProtected, protectionOf, hotFileIntentProtection } = await import('../src/core/verify/protectedPaths.js');
+const { createPermissionBridge, protectedWriteDiff } = await import('../src/core/tools/permissionBridge.js');
+type AuthorizationDecision = import('@htn/shared').AuthorizationDecision;
+type ToolAction = import('@htn/shared').ToolAction;
+
+await test('isProtected: defaults, run-created exemption, policy globs, protectDefaults off', () => {
+  const none = new Set<string>();
+  const cases: [string, string | null][] = [
+    ['src/math.test.ts', 'existing-test'],
+    ['tests/test_util.py', 'existing-test'],
+    ['pkg/x_test.go', 'existing-test'],
+    ['src/__tests__/helpers.ts', 'existing-test'],
+    ['src/__snapshots__/a.test.ts.snap', 'snapshot'],
+    ['.github/workflows/ci.yml', 'ci-config'],
+    ['.gitlab-ci.yml', 'ci-config'],
+    ['eslint.config.js', 'lint-config'],
+    ['apps/web/.prettierrc.json', 'lint-config'],
+    ['pnpm-lock.yaml', 'lockfile'],
+    ['Cargo.lock', 'lockfile'],
+    ['apps/api/yarn.lock', 'lockfile'],
+    ['src/math.ts', null],
+    ['README.md', null],
+  ];
+  for (const [path, reason] of cases) {
+    assert.equal(protectionOf(path, DEFAULT_VERIFY_POLICY, none), reason, path);
+    assert.equal(isProtected(path, DEFAULT_VERIFY_POLICY, none), reason !== null, path);
+  }
+  const created = new Set(['src/new.test.ts', 'src/__snapshots__/new.snap', 'pnpm-lock.yaml']);
+  assert.equal(isProtected('src/new.test.ts', DEFAULT_VERIFY_POLICY, created), false, 'run-created test is editable');
+  assert.equal(isProtected('src/__snapshots__/new.snap', DEFAULT_VERIFY_POLICY, created), false);
+  assert.equal(isProtected('pnpm-lock.yaml', DEFAULT_VERIFY_POLICY, created), true, 'lockfiles stay guarded');
+
+  const custom = resolveVerifyPolicy({ protectedGlobs: ['migrations/**'] });
+  assert.equal(protectionOf('migrations/001.sql', custom, created), 'policy-glob');
+  const off = resolveVerifyPolicy({ protectDefaults: false, protectedGlobs: ['migrations/**'] });
+  assert.equal(isProtected('src/math.test.ts', off, none), false);
+  assert.equal(isProtected('pnpm-lock.yaml', off, none), false);
+  assert.equal(isProtected('migrations/001.sql', off, none), true, 'policy globs apply without defaults');
+});
+
+await test('hot-file intent for a lockfile is still protected', () => {
+  assert.equal(hotFileIntentProtection({ path: 'pnpm-lock.yaml' }, DEFAULT_VERIFY_POLICY), 'lockfile');
+  assert.equal(hotFileIntentProtection({ path: 'package.json' }, DEFAULT_VERIFY_POLICY), null);
+});
+
+await test('protectedWriteDiff renders Edit, MultiEdit and Write exactly', () => {
+  assert.equal(
+    protectedWriteDiff('a.test.ts', { file_path: 'a.test.ts', old_string: 'expect(1)', new_string: 'expect(2)' }, 'x'),
+    '--- a/a.test.ts\n+++ b/a.test.ts\n@@\n-expect(1)\n+expect(2)',
+  );
+  assert.equal(
+    protectedWriteDiff('a.test.ts', { edits: [{ old_string: 'a', new_string: 'b' }, { old_string: 'c', new_string: '' }] }, 'x'),
+    '--- a/a.test.ts\n+++ b/a.test.ts\n@@\n-a\n+b\n@@\n-c',
+  );
+  assert.equal(
+    protectedWriteDiff('pnpm-lock.yaml', { content: 'one\ntwo\n' }, 'one\n'),
+    '--- a/pnpm-lock.yaml\n+++ b/pnpm-lock.yaml\n@@\n-one\n+one\n+two',
+  );
+  const long = protectedWriteDiff('x.snap', { content: 'y'.repeat(40_000) }, null);
+  assert.ok(long.length < 17_000 && long.includes('contentSha256 binds'), 'long diffs are clipped');
+});
+
+const protectedWorktree = join(scratch, 'protected');
+await mkdir(join(protectedWorktree, 'src'), { recursive: true });
+await writeFile(join(protectedWorktree, 'src/math.ts'), 'export const add = (a, b) => a + b;\n');
+await writeFile(join(protectedWorktree, 'src/math.test.ts'), "expect(add(1, 2)).toBe(3);\n");
+await writeFile(join(protectedWorktree, 'pnpm-lock.yaml'), 'lockfileVersion: 9\n');
+
+const allowAuth = async (): Promise<AuthorizationDecision> =>
+  ({ actionId: 'check', recommendation: 'auto', finalPolicy: 'auto', allowed: true, reasonCodes: [], at: new Date().toISOString() }) as unknown as AuthorizationDecision;
+function protectedBridge(runCreated = new Set<string>()) {
+  const asked: ToolAction[] = [];
+  const bridge = createPermissionBridge({
+    harness: 'claudecode',
+    worktree: protectedWorktree,
+    authorize: allowAuth,
+    run: { runId: 'run_prot', stepId: 'step_prot' },
+    approvals: {
+      async request({ action }) {
+        asked.push(action);
+        return { approvalId: 'apr_' + asked.length };
+      },
+    },
+    runCreated,
+  });
+  return { bridge, asked, runCreated };
+}
+const nreq = (toolName: string, rawInput: unknown) =>
+  ({ harness: 'claudecode', toolName, rawInput, sessionId: 'sess_prot' }) as import('@htn/shared').NativeToolRequest;
+
+await test('editing an existing test needs approval carrying the exact diff (irreversible)', async () => {
+  const { bridge, asked } = protectedBridge();
+  const edit = nreq('Edit', { file_path: 'src/math.test.ts', old_string: 'toBe(3)', new_string: 'toBe(4)' });
+  const preview = await bridge.preview(edit);
+  assert.equal(preview.policy, 'ask_user');
+  assert.equal(preview.verdict, 'deny', 'preview never auto-allows a protected edit');
+  assert.equal(preview.exact?.descriptor.reversibility, 'irreversible');
+  assert.ok(preview.authorization?.reasonCodes.includes('protected-existing-test'));
+
+  const d = await bridge.decide(edit);
+  assert.equal(d.verdict, 'allow');
+  assert.equal(d.approvalId, 'apr_1');
+  assert.equal(asked.length, 1);
+  const review = asked[0]!.review as Record<string, unknown>;
+  assert.equal(review.protectedPath, 'src/math.test.ts');
+  assert.equal(review.protection, 'existing-test');
+  assert.equal(review.diff, '--- a/src/math.test.ts\n+++ b/src/math.test.ts\n@@\n-toBe(3)\n+toBe(4)');
+  assert.match(String(review.contentSha256), /^[0-9a-f]{64}$/);
+
+  const other = await bridge.decide(nreq('Edit', { file_path: 'src/math.test.ts', old_string: 'toBe(3)', new_string: 'toBe(5)' }));
+  assert.equal(asked.length, 2, 'a different diff is a different action and asks again');
+  assert.notEqual(other.reusedGrant, true);
+});
+
+await test('adding a new test is auto and flagged; later edits to it stay auto', async () => {
+  const { bridge, asked, runCreated } = protectedBridge();
+  const add = await bridge.decide(nreq('Write', { file_path: 'src/math.extra.test.ts', content: 'it("adds", () => {});\n' }));
+  assert.equal(add.policy, 'auto');
+  assert.equal(add.verdict, 'allow');
+  assert.ok(add.authorization?.reasonCodes.includes('new-test-file'), 'new tests are flagged');
+  assert.ok(runCreated.has('src/math.extra.test.ts'));
+  await writeFile(join(protectedWorktree, 'src/math.extra.test.ts'), 'it("adds", () => {});\n');
+  const edit = await bridge.decide(nreq('Edit', { file_path: 'src/math.extra.test.ts', old_string: 'adds', new_string: 'adds two' }));
+  assert.equal(edit.policy, 'auto', 'a run-created test is not pre-existing');
+  assert.equal(asked.length, 0);
+  const plain = await bridge.decide(nreq('Edit', { file_path: 'src/math.ts', old_string: 'a + b', new_string: 'b + a' }));
+  assert.equal(plain.policy, 'auto', 'ordinary source stays auto');
+  assert.ok(!plain.authorization?.reasonCodes.includes('protected-path'));
+});
+
+await test('a lockfile write applying a hot-file intent still goes through approval', async () => {
+  const { bridge, asked } = protectedBridge(new Set(['pnpm-lock.yaml']));
+  const intent = { id: 'hfi_1', taskId: 'task_1', path: 'pnpm-lock.yaml', kind: 'add_dependency', description: 'add dependency zod@3' };
+  assert.equal(hotFileIntentProtection(intent, DEFAULT_VERIFY_POLICY), 'lockfile');
+  const d = await bridge.decide(nreq('Write', { file_path: intent.path, content: 'lockfileVersion: 9\nzod: 3\n' }));
+  assert.equal(d.policy, 'ask_user');
+  assert.equal(asked.length, 1);
+  assert.equal((asked[0]!.review as Record<string, unknown>).protection, 'lockfile');
+  assert.equal(
+    (asked[0]!.review as Record<string, unknown>).diff,
+    '--- a/pnpm-lock.yaml\n+++ b/pnpm-lock.yaml\n@@\n-lockfileVersion: 9\n+lockfileVersion: 9\n+zod: 3',
+  );
+});
+
+await test('a protected edit with no approval gate denies', async () => {
+  const bridge = createPermissionBridge({ harness: 'claudecode', worktree: protectedWorktree, authorize: allowAuth, run: { runId: 'r', stepId: 's' } });
+  const d = await bridge.decide(nreq('Edit', { file_path: 'src/math.test.ts', old_string: 'a', new_string: 'b' }));
+  assert.equal(d.verdict, 'deny');
 });
 
 await rm(scratch, { recursive: true, force: true }).catch(() => undefined);
