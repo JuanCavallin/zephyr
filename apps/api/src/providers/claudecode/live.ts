@@ -38,6 +38,11 @@ import type {
   RunEvent,
 } from '@htn/shared';
 import { config, type ProviderConfig } from '../../config.js';
+import {
+  gatewayRunTokens,
+  type GatewayRunTokenStore,
+  type RunBudgetCaps,
+} from '../../core/modelGateway/runTokens.js';
 import { AcpClient, type AcpEvent, type AcpSession, type AcpTerminal } from '../_acp/client.js';
 import {
   buildHarnessEnv,
@@ -114,6 +119,13 @@ export interface ClaudeCodeRuntimeDeps {
   gatewayUrl: string;
   mcpUrl?: string;
   tokens: HookTokenStore;
+  /**
+   * Per-run `/v1/messages` credentials. When set, Claude Code's ANTHROPIC_AUTH_TOKEN
+   * is a token minted here (billed to the run, budget-capped, 403 once the task
+   * ends) instead of the session's OpenAI-surface credential.
+   */
+  gatewayTokens?: GatewayRunTokenStore;
+  gatewayBudget?: RunBudgetCaps;
   approvals?: () => Promise<ToolApprovalGate | undefined>;
   emit?: (runId: string, event: RunEvent) => Promise<unknown>;
   authorize?: Authorizer;
@@ -139,6 +151,7 @@ interface TaskRecord {
   session: AcpSession;
   bridge: PermissionBridge;
   token: string;
+  gatewayToken?: string;
   stateDir: string;
   worktree: string;
   branch: string;
@@ -184,6 +197,7 @@ export function createClaudeCodeRuntime(deps: ClaudeCodeRuntimeDeps): ClaudeCode
 
   async function teardown(record: TaskRecord): Promise<void> {
     deps.tokens.revoke(record.token);
+    if (record.gatewayToken) deps.gatewayTokens?.finish(record.gatewayToken);
     record.session.dispose();
     await record.client.close();
     await rm(record.stateDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 }).catch(() => {});
@@ -273,6 +287,7 @@ export function createClaudeCodeRuntime(deps: ClaudeCodeRuntimeDeps): ClaudeCode
       const stepId = ctx.stepId ?? 'unbound';
       let stateDir: string | undefined;
       let token: string | undefined;
+      let gatewayToken: string | undefined;
       let client: AcpClient | undefined;
       try {
         const ws = await deps.workspaces();
@@ -315,9 +330,18 @@ export function createClaudeCodeRuntime(deps: ClaudeCodeRuntimeDeps): ClaudeCode
         const settings = claudeCodeSettings({ hookUrl: hookUrl(deps.apiBaseUrl, token) });
         await writeFile(join(stateDir, 'settings.json'), JSON.stringify(settings, null, 2), 'utf8');
 
+        gatewayToken = deps.gatewayTokens?.mint({
+          runId: ctx.runId,
+          harness: 'claudecode',
+          ...(ctx.sessionStateId ? { sessionStateId: ctx.sessionStateId } : {}),
+          budget: deps.gatewayBudget ?? {},
+        });
         const launch: AcpLaunchContext = {
           cwd: workspace.path,
-          gateway: { url: deps.gatewayUrl, token: ctx.gatewayCredentials?.model ?? 'zephyr-local' },
+          gateway: {
+            url: deps.gatewayUrl,
+            token: gatewayToken ?? ctx.gatewayCredentials?.model ?? 'zephyr-local',
+          },
           ...(deps.mcpUrl ? { mcp: { url: deps.mcpUrl, token: ctx.gatewayCredentials?.mcp ?? '' } } : {}),
           stateDir,
         };
@@ -352,6 +376,7 @@ export function createClaudeCodeRuntime(deps: ClaudeCodeRuntimeDeps): ClaudeCode
           session,
           bridge,
           token,
+          ...(gatewayToken ? { gatewayToken } : {}),
           stateDir,
           worktree: workspace.path,
           branch: workspace.branch,
@@ -362,6 +387,7 @@ export function createClaudeCodeRuntime(deps: ClaudeCodeRuntimeDeps): ClaudeCode
         return { ok: true, data: { taskId: record.taskId }, meta: meta('startTask', started, DESTINATION) };
       } catch (error) {
         if (token) deps.tokens.revoke(token);
+        if (gatewayToken) deps.gatewayTokens?.finish(gatewayToken);
         if (client) await client.close().catch(() => {});
         if (stateDir) await rm(stateDir, { recursive: true, force: true }).catch(() => {});
         return failure('startTask', started, 'UPSTREAM', (error as Error).message);
@@ -466,6 +492,8 @@ export function createLiveClaudeCode(cfg: ProviderConfig): AgentRuntimeAdapter {
     approvals: async () => (await import('../../services/runtime.js')).toolApprovalGate,
     emit: async (runId, event) => (await import('../../services/runtime.js')).bus.emit(runId, event),
     tokens: hookTokens,
+    gatewayTokens: gatewayRunTokens,
+    gatewayBudget: config.modelGateway.messagesBudget,
     apiBaseUrl: `http://127.0.0.1:${config.port}`,
     gatewayUrl: anthropicBaseUrl(cfg.baseUrl ?? config.modelGateway.baseUrl),
     ...(cfg.mcpUrl ? { mcpUrl: cfg.mcpUrl } : {}),

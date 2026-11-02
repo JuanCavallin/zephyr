@@ -21,6 +21,7 @@ import type { RegisteredTool } from '../tools/registry.js';
 import { modelRoutesFor } from './catalog.js';
 import type { ToolDescriptorCatalog } from './toolCatalog.js';
 import { DEFAULT_MAX_TOOL_CALLS_PER_TURN, TOOL_BUDGET_EXHAUSTED_INSTRUCTION } from './turnBudget.js';
+import { AnthropicMessagesGateway, type MessagesGatewayOptions } from './messages.js';
 
 export interface OpenAiMessage {
   role: string;
@@ -98,6 +99,13 @@ export interface ModelGatewayOptions {
   maxToolCallsPerTurn?: number;
   /** Trusted credential eligibility, checked before routing; never supplied by Hermes. */
   routeAvailable?: (route: ModelRoute, ctx: ProviderCallContext) => boolean;
+  /**
+   * The Anthropic Messages passthrough (`/v1/messages`, for Claude Code). Its
+   * routing (`upstreamFor`), budget (run tokens) and accounting (ledger) hooks are
+   * set here; events go to this service's bus and the per-turn tool budget is the
+   * same one the OpenAI-compatible surface enforces. Omit to leave it unmounted.
+   */
+  anthropicMessages?: Omit<MessagesGatewayOptions, 'emit' | 'maxToolCallsPerTurn'>;
 }
 
 // DEFAULT_MAX_TOOL_CALLS_PER_TURN and TOOL_BUDGET_EXHAUSTED_INSTRUCTION live in
@@ -134,6 +142,8 @@ export class ModelGatewayService {
    * again. In memory: a restart simply asks again.
    */
   private readonly taskModelChoices = new Map<string, string>();
+  /** `/v1/messages` passthrough, when configured. Raw bytes in, raw bytes out. */
+  readonly messages: AnthropicMessagesGateway | undefined;
 
   constructor(
     private readonly decisionService: DecisionService,
@@ -147,6 +157,13 @@ export class ModelGatewayService {
     this.backend = options.backend ?? textAdapterBackend(model);
     this.maxToolCallsPerTurn = options.maxToolCallsPerTurn ?? DEFAULT_MAX_TOOL_CALLS_PER_TURN;
     this.routeAvailable = options.routeAvailable ?? (() => true);
+    this.messages = options.anthropicMessages
+      ? new AnthropicMessagesGateway({
+          ...options.anthropicMessages,
+          maxToolCallsPerTurn: this.maxToolCallsPerTurn,
+          emit: (runId, event) => this.bus.emit(runId, event),
+        })
+      : undefined;
   }
 
   listModels(): ModelRoute[] {

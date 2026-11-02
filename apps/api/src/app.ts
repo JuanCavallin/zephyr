@@ -1,6 +1,7 @@
 import express, { type Express } from 'express';
 import { config } from './config.js';
 import { mountRoutes } from './api/index.js';
+import { isAnthropicMessagesPath } from './api/anthropicMessages.routes.js';
 import { errorHandler, notFoundHandler } from './api/middleware/error.js';
 import { requestContext } from './api/middleware/requestContext.js';
 
@@ -12,7 +13,10 @@ export function createApp(): Express {
   // DO NOT ADD compression() HERE. gzip buffering silently breaks SSE and the
   // symptom looks like a hung backend. See api/stream.routes.ts.
 
-  app.use(express.json({ limit: '2mb' }));
+  // /v1/messages is read RAW by its own router: parsing it here would consume the
+  // body, and re-serializing it would break the client's prompt-cache prefix.
+  const json = express.json({ limit: '2mb' });
+  app.use((req, res, next) => (isAnthropicMessagesPath(req.path) ? next() : json(req, res, next)));
   app.use(requestContext);
 
   // In dev the Vite proxy serves /api from the same origin, so CORS is not

@@ -24,7 +24,8 @@ import { tasksRouter } from './tasks.routes.js';
 import { requireLocalControl } from '../services/localControl.js';
 import { createHarnessCallbackRouter, createObservedRouter } from './hooks.routes.js';
 import { hookTokens } from '../core/hooks/hookTokens.js';
-import { bus, store } from '../services/runtime.js';
+import { bus, modelGateway, store } from '../services/runtime.js';
+import { createGatewayLedgerRouter } from './anthropicMessages.routes.js';
 import { config } from '../config.js';
 
 export function mountRoutes(app: Express): void {
@@ -63,6 +64,8 @@ export function mountRoutes(app: Express): void {
   api.use(streamRouter);
   api.use(toolsRouter);
   api.use(mcpConnectionsRouter);
+  // Per-run /v1/messages accounting (tokens incl. cache reads/writes, hit rate).
+  api.use(createGatewayLedgerRouter(() => modelGateway.messages));
   // Observed mode: mint a token + settings snippet for an unmodified Claude Code.
   api.use(createObservedRouter({ ...harnessDeps, apiBaseUrl: `http://127.0.0.1:${config.port}` }));
 

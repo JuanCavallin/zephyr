@@ -1,8 +1,14 @@
 import { Router, type Response } from 'express';
 import type { OpenAiChatRequest } from '../core/modelGateway/service.js';
 import { modelGateway, sessionStateService } from '../services/runtime.js';
+import { createAnthropicMessagesRouter } from './anthropicMessages.routes.js';
 
 export const modelGatewayRouter = Router();
+
+// Anthropic Messages (Claude Code). Mounted BEFORE the session-binding middleware
+// below: it authenticates with its own per-run token (401 unknown, 403 finished),
+// and it reads the body raw.
+modelGatewayRouter.use(createAnthropicMessagesRouter(() => modelGateway.messages));
 
 modelGatewayRouter.get('/models', (_req, res) => {
   const created = Math.floor(Date.now() / 1000);

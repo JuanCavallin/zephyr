@@ -15,6 +15,8 @@ import { Orchestrator } from '../core/orchestrator.js';
 import { DecisionService } from '../core/decisions/service.js';
 import { modelRoutesFor } from '../core/modelGateway/catalog.js';
 import { ModelGatewayService, textAdapterBackend } from '../core/modelGateway/service.js';
+import { fetchUpstream } from '../core/modelGateway/messages.js';
+import { gatewayRunTokens } from '../core/modelGateway/runTokens.js';
 import { RunToolApprovalGate } from '../core/tools/approval.js';
 import { ToolBroker } from '../core/tools/broker.js';
 import { InMemoryToolExecutorRegistry } from '../core/tools/executors.js';
@@ -159,6 +161,17 @@ export const modelGateway = new ModelGatewayService(
       );
     },
     maxToolCallsPerTurn: config.agent.maxToolCallsPerTurn,
+    anthropicMessages: {
+      upstream: fetchUpstream({
+        baseUrl: config.providers.anthropic.baseUrl ?? 'https://api.anthropic.com/v1',
+        // Per run, the same way the Anthropic chat backend resolves it: the operator
+        // key or the run's user credential (never the operator's as a fallback for a
+        // missing user key), pinned for the life of the run.
+        apiKey: async (runId) =>
+          (await credentials.resolve({ runId, providerId: 'anthropic', purpose: 'model' }))?.secret,
+      }),
+      tokens: gatewayRunTokens,
+    },
     modelRoutes: (adapter) => [
       ...modelRoutesFor(adapter),
       ...anthropicModelRoutes(config.providers.anthropic),

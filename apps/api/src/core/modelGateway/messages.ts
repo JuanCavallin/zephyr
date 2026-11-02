@@ -34,6 +34,8 @@ import { DEFAULT_MAX_TOOL_CALLS_PER_TURN, TOOL_BUDGET_EXHAUSTED_INSTRUCTION } fr
 export type MessagesPath = '/v1/messages' | '/v1/messages/count_tokens';
 
 export interface AnthropicUpstreamRequest {
+  /** The run this call is billed to; lets the upstream pick the run's credential. */
+  runId: string;
   path: MessagesPath;
   /** Query string including `?`, or ''. Claude Code calls `/v1/messages?beta=true`. */
   search: string;
@@ -361,6 +363,7 @@ export class AnthropicMessagesGateway {
     let response: Response;
     try {
       response = await upstream({
+        runId: binding.runId,
         path: '/v1/messages',
         search: req.search ?? '',
         body,
@@ -424,6 +427,7 @@ export class AnthropicMessagesGateway {
     let response: Response;
     try {
       response = await upstream({
+        runId: binding.runId,
         path: '/v1/messages/count_tokens',
         search: req.search ?? '',
         body,
@@ -648,16 +652,18 @@ function errorMessage(error: unknown): string {
  */
 export function fetchUpstream(opts: {
   baseUrl: string;
-  apiKey: string | undefined;
+  /** A fixed key, or a per-run lookup (user-supplied credentials). */
+  apiKey: string | undefined | ((runId: string) => Promise<string | undefined>);
   fetch?: typeof fetch;
 }): AnthropicUpstream {
   // Config carries `https://api.anthropic.com/v1`; the paths here include /v1.
   const base = opts.baseUrl.replace(/\/+$/, '').replace(/\/v1$/, '');
   const doFetch = opts.fetch ?? fetch;
   return async (req) => {
-    if (!opts.apiKey) throw new Error('ANTHROPIC_API_KEY is not configured on the Zephyr server.');
+    const apiKey = typeof opts.apiKey === 'function' ? await opts.apiKey(req.runId) : opts.apiKey;
+    if (!apiKey) throw new Error('ANTHROPIC_API_KEY is not configured on the Zephyr server.');
     const headers = new Headers(req.headers);
-    headers.set('x-api-key', opts.apiKey);
+    headers.set('x-api-key', apiKey);
     if (!headers.has('anthropic-version')) headers.set('anthropic-version', '2023-06-01');
     if (!headers.has('content-type')) headers.set('content-type', 'application/json');
     return doFetch(base + req.path + req.search, {

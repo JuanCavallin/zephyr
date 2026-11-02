@@ -63,6 +63,16 @@ export class GatewayRunTokenStore {
     return { status: entry.finished ? 'finished' : 'active', binding: entry.binding };
   }
 
+  /** Mark one token finished (its task ended; the run may go on). Idempotent. */
+  finish(token: string): void {
+    const entry = this.entries.get(digest(token));
+    if (entry && !entry.finished) {
+      entry.finished = true;
+      this.finishedCount += 1;
+      this.prune();
+    }
+  }
+
   /** Mark every token of a run finished. Idempotent. */
   finishRun(runId: string): void {
     for (const entry of this.entries.values()) {

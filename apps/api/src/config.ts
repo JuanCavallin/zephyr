@@ -63,6 +63,9 @@ const envSchema = z.object({
 
   MODEL_GATEWAY_BASE_URL: optionalUrl,
   MODEL_GATEWAY_API_KEY: z.string().default('agentos-local'),
+  /** Per-run caps on `/v1/messages` (Claude Code) traffic. Unset = uncapped. */
+  GATEWAY_RUN_MAX_TOKENS: z.preprocess(blankIsUnset, z.coerce.number().int().positive().optional()),
+  GATEWAY_RUN_MAX_COST_CENTS: z.preprocess(blankIsUnset, z.coerce.number().positive().optional()),
   MCP_GATEWAY_URL: optionalUrl,
   MCP_GATEWAY_API_KEY: z.string().default('agentos-mcp-local'),
 
@@ -377,6 +380,12 @@ export const config = Object.freeze({
   modelGateway: {
     baseUrl: env.MODEL_GATEWAY_BASE_URL ?? `http://127.0.0.1:${env.PORT}/v1`,
     apiKey: env.MODEL_GATEWAY_API_KEY,
+    messagesBudget: {
+      ...(env.GATEWAY_RUN_MAX_TOKENS !== undefined ? { maxTokens: env.GATEWAY_RUN_MAX_TOKENS } : {}),
+      ...(env.GATEWAY_RUN_MAX_COST_CENTS !== undefined
+        ? { maxCostCents: env.GATEWAY_RUN_MAX_COST_CENTS }
+        : {}),
+    },
   },
   mcpGateway: {
     url: env.MCP_GATEWAY_URL ?? `http://127.0.0.1:${env.PORT}/mcp`,
