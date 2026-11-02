@@ -162,6 +162,12 @@ const envSchema = z.object({
   GIT_REPO_ROOT: optionalString,
   // Keep it short: Windows long-path limits bite deep worktree paths.
   WORKSPACES_DIR: optionalString,
+
+  // Claude Code over ACP (@agentclientprotocol/claude-agent-acp, pinned 0.99.1).
+  // live needs CLAUDECODE_BINARY: the adapter's dist/index.js (run with node) or an
+  // executable on PATH. Every native tool call goes through the permission bridge.
+  CLAUDECODE_MODE: modeEnum.default('mock'),
+  CLAUDECODE_BINARY: optionalString,
   GPTZERO_API_KEY: optionalString,
   GPTZERO_BASE_URL: optionalUrl,
   /** P(ai) at or above which an authorized outbound send stops for a human. */
@@ -212,6 +218,8 @@ export interface ProviderConfig {
   repoRoot?: string;
   /** Directory holding one worktree per run (git only). */
   workspacesDir?: string;
+  /** Harness entry point: a .js file (run with node) or an executable (claudecode only). */
+  binary?: string;
   /** Name of the env var that would enable live mode. Shown in health detail. */
   keyVar: string;
 }
@@ -299,6 +307,15 @@ function resolveGit(): ProviderConfig {
   };
 }
 
+function resolveClaudeCode(): ProviderConfig {
+  return {
+    mode: env.MOCK_ALL ? 'mock' : env.CLAUDECODE_MODE,
+    ...(env.CLAUDECODE_BINARY ? { binary: env.CLAUDECODE_BINARY } : {}),
+    baseUrl: env.MODEL_GATEWAY_BASE_URL ?? `http://127.0.0.1:${env.PORT}/v1`,
+    keyVar: 'CLAUDECODE_MODE',
+  };
+}
+
 const providers: Record<ProviderId, ProviderConfig> = {
   hermes: resolveHermes(),
   jev: resolve(
@@ -347,6 +364,7 @@ const providers: Record<ProviderId, ProviderConfig> = {
     baseUrl: env.GPTZERO_BASE_URL,
   }),
   git: resolveGit(),
+  claudecode: resolveClaudeCode(),
 };
 
 export const config = Object.freeze({

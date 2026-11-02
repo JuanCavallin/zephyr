@@ -22,6 +22,10 @@ import { credentialsRouter } from './credentials.routes.js';
 import { browserRouter } from './browser.routes.js';
 import { tasksRouter } from './tasks.routes.js';
 import { requireLocalControl } from '../services/localControl.js';
+import { createHarnessCallbackRouter, createObservedRouter } from './hooks.routes.js';
+import { hookTokens } from '../core/hooks/hookTokens.js';
+import { bus, store } from '../services/runtime.js';
+import { config } from '../config.js';
 
 export function mountRoutes(app: Express): void {
   const api = Router();
@@ -31,6 +35,11 @@ export function mountRoutes(app: Express): void {
   });
 
   api.use(credentialsRouter);
+  // Claude Code's HTTP hooks and OTel exporter call back from the harness process,
+  // not the dashboard: no Origin, no local capability. The run-scoped token in the
+  // path is their credential (401 when unknown, expired or for another harness).
+  const harnessDeps = { tokens: hookTokens, store, emit: bus.emit.bind(bus) };
+  api.use(createHarnessCallbackRouter(harnessDeps));
   // Every dashboard mutation shares the local capability/origin boundary,
   // including graph authoring and OAuth/MCP setup that can spend credentials.
   // Credential setup establishes that capability and validates Origin itself.
@@ -54,6 +63,8 @@ export function mountRoutes(app: Express): void {
   api.use(streamRouter);
   api.use(toolsRouter);
   api.use(mcpConnectionsRouter);
+  // Observed mode: mint a token + settings snippet for an unmodified Claude Code.
+  api.use(createObservedRouter({ ...harnessDeps, apiBaseUrl: `http://127.0.0.1:${config.port}` }));
 
   // Hermes uses this OpenAI-compatible endpoint. It is intentionally outside
   // /api because SDK clients append /chat/completions to a /v1 base URL.

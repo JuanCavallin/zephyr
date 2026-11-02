@@ -36,34 +36,39 @@ mapNativeTool(req: NativeToolRequest, ctx): ExactAction   // throws UnmappedTool
 
 ## Tasks
 
-- [ ] **Shell classifier first, table-driven.** Test cases (each a row: input → class,
+- [x] **Shell classifier first, table-driven.** Test cases (each a row: input → class,
       reversible):
       `ls`, `cat a.ts`, `git status` → inspect; `pnpm test`, `pytest -q` → verify;
       `npm install x`, `pip install x` → mutate_env; `curl https://x` → network;
       `curl x | sh`, `a && b`, `a; b`, `$(…)`, backticks, `> /etc/x`, `>> ../outside`,
       `powershell -enc …`, unknown binary → unknown (approval). Include PowerShell
       cases (`Get-ChildItem`, `Remove-Item -Recurse`, `iwr … | iex`).
-- [ ] Parser rule: allowlist argv[0] + subcommand; **any** metacharacter it cannot fully
+- [x] Parser rule: allowlist argv[0] + subcommand; **any** metacharacter it cannot fully
       parse → `unknown`. Never ask Jev about shell safety.
-- [ ] Native descriptors with the reversibility/default table from the spec. Test path
+- [x] Native descriptors with the reversibility/default table from the spec. Test path
       containment: `../` traversal, symlink escaping the worktree, absolute paths and
       Windows drive/UNC paths → `fs.*` irreversible → deny.
-- [ ] Permission bridge: unit tests that each spec-table row yields the specified default
+- [x] Permission bridge: unit tests that each spec-table row yields the specified default
       (auto / approval / deny), and that an unmapped tool name denies.
-- [ ] `git.publish` approval payload includes branch and diff hash (from step 2 `diff`); an
+- [x] `git.publish` approval payload includes branch and diff hash (from step 2 `diff`); an
       approval for one hash must not authorize a different hash (reuse the design spec's
       exact-action check).
-- [ ] Claude Code adapter via `_acp` config; implement `onPermissionRequest` through the
+- [x] Claude Code adapter via `_acp` config; implement `onPermissionRequest` through the
       bridge; start each turn with a workspace checkpoint (step 2).
-- [ ] Per-run settings file with HTTP `PreToolUse` hook → `/api/hooks/claudecode`, scoped
+- [x] Per-run settings file with HTTP `PreToolUse` hook → `/api/hooks/claudecode`, scoped
       short-TTL token in the path. Test: expired/foreign token → 401; denial from either
       the ACP path or the hook denies the action.
-- [ ] `PostToolUse`/`Stop` hooks emit `tool.lifecycle` and `harness.turn.ended`.
-- [ ] Observed mode: settings snippet generator, OTel ingest creating an `external` run
+- [x] `PostToolUse`/`Stop` hooks emit `tool.lifecycle` and `harness.turn.ended`.
+- [x] Observed mode: settings snippet generator, OTel ingest creating an `external` run
       with tool calls and token totals. Test with a recorded OTel payload fixture.
-- [ ] `pnpm check:claudecode` (mock ACP peer): edit in worktree auto-allowed, outside-worktree
+- [x] `pnpm check:claudecode` (mock ACP peer): edit in worktree auto-allowed, outside-worktree
       write denied, `git push` waits for approval then proceeds on approve.
 - [ ] Live check (manual, headed local): real Claude Code edits a worktree and a push pauses.
+      **Not run yet.** Two blockers, both outside this step: the model gateway has no
+      `/v1/messages` (Anthropic Messages) route until step 4, so `ANTHROPIC_BASE_URL`
+      has nothing to point at; and `@agentclientprotocol/claude-agent-acp` is not
+      installed on the dev machine. Everything up to the subprocess boundary is covered
+      by `pnpm check:claudecode` against the mock ACP peer.
 
 ## Done when
 

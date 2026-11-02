@@ -505,10 +505,11 @@ export class AcpClient {
       const verdict = await handler(
         {
           harness: this.harness.harness,
-          toolName: params.toolCall.title ?? params.toolCall.kind ?? 'unknown',
+          toolName: nativeToolName(params.toolCall),
           rawInput: params.toolCall.rawInput ?? null,
           sessionId: params.sessionId,
           toolCallId: params.toolCall.toolCallId,
+          ...(params.toolCall.kind ? { kind: params.toolCall.kind } : {}),
         },
         params,
       );
@@ -641,4 +642,21 @@ export class AcpClient {
     })();
     return this.closing;
   }
+}
+
+/**
+ * The harness's own tool name for a permission request. Claude Code's ACP adapter
+ * carries it in `_meta.claudeCode.toolName`; the title ("Edit `a.ts`", "`git push`")
+ * is a human label and only the fallback. Descriptors never trust either for safety.
+ */
+function nativeToolName(toolCall: acp.RequestPermissionRequest['toolCall']): string {
+  const meta = (toolCall as { _meta?: unknown })._meta;
+  if (meta && typeof meta === 'object') {
+    const cc = (meta as Record<string, unknown>).claudeCode;
+    if (cc && typeof cc === 'object') {
+      const name = (cc as Record<string, unknown>).toolName;
+      if (typeof name === 'string' && name.length > 0) return name;
+    }
+  }
+  return toolCall.title ?? toolCall.kind ?? 'unknown';
 }

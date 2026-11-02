@@ -28,12 +28,12 @@
  *      Calls to configured AgentOS MCP tools are intercepted by the trusted
  *      registry, exact-action broker, and registered local/provider executor.
  *
- *   2. Unmapped native ACP permission requests fail closed. They do not carry
- *      a trusted AgentOS descriptor/destination/exact ToolAction and cannot
- *      safely grant execution from a tool title. AgentOS MCP tools already
- *      pass through the exact-action broker and its real approval flow. A
- *      future native-tool mapping must construct that same trusted contract
- *      before this callback may allow anything.
+ *   2. Native ACP permission requests go through the shared permission bridge
+ *      (core/tools/permissionBridge.ts): Hermes's terminal/read_file/write_file/
+ *      patch/search_files/web_* tools map to exact native descriptors and are
+ *      authorized like any other action. Unmapped tools still fail closed, and
+ *      with no approval gate bound here anything needing approval denies.
+ *      AgentOS MCP tools pass through the exact-action broker as before.
  *
  * `startTask`/`pollTask` bridge ACP's session+event model onto this
  * interface's start/poll/cancel shape: startTask opens a session and returns
@@ -51,6 +51,7 @@ import { basename, resolve } from 'node:path';
 import type { AgentRuntimeAdapter, ProviderErrorCode, ProviderResult } from '@htn/shared';
 import type { ProviderConfig } from '../../config.js';
 import { AcpClient, denyPermission, type AcpEvent, type AcpSession } from '../_acp/client.js';
+import { createPermissionBridge } from '../../core/tools/permissionBridge.js';
 import {
   buildHarnessEnv,
   type AcpHarnessConfig,
@@ -308,6 +309,14 @@ function createHermesProcess(cfg: ProviderConfig): AgentRuntimeAdapter {
     return profileDir;
   }
 
+  // Hermes's session cwd (see newSession below) is the only directory its native
+  // fs/shell tools may touch without approval.
+  const hermesBridge = createPermissionBridge({
+    harness: 'hermes',
+    worktree: resolve(tmpdir(), 'agentos-hermes-work', basename(profileDirFor(cfg))),
+    log: (m) => console.warn('[hermes:live] native permission: ' + m),
+  });
+
   async function connect(): Promise<AcpClient> {
     if (client) return client;
     if (connecting) return connecting;
@@ -324,13 +333,10 @@ function createHermesProcess(cfg: ProviderConfig): AgentRuntimeAdapter {
         onExit: () => {
           if (client === started) resetConnection();
         },
-        onPermission: () => {
-          // FAIL CLOSED — see the file header. Never silently approve here.
-          console.warn(
-            '[hermes:live] denied unmapped native permission; use AgentOS broker tools.',
-          );
-          return 'deny';
-        },
+        // The shared native-tool bridge (core/tools/permissionBridge.ts). Hermes has
+        // no approval gate bound here, so anything needing approval denies, and an
+        // unmapped tool still fails closed — see the file header.
+        onPermission: (req) => hermesBridge.handler(req),
       });
       client = started;
       return started;

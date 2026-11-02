@@ -214,6 +214,8 @@ export const nativeToolRequestSchema = z.object({
   sessionId: id,
   /** The harness's id for this call, when it has one. */
   toolCallId: z.string().min(1).optional(),
+  /** ACP `ToolKind` (`read`, `edit`, `execute`, …) when the harness sent one. A hint only. */
+  kind: z.string().min(1).optional(),
   /** Set by Zephyr (never by the harness) when the session runs a board task. */
   taskId: id.optional(),
 });

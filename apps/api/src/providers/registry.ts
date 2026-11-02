@@ -32,6 +32,7 @@ import { create as createAnthropic } from './anthropic/index.js';
 import { create as createGemini } from './gemini/index.js';
 import { create as createGptzero } from './gptzero/index.js';
 import { create as createGit } from './git/index.js';
+import { create as createClaudeCode } from './claudecode/index.js';
 
 type Factory = (cfg: ProviderConfig) => ProviderAdapter;
 
@@ -48,6 +49,7 @@ const FACTORIES: Record<ProviderId, Factory> = {
   gemini: createGemini,
   gptzero: createGptzero,
   git: createGit,
+  claudecode: createClaudeCode,
 };
 
 /** THE re-wiring knob. One line per capability. */

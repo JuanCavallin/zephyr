@@ -16,13 +16,21 @@
  *   hang                one chunk, then never answer (ignores session/cancel)
  *   slow                a chunk every 200ms; stops with `cancelled` on cancel
  *   spawn-child         start a long-lived grandchild, say `child:<pid>`, hang
+ *   request:<Tool>[:nohook]
+ *                       act like Claude Code running native tool <Tool> with the
+ *                       JSON input on the following prompt lines: POST the
+ *                       PreToolUse hook from $CLAUDE_CONFIG_DIR/settings.json (if
+ *                       any; `nohook` skips it), then session/request_permission,
+ *                       then perform Write/Edit (file_path, content) or "execute"
+ *                       Bash (say `executed:<command>`), then POST PostToolUse.
+ *                       Says `hook-denied`, `denied` or `allowed`.
  *
  * Run it with `mockPeerHarness()`, which launches it under tsx.
  */
 
 import { spawn } from 'node:child_process';
-import { mkdirSync, writeFileSync } from 'node:fs';
-import { dirname, resolve } from 'node:path';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { dirname, isAbsolute, resolve } from 'node:path';
 import { createInterface } from 'node:readline';
 import { fileURLToPath } from 'node:url';
 import { zephyrGatewayEnv, type AcpHarnessConfig } from './config.js';
@@ -69,6 +77,35 @@ function runPeer(): void {
       send({ id, method, params });
     });
   const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+  /** The http hook URL Claude Code would call for `event`, from the per-run settings. */
+  const hookUrlFor = (event: string): string | null => {
+    const dir = process.env.CLAUDE_CONFIG_DIR;
+    if (!dir || !existsSync(resolve(dir, 'settings.json'))) return null;
+    try {
+      const settings = JSON.parse(readFileSync(resolve(dir, 'settings.json'), 'utf8')) as {
+        hooks?: Record<string, { hooks?: { type?: string; url?: string }[] }[]>;
+      };
+      return settings.hooks?.[event]?.[0]?.hooks?.find((h) => h.type === 'http')?.url ?? null;
+    } catch {
+      return null;
+    }
+  };
+  const postHook = async (event: string, body: Json): Promise<Json | null> => {
+    const url = hookUrlFor(event);
+    if (!url) return null;
+    try {
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ hook_event_name: event, ...body }),
+      });
+      // Claude Code treats a non-2xx http hook as a non-blocking error.
+      return res.ok ? ((await res.json()) as Json) : { status: res.status };
+    } catch {
+      return null;
+    }
+  };
   const hang = () => new Promise<never>(() => {});
 
   async function prompt(id: unknown, params: Json): Promise<void> {
@@ -136,6 +173,58 @@ function runPeer(): void {
       } else {
         say(sessionId, 'denied');
       }
+      return done();
+    }
+
+    if (scenario.startsWith('request:')) {
+      const [, toolName = '', flag] = scenario.split(':');
+      const input = JSON.parse(text.split('\n').slice(1).join('\n') || '{}') as Json;
+      const toolCallId = 'toolu_' + Math.random().toString(36).slice(2, 10);
+      const common = { session_id: sessionId, cwd: session.cwd, tool_name: toolName, tool_input: input, tool_use_id: toolCallId };
+      if (flag !== 'nohook') {
+        const pre = (await postHook('PreToolUse', common)) as
+          | { hookSpecificOutput?: { permissionDecision?: string; permissionDecisionReason?: string } }
+          | null;
+        if (pre?.hookSpecificOutput?.permissionDecision === 'deny') {
+          say(sessionId, 'hook-denied:' + toolName + ' ' + (pre.hookSpecificOutput.permissionDecisionReason ?? ''));
+          return done();
+        }
+      }
+      const kind = toolName === 'Bash' ? 'execute' : toolName === 'Read' ? 'read' : 'edit';
+      const answer = await request('session/request_permission', {
+        sessionId,
+        toolCall: {
+          toolCallId,
+          title: toolName,
+          kind,
+          status: 'pending',
+          rawInput: input,
+          _meta: { claudeCode: { toolName } },
+        },
+        options: [
+          { optionId: 'yes', name: 'Allow once', kind: 'allow_once' },
+          { optionId: 'no', name: 'Reject once', kind: 'reject_once' },
+        ],
+      });
+      const outcome = (answer.outcome ?? {}) as { outcome?: string; optionId?: string };
+      if (!(outcome.outcome === 'selected' && outcome.optionId === 'yes')) {
+        say(sessionId, 'denied:' + toolName);
+        return done();
+      }
+      let response: Json = { success: true };
+      if (toolName === 'Write' || toolName === 'Edit') {
+        const path = String(input.file_path ?? '');
+        const target = isAbsolute(path) ? path : resolve(session.cwd, path);
+        mkdirSync(dirname(target), { recursive: true });
+        writeFileSync(target, String(input.content ?? input.new_string ?? ''));
+        response = { success: true, filePath: target };
+      } else if (toolName === 'Bash') {
+        say(sessionId, 'executed:' + String(input.command ?? ''));
+        response = { stdout: '', stderr: '', interrupted: false };
+      }
+      update(sessionId, { sessionUpdate: 'tool_call', toolCallId, title: toolName, kind, status: 'completed', rawInput: input });
+      if (flag !== 'nohook') await postHook('PostToolUse', { ...common, tool_response: response });
+      say(sessionId, 'allowed:' + toolName);
       return done();
     }
 

@@ -21,7 +21,8 @@ export type ProviderId =
   | 'anthropic' // frontier text model
   | 'gemini' // direct Google cloud model route (second cloud vendor)
   | 'gptzero' // outbound-text authenticity check
-  | 'git'; // per-run git worktrees for coding harnesses (local, no egress)
+  | 'git' // per-run git worktrees for coding harnesses (local, no egress)
+  | 'claudecode'; // Claude Code coding harness over ACP, gated by the permission bridge
 
 export const PROVIDER_IDS = [
   'hermes',
@@ -36,6 +37,7 @@ export const PROVIDER_IDS = [
   'gemini',
   'gptzero',
   'git',
+  'claudecode',
 ] as const satisfies readonly ProviderId[];
 
 export type ProviderMode = 'mock' | 'live' | 'disabled';
