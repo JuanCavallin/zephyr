@@ -47,6 +47,10 @@ export function Nav({
           <Icon name="graph" />
           <span>Workflows</span>
         </NavLink>
+        <NavLink to="/board">
+          <Icon name="folder" />
+          <span>Task board</span>
+        </NavLink>
         <NavLink to="/runs">
           <Icon name="clock" />
           <span>Run history</span>

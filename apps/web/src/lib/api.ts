@@ -30,8 +30,11 @@ import type {
   BenchmarkReport,
   GraphReuseReport,
   ToolLifecycleEvent,
+  Assignee,
+  Task,
 } from '@htn/shared';
 export type { BrowserViewer } from '@htn/shared';
+import type { BoardEditOp, BoardSnapshot, InboxItem } from './board';
 
 export interface CredentialStatus {
   providerId: string;
@@ -354,6 +357,43 @@ export const api = {
   /** "Save as a new task": fork the graph THIS run executed into a new document. */
   saveRunAsGraph: (id: string) =>
     request<{ graph: AgentGraph }>('/runs/' + id + '/save-as-graph', { method: 'POST' }),
+
+  /* ------------------------------------------------------------ Task board */
+
+  createBoard: (body: { request: string; repoFiles?: string[]; private?: boolean; base?: string }) =>
+    request<BoardSnapshot>('/tasks', { method: 'POST', body: JSON.stringify(body) }),
+
+  board: (boardId: string) => request<BoardSnapshot>('/tasks/' + encodeURIComponent(boardId)),
+
+  /** split / merge / reorder / scope / update / pin, applied atomically. */
+  editBoard: (boardId: string, ops: BoardEditOp[]) =>
+    request<BoardSnapshot>('/tasks/' + encodeURIComponent(boardId), {
+      method: 'PATCH',
+      body: JSON.stringify({ ops }),
+    }),
+
+  runReadyTasks: (boardId: string, body: { concurrency?: number; autoMergeGreen?: boolean } = {}) =>
+    request<unknown>('/tasks/' + encodeURIComponent(boardId) + '/run', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+
+  cancelBoard: (boardId: string) =>
+    request<BoardSnapshot>('/tasks/' + encodeURIComponent(boardId) + '/cancel', { method: 'POST' }),
+
+  resumeTask: (boardId: string, taskId: string, assignee?: Assignee) =>
+    request<{ task: Task }>(
+      '/tasks/' + encodeURIComponent(boardId) + '/tasks/' + encodeURIComponent(taskId) + '/resume',
+      { method: 'POST', body: JSON.stringify(assignee ? { assignee } : {}) },
+    ),
+
+  decideExtension: (boardId: string, requestId: string, outcome: 'approve' | 'reject') =>
+    request<unknown>(
+      '/tasks/' + encodeURIComponent(boardId) + '/extensions/' + encodeURIComponent(requestId),
+      { method: 'POST', body: JSON.stringify({ outcome }) },
+    ),
+
+  inbox: () => request<{ items: InboxItem[] }>('/tasks/inbox'),
 
   decide: (approvalId: string, decision: ApprovalDecision) =>
     request<{ approval: Approval }>('/approvals/' + approvalId + '/decide', {

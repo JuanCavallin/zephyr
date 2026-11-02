@@ -1,6 +1,7 @@
 import { Link, Route, Routes, useLocation } from 'react-router-dom';
 import { AppShell } from './components/layout/AppShell';
 import { Benchmarks } from './pages/Benchmarks';
+import { BoardHome, BoardPage } from './pages/Board';
 import { Compare } from './pages/Compare';
 import { Connections } from './pages/Connections';
 import { GraphEditor } from './pages/GraphEditor';
@@ -15,6 +16,8 @@ export function App() {
         <Route path="/" element={<Workspace key={location.key} />} />
         <Route path="/runs" element={<RunHistory />} />
         <Route path="/runs/:id" element={<LiveRunWorkspace key={location.pathname} />} />
+        <Route path="/board" element={<BoardHome />} />
+        <Route path="/board/:id" element={<BoardPage key={location.pathname} />} />
         <Route path="/connections" element={<Connections />} />
         <Route path="/compare" element={<Compare />} />
         <Route path="/benchmarks" element={<Benchmarks />} />

@@ -10,7 +10,8 @@
     "typecheck": "tsc --noEmit",
     "test": "node --experimental-strip-types --test \"tests/*.test.mjs\"",
     "test:browser": "node tests/workspace.browser.mjs",
-    "test:actions-browser": "node tests/actions.browser.mjs"
+    "test:actions-browser": "node tests/actions.browser.mjs",
+    "test:board-browser": "node tests/board.browser.mjs"
   },
   "dependencies": {
     "@htn/shared": "workspace:*",

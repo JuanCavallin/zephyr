@@ -106,19 +106,21 @@ export function AppShell({ children }: { children: ReactNode }) {
               </Link>
               <span className="breadcrumb-divider">/</span>
               <strong>
-                {location.pathname.startsWith('/graphs')
-                  ? 'Workflows'
-                  : location.pathname === '/runs'
-                    ? 'Run history'
-                    : location.pathname.startsWith('/runs/')
-                      ? 'Execution'
-                      : location.pathname === '/connections'
-                        ? 'Connections'
-                        : location.pathname === '/compare'
-                          ? 'Compare'
-                          : location.pathname === '/benchmarks'
-                            ? 'Benchmarks'
-                            : 'Conversation'}
+                {location.pathname.startsWith('/board')
+                  ? 'Task board'
+                  : location.pathname.startsWith('/graphs')
+                    ? 'Workflows'
+                    : location.pathname === '/runs'
+                      ? 'Run history'
+                      : location.pathname.startsWith('/runs/')
+                        ? 'Execution'
+                        : location.pathname === '/connections'
+                          ? 'Connections'
+                          : location.pathname === '/compare'
+                            ? 'Compare'
+                            : location.pathname === '/benchmarks'
+                              ? 'Benchmarks'
+                              : 'Conversation'}
               </strong>
             </div>
             <button
