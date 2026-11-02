@@ -2,10 +2,12 @@ import type {
   ActionPolicy,
   ActionPolicyRecommendation,
   AuthorizationDecision,
+  CodingCompletionInput,
   CompletionDecision,
   CompletionJudgment,
   DecisionAdapter,
   DecisionState,
+  FlakyTestInput,
   ModelRoute,
   ModelSelectionDecision,
   ProviderCallContext,
@@ -35,6 +37,27 @@ export interface DecisionServiceOptions {
   minimumConfidence?: number;
   maximumTools?: number;
   now?: () => string;
+}
+
+/**
+ * Step 6 fallback rule on test status and budget. Never `done` while a test fails
+ * or approval is pending; `done` needs a non-empty diff.
+ */
+export function fallbackCodingCompletion(input: CodingCompletionInput): 'done' | 'continue' | 'blocked' {
+  if (input.pendingApprovals > 0) return 'blocked';
+  const failing = input.tests !== null && input.tests.failed > 0;
+  if (!failing && input.diff.files > 0) return 'done';
+  return input.turns < input.maxTurns ? 'continue' : 'blocked';
+}
+
+/** What a coding `done` must have behind it. */
+export function codingVerificationFailures(input: CodingCompletionInput): string[] {
+  const failures: string[] = [];
+  if (input.pendingApprovals > 0) failures.push('approvals-pending');
+  if (input.diff.files === 0) failures.push('empty-diff');
+  if (input.tests === null) failures.push('no-tests-ran');
+  else if (input.tests.failed > 0) failures.push('tests-failing');
+  return failures;
 }
 
 export class NoEligibleModelRouteError extends Error {
@@ -374,6 +397,99 @@ export class DecisionService {
       scores[file.path] = typeof value === 'number' && Number.isFinite(value) ? Math.max(0, Math.min(1, value)) : 0;
     }
     return { scores, reasonCodes: result.data.reasonCodes };
+  }
+
+  /**
+   * Step 6: Jev's relevance score per candidate test, or `null` when the caller
+   * must run every candidate (adapter lacks the operation, state is not
+   * remote-eligible, or the call failed). Mirrors `scoreFiles`.
+   */
+  async scoreTests(
+    eligibility: Pick<DecisionState, 'sanitizedForRemote' | 'dataLabels'>,
+    input: { task: string; changed: string[]; tests: { id: string; summary: string }[] },
+    ctx: ProviderCallContext,
+  ): Promise<{ scores: Record<string, number> | null; reasonCodes: string[] }> {
+    if (!this.adapter.scoreTests) {
+      return { scores: null, reasonCodes: ['jev-score-tests-unsupported', 'run-every-candidate'] };
+    }
+    if (this.adapter.mode === 'live' && !canSendToRemoteDecisionModel(eligibility)) {
+      return { scores: null, reasonCodes: ['remote-jev-ineligible', 'run-every-candidate'] };
+    }
+    if (input.tests.length === 0) return { scores: {}, reasonCodes: ['no-candidate-tests'] };
+    const result = await this.adapter.scoreTests(input, ctx);
+    if (!result.ok) {
+      return { scores: null, reasonCodes: ['jev-score-tests-failed', 'run-every-candidate'] };
+    }
+    const scores: Record<string, number> = {};
+    for (const test of input.tests) {
+      const value = result.data.scores[test.id];
+      scores[test.id] = typeof value === 'number' && Number.isFinite(value) ? Math.max(0, Math.min(1, value)) : 0;
+    }
+    return { scores, reasonCodes: result.data.reasonCodes };
+  }
+
+  /**
+   * Step 6: a coding run's completion verdict. Jev judges from the test digest,
+   * diff stat and turn count; without Jev the fallback rule decides, and that rule
+   * never says `done` while a test fails. As with `judgeCompletion`, Jev's verdict
+   * is not rewritten: `verified` reports whether the evidence backs a `done`.
+   */
+  async completionVerdict(
+    eligibility: Pick<DecisionState, 'sanitizedForRemote' | 'dataLabels'>,
+    input: CodingCompletionInput,
+    ctx: ProviderCallContext,
+  ): Promise<CompletionDecision & { source: 'jev' | 'fallback' }> {
+    const verificationFailures = codingVerificationFailures(input);
+    let judgment: CompletionJudgment | undefined;
+    let fallbackReason: string | undefined;
+    if (!this.adapter.judgeCodingCompletion) fallbackReason = 'jev-coding-completion-unsupported';
+    else if (this.adapter.mode === 'live' && !canSendToRemoteDecisionModel(eligibility)) {
+      fallbackReason = 'remote-jev-ineligible';
+    } else {
+      const result = await this.adapter.judgeCodingCompletion(input, ctx);
+      if (result.ok) judgment = result.data;
+      else fallbackReason = 'jev-coding-completion-failed';
+    }
+    const source = judgment ? ('jev' as const) : ('fallback' as const);
+    judgment ??= {
+      status: fallbackCodingCompletion(input),
+      confidence: 1,
+      probabilities: {},
+      reasonCodes: [fallbackReason!, 'deterministic-completion-fallback'],
+    };
+    const unverifiedDone = judgment.status === 'done' && verificationFailures.length > 0;
+    return {
+      ...judgment,
+      verified: judgment.status === 'done' && verificationFailures.length === 0,
+      verificationFailures,
+      ...(unverifiedDone ? { reasonCodes: [...judgment.reasonCodes, 'done-unverified'] } : {}),
+      source,
+    };
+  }
+
+  /**
+   * Step 6: is a failing test flaky? Jev's probability from the test's history;
+   * without Jev, or on any failure, the failure is treated as real.
+   */
+  async flakyVerdict(
+    eligibility: Pick<DecisionState, 'sanitizedForRemote' | 'dataLabels'>,
+    input: FlakyTestInput,
+    ctx: ProviderCallContext,
+  ): Promise<{ flaky: boolean; probability: number; reasonCodes: string[]; source: 'jev' | 'fallback' }> {
+    const real = (reason: string) => ({
+      flaky: false,
+      probability: 0,
+      reasonCodes: [reason, 'treat-failure-as-real'],
+      source: 'fallback' as const,
+    });
+    if (!this.adapter.judgeFlaky) return real('jev-flaky-unsupported');
+    if (this.adapter.mode === 'live' && !canSendToRemoteDecisionModel(eligibility)) {
+      return real('remote-jev-ineligible');
+    }
+    const result = await this.adapter.judgeFlaky(input, ctx);
+    if (!result.ok || !Number.isFinite(result.data.flakyProbability)) return real('jev-flaky-failed');
+    const probability = Math.max(0, Math.min(1, result.data.flakyProbability));
+    return { flaky: probability >= 0.5, probability, reasonCodes: result.data.reasonCodes, source: 'jev' };
   }
 
   private fallbackCompletion(checkpoint: SessionCheckpoint): 'continue' | 'blocked' {

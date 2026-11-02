@@ -359,6 +359,7 @@ const selectedTestSchema = z.object({
   score: unit.optional(),
   fallback: z.boolean(),
 });
+export type SelectedTest = z.infer<typeof selectedTestSchema>;
 
 /** Step 6: when a verification test run happened relative to the agent's change. */
 export const verifyPhaseSchema = z.enum(['before', 'after', 'full']);

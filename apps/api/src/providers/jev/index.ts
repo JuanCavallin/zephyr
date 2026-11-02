@@ -204,6 +204,71 @@ function createMock(cfg: ProviderConfig): DecisionAdapter {
         },
       );
     },
+    async scoreTests(input, ctx) {
+      // Deterministic: a test whose summary names a changed path is central; else
+      // the share of changed-path words it shares.
+      return mockCall(
+        'jev',
+        'score_tests',
+        cfg.mode,
+        ctx,
+        () => ({
+          scores: Object.fromEntries(
+            input.tests.map((test) => {
+              const text = test.id + ' ' + test.summary;
+              if (input.changed.some((path) => text.includes(path))) return [test.id, 0.9];
+              const candidate = text.replace(/[/\\._-]+/g, ' ');
+              const changed = input.changed.join(' ').replace(/[/\\._-]+/g, ' ');
+              const size = Math.max(1, words(candidate).size);
+              return [test.id, Math.min(0.6, overlapScore(changed, candidate) / Math.min(size, 6))];
+            }),
+          ),
+          reasonCodes: ['mock-test-relevance'],
+        }),
+        {
+          tokensIn: estimateTokens(input.changed.join(' ') + input.tests.map((t) => t.id + t.summary).join(' ')),
+          tokensOut: 4 * input.tests.length,
+        },
+      );
+    },
+    async judgeCodingCompletion(input, ctx) {
+      let status: CompletionStatus = 'done';
+      const canContinue = input.turns < input.maxTurns;
+      if (input.pendingApprovals > 0) status = 'blocked';
+      else if (input.tests && input.tests.failed > 0) status = canContinue ? 'continue' : 'blocked';
+      else if (input.diff.files === 0) status = canContinue ? 'continue' : 'blocked';
+      return mockCall(
+        'jev',
+        'judge_coding_completion',
+        cfg.mode,
+        ctx,
+        () => ({
+          status,
+          confidence: 0.86,
+          probabilities: { [status]: 0.86 },
+          reasonCodes: ['mock-coding-completion'],
+        }),
+        { tokensIn: estimateTokens(input.task) + 24, tokensOut: 8 },
+      );
+    },
+    async judgeFlaky(input, ctx) {
+      // Deterministic: a test that has passed and failed without this diff touching
+      // it flips; a test the diff touches is almost certainly a real failure.
+      const passes = input.history.filter((o) => o === 'pass').length;
+      const flips = input.history.slice(1).filter((o, i) => o !== input.history[i]).length;
+      const flaky =
+        input.touchedByDiff || input.history.length < 2 || passes === 0
+          ? 0.05
+          : Math.min(0.95, 0.3 + flips / input.history.length);
+      return mockCall(
+        'jev',
+        'judge_flaky',
+        cfg.mode,
+        ctx,
+        () => ({ flakyProbability: flaky, reasonCodes: ['mock-flaky-history'] }),
+        { tokensIn: estimateTokens(input.test) + input.history.length, tokensOut: 4 },
+      );
+    },
     async recommendActionPolicy(input, ctx) {
       let policy: ActionPolicy = 'auto';
       if (input.descriptor.baselineEffect === 'unknown') policy = 'deny';

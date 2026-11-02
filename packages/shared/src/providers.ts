@@ -185,6 +185,25 @@ export interface AgentRuntimeAdapter extends ProviderAdapter {
   ): Promise<PermissionVerdict>;
 }
 
+/** Step 6: what the coding completion judge sees. No file contents, no test output. */
+export interface CodingCompletionInput {
+  task: string;
+  /** Test digest of the latest run; `null` when no test ran this session. */
+  tests: { passed: number; failed: number; skipped: number } | null;
+  diff: { files: number; insertions: number; deletions: number };
+  turns: number;
+  maxTurns: number;
+  pendingApprovals: number;
+}
+
+/** Step 6: one failing test and its recent outcomes, oldest first. */
+export interface FlakyTestInput {
+  test: string;
+  history: ('pass' | 'fail')[];
+  /** Whether this run's diff touches the test or a file it covers. */
+  touchedByDiff: boolean;
+}
+
 export interface DecisionAdapter extends ProviderAdapter {
   /** Cheap, fast classify-or-route call. Deliberately tiny. */
   decide(
@@ -248,6 +267,34 @@ export interface DecisionAdapter extends ProviderAdapter {
     input: { task: string; files: { path: string; summary: string }[] },
     ctx: ProviderCallContext,
   ): Promise<ProviderResult<{ scores: Record<string, number>; reasonCodes: string[] }>>;
+
+  /**
+   * Step 6: rate each candidate test's relevance to a diff, in ONE request (one
+   * `score` question per test), normalized to 0..1 and keyed by test id. Optional:
+   * without it every candidate runs.
+   */
+  scoreTests?(
+    input: { task: string; changed: string[]; tests: { id: string; summary: string }[] },
+    ctx: ProviderCallContext,
+  ): Promise<ProviderResult<{ scores: Record<string, number>; reasonCodes: string[] }>>;
+
+  /**
+   * Step 6: done / continue / blocked for a coding run, from the test digest, the
+   * diff stat and the turn count. Optional: without it the fallback rule decides.
+   */
+  judgeCodingCompletion?(
+    input: CodingCompletionInput,
+    ctx: ProviderCallContext,
+  ): Promise<ProviderResult<import('./control.js').CompletionJudgment>>;
+
+  /**
+   * Step 6: probability that a failing test is flaky rather than a real failure,
+   * from its pass/fail history. Optional: without it every failure is real.
+   */
+  judgeFlaky?(
+    input: FlakyTestInput,
+    ctx: ProviderCallContext,
+  ): Promise<ProviderResult<{ flakyProbability: number; reasonCodes: string[] }>>;
 
   /**
    * Route a subtask BEFORE it starts: pick a model tier and filter the

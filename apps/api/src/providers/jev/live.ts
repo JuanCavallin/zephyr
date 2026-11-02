@@ -33,6 +33,13 @@ const FILE_RELEVANCE_LEVELS = [
   'Related; likely read or touched.',
   'Central; the change almost certainly happens or is tested here.',
 ] as const;
+/** Ordered scale for `score_tests` (step 6). */
+const TEST_RELEVANCE_LEVELS = [
+  'Unrelated; cannot fail because of this diff.',
+  'Distant; exercises the changed code only indirectly.',
+  'Related; exercises code the diff changes.',
+  'Direct; tests exactly what the diff changes.',
+] as const;
 
 function decisionSignal(signal?: AbortSignal): AbortSignal {
   const timeout = AbortSignal.timeout(JEV_TIMEOUT_MS);
@@ -630,6 +637,149 @@ export function createLiveJev(
     }
   };
 
+  /**
+   * Step 6: one `score` question per candidate test, in a single request. State is
+   * the task, the changed paths and a one-line summary per test (what it covers).
+   */
+  const scoreTests: NonNullable<DecisionAdapter['scoreTests']> = async (input, ctx) => {
+    const startedAt = Date.now();
+    try {
+      if (input.tests.length === 0) {
+        return {
+          ok: true,
+          data: { scores: {}, reasonCodes: ['no-candidate-tests'] },
+          meta: meta('score_tests', startedAt, LOCAL_PRECHECK_DESTINATION),
+        };
+      }
+      const levels = TEST_RELEVANCE_LEVELS;
+      const questions: Record<string, Experimental_EvaluationQuestion> = Object.fromEntries(
+        input.tests.map((test, index) => [
+          'test_' + index,
+          {
+            type: 'score' as const,
+            instructions: `How likely is test [${index}] ${test.id} to catch a regression in this diff?`,
+            criteria: levels,
+          },
+        ]),
+      );
+      const result = await evaluate({
+        model: await modelFor(ctx),
+        state: {
+          task: input.task,
+          changed: input.changed,
+          tests: input.tests.map((test, index) => ({ index, id: test.id, summary: test.summary })),
+        },
+        questions,
+        maxRetries,
+        abortSignal: decisionSignal(ctx.signal),
+      });
+      const scores: Record<string, number> = {};
+      input.tests.forEach((test, index) => {
+        const answer = result.answers['test_' + index];
+        if (!answer || answer.type !== 'score' || !Number.isFinite(answer.score)) {
+          throw new Error('Jev returned an invalid test score.');
+        }
+        scores[test.id] = Math.max(0, Math.min(1, answer.score / (levels.length - 1)));
+      });
+      return {
+        ok: true,
+        data: { scores, reasonCodes: ['jev-test-relevance'] },
+        meta: meta('score_tests', startedAt, destination, result.usage, result.providerMetadata),
+      };
+    } catch (error) {
+      return { ok: false, error: providerError(error), meta: meta('score_tests', startedAt, destination) };
+    }
+  };
+
+  /** Step 6: done / continue / blocked from the test digest, diff stat and turn count. */
+  const judgeCodingCompletion: NonNullable<DecisionAdapter['judgeCodingCompletion']> = async (
+    input,
+    ctx,
+  ) => {
+    const startedAt = Date.now();
+    try {
+      const result = await evaluate({
+        model: await modelFor(ctx),
+        state: {
+          task: input.task,
+          tests: input.tests,
+          diff: input.diff,
+          turns: input.turns,
+          maxTurns: input.maxTurns,
+          pendingApprovals: input.pendingApprovals,
+        },
+        questions: {
+          completion: {
+            type: 'choice',
+            instructions: 'Judge whether this coding task is done, should continue, or is blocked.',
+            criteria: {
+              done: 'The diff implements the task and the tests that ran pass.',
+              continue: 'Tests fail or the change is incomplete, and turns remain to fix it.',
+              blocked: 'Approval is pending, or no turns remain while work is unfinished.',
+            },
+          },
+        },
+        maxRetries,
+        abortSignal: decisionSignal(ctx.signal),
+      });
+      const answer = result.answers.completion;
+      if (!answer || answer.type !== 'choice') throw new Error('Jev returned an invalid completion judgment.');
+      if (!['done', 'continue', 'blocked'].includes(answer.choice)) {
+        throw new Error('Jev returned an unknown completion status.');
+      }
+      return {
+        ok: true,
+        data: {
+          status: answer.choice as CompletionStatus,
+          confidence: probabilityForChoice(answer.choice, answer.probabilities),
+          probabilities: answer.probabilities ?? {},
+          reasonCodes: ['jev-coding-completion'],
+        },
+        meta: meta('judge_coding_completion', startedAt, destination, result.usage, result.providerMetadata),
+      };
+    } catch (error) {
+      return {
+        ok: false,
+        error: providerError(error),
+        meta: meta('judge_coding_completion', startedAt, destination),
+      };
+    }
+  };
+
+  /** Step 6: probability a failing test is flaky, from its outcome history. */
+  const judgeFlaky: NonNullable<DecisionAdapter['judgeFlaky']> = async (input, ctx) => {
+    const startedAt = Date.now();
+    try {
+      const result = await evaluate({
+        model: await modelFor(ctx),
+        state: { test: input.test, history: input.history, touchedByDiff: input.touchedByDiff },
+        questions: {
+          flaky: {
+            type: 'boolean',
+            instructions:
+              'Is this failure flaky (intermittent, unrelated to the change) rather than a real regression?',
+          },
+        },
+        maxRetries,
+        abortSignal: decisionSignal(ctx.signal),
+      });
+      const answer = result.answers.flaky;
+      if (!answer || answer.type !== 'boolean' || !Number.isFinite(answer.probability)) {
+        throw new Error('Jev returned an invalid flaky judgment.');
+      }
+      return {
+        ok: true,
+        data: {
+          flakyProbability: Math.max(0, Math.min(1, answer.probability)),
+          reasonCodes: ['jev-flaky-history'],
+        },
+        meta: meta('judge_flaky', startedAt, destination, result.usage, result.providerMetadata),
+      };
+    } catch (error) {
+      return { ok: false, error: providerError(error), meta: meta('judge_flaky', startedAt, destination) };
+    }
+  };
+
   const route: DecisionAdapter['route'] = async (input, ctx) => {
     const startedAt = Date.now();
     try {
@@ -827,6 +977,24 @@ export function createLiveJev(
           ctx,
         )) as ProviderResult<TOut>;
       }
+      if (op === 'score_tests') {
+        return (await scoreTests(
+          input as Parameters<NonNullable<DecisionAdapter['scoreTests']>>[0],
+          ctx,
+        )) as ProviderResult<TOut>;
+      }
+      if (op === 'judge_coding_completion') {
+        return (await judgeCodingCompletion(
+          input as Parameters<NonNullable<DecisionAdapter['judgeCodingCompletion']>>[0],
+          ctx,
+        )) as ProviderResult<TOut>;
+      }
+      if (op === 'judge_flaky') {
+        return (await judgeFlaky(
+          input as Parameters<NonNullable<DecisionAdapter['judgeFlaky']>>[0],
+          ctx,
+        )) as ProviderResult<TOut>;
+      }
       if (op === 'judge_completion') {
         return (await judgeCompletion(
           input as Parameters<DecisionAdapter['judgeCompletion']>[0],
@@ -846,6 +1014,9 @@ export function createLiveJev(
     recommendActionPolicy,
     judgeCompletion,
     scoreFiles,
+    scoreTests,
+    judgeCodingCompletion,
+    judgeFlaky,
     route,
   };
 }
