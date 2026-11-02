@@ -4,6 +4,11 @@ import { mockBase, mockCall } from '../_mock.js';
 import { createLiveAnthropic } from './live.js';
 import { estimateCostCents } from './pricing.js';
 import { mockGraphFor } from './mockGraphs.js';
+import {
+  DECOMPOSE_POLICY_RULE,
+  heuristicPlan,
+  requestFromPrompt,
+} from '../../core/coordination/decompose.js';
 import { credentials } from '../../services/credentials.js';
 
 const CAPABILITIES: readonly Capability[] = ['text.model'];
@@ -40,6 +45,26 @@ function createMock(cfg: ProviderConfig): TextModelAdapter {
             tokensIn: jsonIn,
             tokensOut: jsonOut,
             estimatedCostCents: estimateCostCents(input.tier ?? 'standard', jsonIn, jsonOut),
+          },
+        );
+      }
+
+      // Task decomposition parses the reply too; the same deterministic-plan
+      // argument as graph synthesis applies (see core/coordination/decompose.ts).
+      if (input.json && ctx.policyRule === DECOMPOSE_POLICY_RULE) {
+        const plan = JSON.stringify(heuristicPlan(requestFromPrompt(input.prompt)));
+        const planIn = Math.ceil((input.prompt.length + (input.system?.length ?? 0)) / 4);
+        const planOut = Math.ceil(plan.length / 4);
+        return mockCall(
+          'anthropic',
+          'complete',
+          cfg.mode,
+          ctx,
+          () => ({ text: plan, tokensIn: planIn, tokensOut: planOut }),
+          {
+            tokensIn: planIn,
+            tokensOut: planOut,
+            estimatedCostCents: estimateCostCents(input.tier ?? 'standard', planIn, planOut),
           },
         );
       }
