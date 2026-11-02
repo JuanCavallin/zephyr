@@ -10,6 +10,7 @@
  *   3. Leases: grant, deny reasons, extension, expiry, hot files, broker integration.
  *   4. Hot-file intents: typed appliers, serial integrator, concurrent package.json edits.
  *   5. Routing: pin beats Jev, fallback rules, Jev down -> source fallback.
+ *   6. Merge queue: real git; green tasks merge, conflicts and red tests spawn fix tasks, approvals and signals.
  */
 
 process.env.PERSIST_TO_DISK = 'false';
@@ -682,6 +683,186 @@ await test('mock Jev routes like the rules on the clear cases', async () => {
   assert.ok(failed.assignee.kind === 'human' || failed.assignee.tier === 'frontier', 'escalated');
   const sum = Object.values(small.probabilities).reduce((a, b) => a + b, 0);
   assert.ok(Math.abs(sum - 1) < 1e-9, 'a distribution over every candidate');
+});
+
+console.log('6. merge queue');
+
+const { MergeQueue, MergeQueueError } = await import('../src/core/coordination/mergeQueue.js');
+const { execArgv } = await import('../src/services/publish.service.js');
+const { InMemorySignalLog } = await import('../src/core/learning/signals.mock.js');
+const { preferenceSignalSchema } = await import('@htn/shared');
+type MergeItem = import('../src/core/coordination/mergeQueue.js').MergeItem;
+type FixTaskRequest = import('../src/core/coordination/mergeQueue.js').FixTaskRequest;
+type MergeQueueDeps = import('../src/core/coordination/mergeQueue.js').MergeQueueDeps;
+
+const mqGit = async (cwd: string, ...args: string[]) => {
+  const r = await execArgv('git', args, { cwd });
+  assert.equal(r.code, 0, `git ${args.join(' ')}: ${r.stderr}`);
+  return r.stdout.trim();
+};
+
+/** A repo whose root is the integration worktree (on `main`), plus a worktree per task. */
+async function mqRepo(name: string) {
+  const root = join(scratch, name);
+  const repo = join(root, 'repo');
+  await mkdir(repo, { recursive: true });
+  await mqGit(repo, 'init', '-q', '-b', 'main');
+  await mqGit(repo, 'config', 'user.name', 'Zephyr Check');
+  await mqGit(repo, 'config', 'user.email', 'check@zephyr.invalid');
+  await mqGit(repo, 'config', 'commit.gpgsign', 'false');
+  await mqGit(repo, 'config', 'core.autocrlf', 'false');
+  await writeText(join(repo, 'README.md'), '# fixture\nline two\n');
+  await mqGit(repo, 'add', '-A');
+  await mqGit(repo, 'commit', '-q', '-m', 'init');
+  const task = async (id: string, files: Record<string, string>, over: Partial<Task> = {}): Promise<MergeItem> => {
+    const branch = 'zephyr/' + id;
+    const worktree = join(root, 'wt-' + id);
+    await mqGit(repo, 'worktree', 'add', '-q', '-b', branch, worktree, 'main');
+    for (const [p, c] of Object.entries(files)) {
+      await mkdir(join(worktree, p, '..'), { recursive: true });
+      await writeText(join(worktree, p), c);
+    }
+    return { task: makeTask(id, { status: 'review', assignee: { kind: 'agent', harness: 'codex', tier: 'cheap' }, ...over }), worktree, branch };
+  };
+  return { repo, task };
+}
+
+function mqDeps(repo: string, over: Partial<MergeQueueDeps> = {}) {
+  const fixes: FixTaskRequest[] = [];
+  const emitted: Array<{ taskId: string; outcome: string }> = [];
+  const evidence: string[] = [];
+  const signals = new InMemorySignalLog();
+  const deps: MergeQueueDeps = {
+    exec: execArgv,
+    integration: { worktree: repo, branch: 'main' },
+    runTests: async () => ({ passed: 3, failed: 0, failedTests: [] }),
+    evidence: (item) => void evidence.push(item.task.id),
+    createFixTask: (req) => {
+      fixes.push(req);
+      return { id: 'fix_' + req.parent.id };
+    },
+    signals,
+    emit: (r) => {
+      assert.ok(codingEventSchema.safeParse({ type: 'merge.result', ...r }).success, 'merge.result parses');
+      emitted.push({ taskId: r.taskId, outcome: r.outcome });
+    },
+    policy: { autoMergeGreen: true },
+    ...over,
+  };
+  return { deps, fixes, emitted, evidence, signals };
+}
+
+await test('three green tasks merge in enqueue order; each rebases onto the last', async () => {
+  const { repo, task } = await mqRepo('mq-green');
+  const items = [
+    await task('a', { 'src/a/index.ts': 'export const a = 1;\n' }),
+    await task('b', { 'src/b/index.ts': 'export const b = 2;\n' }),
+    await task('c', { 'src/c/index.ts': 'export const c = 3;\n' }),
+  ];
+  const { deps, emitted, evidence } = mqDeps(repo);
+  const queue = new MergeQueue(deps);
+  const results = await Promise.all(items.map((i) => queue.enqueue(i)));
+  assert.deepEqual(results.map((r) => r.outcome), ['merged', 'merged', 'merged']);
+  assert.deepEqual(emitted.map((e) => e.taskId), ['a', 'b', 'c']);
+  assert.deepEqual(evidence, ['a', 'b', 'c'], 'evidence attached before each merge');
+  const files = (await mqGit(repo, 'ls-files')).split(/\r?\n/);
+  for (const f of ['src/a/index.ts', 'src/b/index.ts', 'src/c/index.ts']) assert.ok(files.includes(f), f);
+  assert.equal(await mqGit(repo, 'rev-parse', 'HEAD'), results[2]!.commit);
+  const log = (await mqGit(repo, 'log', '--format=%s')).split(/\r?\n/);
+  assert.deepEqual(log, ['zephyr: c', 'zephyr: b', 'zephyr: a', 'init'], 'linear history, no merge commits');
+});
+
+await test('a conflicting task produces a fix task pinned to the same agent; main untouched', async () => {
+  const { repo, task } = await mqRepo('mq-conflict');
+  const first = await task('d', { 'README.md': '# fixture\nline two, by d\n' });
+  const second = await task('e', { 'README.md': '# fixture\nline two, by e\n' });
+  const { deps, fixes, emitted } = mqDeps(repo);
+  const queue = new MergeQueue(deps);
+  const [rd, re] = await Promise.all([queue.enqueue(first), queue.enqueue(second)]);
+  assert.equal(rd.outcome, 'merged');
+  assert.equal(re.outcome, 'conflict');
+  assert.equal(re.fixTaskId, 'fix_e');
+  assert.match(re.detail ?? '', /conflicts in README\.md/);
+  assert.equal(fixes.length, 1);
+  const fix = fixes[0]!;
+  assert.deepEqual(fix.assignee, second.task.assignee, 'back to the same agent');
+  assert.equal(fix.pinned, true);
+  assert.deepEqual(fix.context, { kind: 'conflict', files: ['README.md'], detail: re.detail });
+  assert.equal(await mqGit(repo, 'rev-parse', 'HEAD'), rd.commit, 'main holds only d');
+  assert.equal(await mqGit(second.worktree, 'status', '--porcelain'), '', 'rebase aborted cleanly');
+  assert.deepEqual(emitted.map((e) => e.outcome), ['merged', 'conflict']);
+});
+
+await test('failing tests block the merge and spawn a fix task', async () => {
+  const { repo, task } = await mqRepo('mq-red');
+  const item = await task('f', { 'src/f/index.ts': 'export const f = () => { throw 1; };\n' });
+  const before = await mqGit(repo, 'rev-parse', 'HEAD');
+  const { deps, fixes, evidence } = mqDeps(repo, {
+    runTests: async () => ({ passed: 2, failed: 1, failedTests: ['f.test.ts > f works'] }),
+  });
+  const r = await new MergeQueue(deps).enqueue(item);
+  assert.equal(r.outcome, 'tests_failed');
+  assert.equal(r.fixTaskId, 'fix_f');
+  assert.deepEqual(fixes[0]!.context, { kind: 'tests_failed', failedTests: ['f.test.ts > f works'], detail: r.detail });
+  assert.equal(await mqGit(repo, 'rev-parse', 'HEAD'), before, 'main did not move');
+  assert.deepEqual(evidence, [], 'no evidence for a red task');
+});
+
+await test('without auto-merge: pending approval parks; approved merges; rejected and revert record signals', async () => {
+  const { repo, task } = await mqRepo('mq-approval');
+  const g = await task('g', { 'src/g/index.ts': 'export const g = 1;\n' });
+  const h = await task('h', { 'src/h/index.ts': 'export const h = 1;\n' });
+  const verdicts: Record<string, 'pending' | 'rejected'> = { g: 'pending', h: 'rejected' };
+  const { deps, signals, fixes } = mqDeps(repo, {
+    policy: { autoMergeGreen: false },
+    approve: async (item) =>
+      verdicts[item.task.id] === 'pending'
+        ? { status: 'pending', approvalId: 'apr_' + item.task.id }
+        : { status: 'rejected', approvalId: 'apr_' + item.task.id, comment: 'no new modules' },
+  });
+  const queue = new MergeQueue(deps);
+  const before = await mqGit(repo, 'rev-parse', 'HEAD');
+  const [rg, rh] = await Promise.all([queue.enqueue(g), queue.enqueue(h)]);
+  assert.equal(rg.outcome, 'awaiting_approval');
+  assert.equal(rh.outcome, 'rejected');
+  assert.equal(await mqGit(repo, 'rev-parse', 'HEAD'), before, 'nothing merged without approval');
+  assert.deepEqual(queue.awaiting(), [{ taskId: 'g', approvalId: 'apr_g' }]);
+  const merged = await queue.resolveApproval('g', { outcome: 'approved' });
+  assert.equal(merged.outcome, 'merged');
+  assert.deepEqual(queue.awaiting(), []);
+  await assert.rejects(queue.resolveApproval('g', { outcome: 'approved' }), MergeQueueError);
+
+  const head = await queue.revert('g', merged.commit!);
+  assert.notEqual(head, merged.commit);
+  const list = signals.list();
+  assert.deepEqual(
+    list.map((s) => s.kind),
+    ['approval', 'revert'],
+  );
+  for (const s of list) assert.ok(preferenceSignalSchema.safeParse(s).success, 'signal parses');
+  assert.equal((list[0] as { outcome: string }).outcome, 'rejected');
+  assert.equal(list[0]!.taskId, 'h');
+  assert.equal(fixes.length, 0, 'a plain rejection spawns no fix');
+});
+
+await test('a revised approval records a signal and sends a fix task back', async () => {
+  const { repo, task } = await mqRepo('mq-revised');
+  const k = await task('k', { 'src/k/index.ts': 'export const k = 1;\n' });
+  const { deps, signals, fixes } = mqDeps(repo, {
+    policy: { autoMergeGreen: false },
+    approve: async () => ({ status: 'pending', approvalId: 'apr_k' }),
+  });
+  const queue = new MergeQueue(deps);
+  assert.equal((await queue.enqueue(k)).outcome, 'awaiting_approval');
+  const r = await queue.resolveApproval('k', { outcome: 'revised', comment: 'rename k to kappa' });
+  assert.equal(r.outcome, 'rejected');
+  assert.equal(r.fixTaskId, 'fix_k');
+  assert.deepEqual(fixes[0]!.context, { kind: 'revised', comment: 'rename k to kappa', detail: 'revision requested: rename k to kappa' });
+  assert.equal((signals.list()[0] as { outcome: string }).outcome, 'revised');
+  // No approval gate and no auto-merge is a configuration error, not a silent merge.
+  const { deps: bare } = mqDeps(repo, { policy: {} });
+  const m = await task('m', { 'src/m/index.ts': 'export const m = 1;\n' });
+  await assert.rejects(new MergeQueue(bare).enqueue(m), MergeQueueError);
 });
 
 console.log(`\n${passed} passed`);
