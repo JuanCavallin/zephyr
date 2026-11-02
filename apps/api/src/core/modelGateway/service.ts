@@ -20,6 +20,7 @@ import { waitWhilePaused } from '../pauseGate.js';
 import type { RegisteredTool } from '../tools/registry.js';
 import { modelRoutesFor } from './catalog.js';
 import type { ToolDescriptorCatalog } from './toolCatalog.js';
+import { DEFAULT_MAX_TOOL_CALLS_PER_TURN, TOOL_BUDGET_EXHAUSTED_INSTRUCTION } from './turnBudget.js';
 
 export interface OpenAiMessage {
   role: string;
@@ -99,25 +100,8 @@ export interface ModelGatewayOptions {
   routeAvailable?: (route: ModelRoute, ctx: ProviderCallContext) => boolean;
 }
 
-const DEFAULT_MAX_TOOL_CALLS_PER_TURN = 8;
-
-/**
- * Hermes's ACP adapter builds every agent with an unlimited per-prompt
- * iteration budget and ignores `agent.max_turns`, so one turn could chain
- * tool calls until the wall-clock budget ran out (35 calls in a single
- * 7-minute turn, observed live). The orchestrator's completion judge only runs
- * BETWEEN turns, so it never got a say. Once a turn spends its budget, the
- * next model call gets no tools and this instruction, the model answers in
- * text, Hermes ends the turn, and the judge decides whether to continue.
- *
- * It asks for a final answer, not a progress report: "list what is still
- * missing" turned every capped turn into a to-do list the judge then
- * (reasonably) sent back for another full turn.
- */
-const TOOL_BUDGET_EXHAUSTED_INSTRUCTION =
-  'Tool budget for this turn is used up; tools are unavailable. Do not call tools. ' +
-  'Give your final answer now from what you have found: the concrete results and their ' +
-  'sources. If a requested item could not be found, say so in one sentence.';
+// DEFAULT_MAX_TOOL_CALLS_PER_TURN and TOOL_BUDGET_EXHAUSTED_INSTRUCTION live in
+// turnBudget.ts: the Anthropic Messages passthrough applies the same budget.
 
 /**
  * Model calls a turn may make beyond one per allowed tool call: the final

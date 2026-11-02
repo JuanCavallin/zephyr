@@ -397,6 +397,26 @@ export const evidenceBundleSchema = z.object({
 export type EvidenceBundle = z.infer<typeof evidenceBundleSchema>;
 
 /* -------------------------------------------------------------------------- */
+/* Model gateway accounting (step 4, docs/cacp-04-model-gateway.md)           */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * One Anthropic Messages call's usage, split the way Anthropic bills it. The four
+ * counts are disjoint: `inputTokens` is the UNCACHED input only, so total input is
+ * `inputTokens + cacheCreationInputTokens + cacheReadInputTokens`.
+ */
+export const gatewayUsageSchema = z.object({
+  inputTokens: count,
+  outputTokens: count,
+  cacheCreationInputTokens: count,
+  cacheReadInputTokens: count,
+});
+export type GatewayUsage = z.infer<typeof gatewayUsageSchema>;
+
+export const gatewayBlockReasonSchema = z.enum(['token_budget', 'cost_budget']);
+export type GatewayBlockReason = z.infer<typeof gatewayBlockReasonSchema>;
+
+/* -------------------------------------------------------------------------- */
 /* Events (members of RunEvent in events.ts)                                  */
 /* -------------------------------------------------------------------------- */
 
@@ -453,6 +473,31 @@ export const codingEventSchema = z.discriminatedUnion('type', [
     entry: z.enum(['preference', 'skill']),
     id,
     reason: z.string().min(1),
+    at: iso,
+  }),
+  /** One `/v1/messages` call through the gateway, after its usage is known. */
+  z.object({
+    type: z.literal('gateway.call'),
+    runId: id,
+    callId: id,
+    model: z.string().min(1).optional(),
+    status: z.number().int(),
+    stream: z.boolean(),
+    usage: gatewayUsageSchema,
+    /** Absent when the model has no known price; never a guessed 0. */
+    costCents: z.number().nonnegative().optional(),
+    /** Run-level cache hit rate after this call, 0..1. */
+    runCacheHitRate: unit,
+    toolUses: count,
+    error: z.object({ type: z.string().min(1), message: z.string() }).optional(),
+    at: iso,
+  }),
+  /** The gateway refused to forward a call. The harness got an error, never silence. */
+  z.object({
+    type: z.literal('gateway.blocked'),
+    runId: id,
+    reason: gatewayBlockReasonSchema,
+    detail: z.string().min(1),
     at: iso,
   }),
   /** Claude Code `Stop` hook / ACP end-of-turn. `harness.turn` covers in-turn phases. */
