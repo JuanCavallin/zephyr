@@ -9,7 +9,9 @@ import type {
 
 const REMOTE_FORBIDDEN_LABELS = new Set<DataLabel>(['secret', 'local_only']);
 
-export function canSendToRemoteDecisionModel(state: DecisionState): boolean {
+export function canSendToRemoteDecisionModel(
+  state: Pick<DecisionState, 'sanitizedForRemote' | 'dataLabels'>,
+): boolean {
   return (
     state.sanitizedForRemote &&
     !state.dataLabels.some((label) => REMOTE_FORBIDDEN_LABELS.has(label))

@@ -240,6 +240,16 @@ export interface DecisionAdapter extends ProviderAdapter {
   ): Promise<ProviderResult<import('./control.js').CompletionJudgment>>;
 
   /**
+   * Step 5 L2: rate each candidate file's relevance to a coding task, in ONE
+   * request (one `score` question per file). Scores are normalized to 0..1 and
+   * keyed by path. Optional: an adapter without it gets the deterministic rank.
+   */
+  scoreFiles?(
+    input: { task: string; files: { path: string; summary: string }[] },
+    ctx: ProviderCallContext,
+  ): Promise<ProviderResult<{ scores: Record<string, number>; reasonCodes: string[] }>>;
+
+  /**
    * Route a subtask BEFORE it starts: pick a model tier and filter the
    * candidate tool list down to what the agent runtime is allowed to see.
    * This is the actual mechanism behind "expose only Jev-selected tools" —

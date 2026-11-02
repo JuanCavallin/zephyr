@@ -292,7 +292,9 @@ export type ControlDecisionOperation =
   | 'recommend_action_policy'
   /** Outbound-text authenticity check. Advisory and escalate-only. */
   | 'check_outbound_text'
-  | 'judge_completion';
+  | 'judge_completion'
+  /** Step 5 L2: one file picked into a coding task's context pack. */
+  | 'select_context_files';
 
 /** Persisted, UI-safe trace of one bounded control-plane decision. */
 export interface ControlDecisionRecord {

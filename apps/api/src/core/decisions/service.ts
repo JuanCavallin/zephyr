@@ -346,6 +346,36 @@ export class DecisionService {
     };
   }
 
+  /**
+   * Step 5 L2: Jev's relevance score per candidate file, or `null` when the
+   * caller must use its deterministic rank (adapter lacks the operation, state is
+   * not remote-eligible, or the call failed). Scores for paths that were not
+   * candidates are dropped; a missing candidate counts as 0.
+   */
+  async scoreFiles(
+    eligibility: Pick<DecisionState, 'sanitizedForRemote' | 'dataLabels'>,
+    input: { task: string; files: { path: string; summary: string }[] },
+    ctx: ProviderCallContext,
+  ): Promise<{ scores: Record<string, number> | null; reasonCodes: string[] }> {
+    if (!this.adapter.scoreFiles) {
+      return { scores: null, reasonCodes: ['jev-score-files-unsupported', 'deterministic-rank-fallback'] };
+    }
+    if (this.adapter.mode === 'live' && !canSendToRemoteDecisionModel(eligibility)) {
+      return { scores: null, reasonCodes: ['remote-jev-ineligible', 'deterministic-rank-fallback'] };
+    }
+    if (input.files.length === 0) return { scores: {}, reasonCodes: ['no-candidate-files'] };
+    const result = await this.adapter.scoreFiles(input, ctx);
+    if (!result.ok) {
+      return { scores: null, reasonCodes: ['jev-score-files-failed', 'deterministic-rank-fallback'] };
+    }
+    const scores: Record<string, number> = {};
+    for (const file of input.files) {
+      const value = result.data.scores[file.path];
+      scores[file.path] = typeof value === 'number' && Number.isFinite(value) ? Math.max(0, Math.min(1, value)) : 0;
+    }
+    return { scores, reasonCodes: result.data.reasonCodes };
+  }
+
   private fallbackCompletion(checkpoint: SessionCheckpoint): 'continue' | 'blocked' {
     if (checkpoint.pendingApprovalIds.length > 0) return 'blocked';
     return checkpoint.budget.stepsRemaining > 0 ? 'continue' : 'blocked';

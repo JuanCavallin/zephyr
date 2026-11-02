@@ -689,6 +689,54 @@ await test('a checkpoint failure fails the turn before the harness runs', async 
   assert.equal(existsSync(join(task.worktree, 'x.txt')), false, 'the harness never ran');
   await failing.cancelTask(started.data.taskId, { runId: run.runId, policyRule: 'check' });
 });
+await test('Step 5 L2: the context pack precedes the goal; a failing pack costs only the pack', async () => {
+  const calls: { task: string; worktree: string; runId: string }[] = [];
+  const packed = createClaudeCodeRuntime({
+    harness: mockPeerHarness({ harness: 'claudecode', env: claudeCodeHarness().env }),
+    workspaces: async () => workspaces,
+    apiBaseUrl,
+    gatewayUrl: 'http://127.0.0.1:1/never',
+    tokens,
+    requireGatewayCredentials: false,
+    stderr: 'ignore',
+    log: () => {},
+    contextPack: async (input, c) => {
+      calls.push({ ...input, runId: c.runId });
+      if (input.task.includes('boom')) throw new Error('index exploded');
+      // The mock peer runs the first prompt line: the pack must come first.
+      return { files: [], prompt: 'write:packed.txt=from-pack', source: 'jev', tokens: 6, cached: false, reasonCodes: [] };
+    },
+  });
+  const run = await seedRun('run_pack');
+  const started = await packed.startTask({ goal: 'write:goal.txt=from-goal' }, { ...run, policyRule: 'check' });
+  assert.ok(started.ok, JSON.stringify(started));
+  const task = packed.task(started.data.taskId)!;
+  await task.turn;
+  assert.equal(await readFile(join(task.worktree, 'packed.txt'), 'utf8'), 'from-pack');
+  assert.deepEqual(calls, [{ task: 'write:goal.txt=from-goal', worktree: task.worktree, runId: run.runId }]);
+  const polled = await packed.pollTask(started.data.taskId, { runId: run.runId, policyRule: 'check' });
+  assert.ok(polled.ok && polled.data.log?.some((l: string) => /context pack: 0 file\(s\), ~6 tokens, source=jev/.test(l)));
+  await packed.cancelTask(started.data.taskId, { runId: run.runId, policyRule: 'check' });
+
+  const run2 = await seedRun('run_pack_fail');
+  const second = await packed.startTask({ goal: 'write:plain.txt=boom' }, { ...run2, policyRule: 'check' });
+  assert.ok(second.ok, 'a pack failure never fails the task');
+  const task2 = packed.task(second.data.taskId)!;
+  await task2.turn;
+  assert.equal(await readFile(join(task2.worktree, 'plain.txt'), 'utf8'), 'boom');
+  await packed.cancelTask(second.data.taskId, { runId: run2.runId, policyRule: 'check' });
+
+  const run3 = await seedRun('run_pack_off');
+  const off = await packed.startTask(
+    { goal: 'write:off.txt=lever-off', levers: { contextPack: false } },
+    { ...run3, policyRule: 'check' },
+  );
+  assert.ok(off.ok);
+  await packed.task(off.data.taskId)!.turn;
+  assert.equal(calls.length, 2, 'levers.contextPack=false skips the builder');
+  assert.equal(await readFile(join(packed.task(off.data.taskId)!.worktree, 'off.txt'), 'utf8'), 'lever-off');
+  await packed.cancelTask(off.data.taskId, { runId: run3.runId, policyRule: 'check' });
+});
 await test('startTask requires a gateway credential by default', async () => {
   const strict = createClaudeCodeRuntime({
     harness: mockPeerHarness({ harness: 'claudecode' }),

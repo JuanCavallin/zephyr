@@ -181,6 +181,29 @@ function createMock(cfg: ProviderConfig): DecisionAdapter {
         },
       );
     },
+    async scoreFiles(input, ctx) {
+      // Deterministic: share of the file's path/summary words that appear in the task.
+      return mockCall(
+        'jev',
+        'score_files',
+        cfg.mode,
+        ctx,
+        () => ({
+          scores: Object.fromEntries(
+            input.files.map((file) => {
+              const candidate = file.path.replace(/[/\\._-]+/g, ' ') + ' ' + file.summary;
+              const size = Math.max(1, words(candidate).size);
+              return [file.path, Math.min(1, overlapScore(input.task, candidate) / Math.min(size, 6))];
+            }),
+          ),
+          reasonCodes: ['mock-file-relevance'],
+        }),
+        {
+          tokensIn: estimateTokens(input.task + input.files.map((f) => f.path + f.summary).join(' ')),
+          tokensOut: 4 * input.files.length,
+        },
+      );
+    },
     async recommendActionPolicy(input, ctx) {
       let policy: ActionPolicy = 'auto';
       if (input.descriptor.baselineEffect === 'unknown') policy = 'deny';

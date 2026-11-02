@@ -64,6 +64,7 @@ import { newId, nowIso } from '../../lib/ids.js';
 import { claudeCodeSettings, hookUrl } from './settings.js';
 import { offeredShapedKinds } from '../../core/tools/shaped/index.js';
 import { runWorktrees, type RunWorktrees } from '../../core/tools/shaped/worktrees.js';
+import { goalWithContextPack, type ContextPackBuilder } from '../../core/context/index.js';
 
 /** The claude-agent-acp release this Zephyr build was verified against. */
 export const CLAUDE_AGENT_ACP_VERSION = '0.99.1';
@@ -139,6 +140,8 @@ export interface ClaudeCodeRuntimeDeps {
   log?: (message: string) => void;
   /** Where shaped tools find a run's worktree (Step 5 L1). Defaults to the process registry. */
   worktrees?: RunWorktrees;
+  /** Step 5 L2: builds the Jev-ranked context pack prepended to the goal. */
+  contextPack?: ContextPackBuilder;
 }
 
 interface TaskRecord {
@@ -399,7 +402,21 @@ export function createClaudeCodeRuntime(deps: ClaudeCodeRuntimeDeps): ClaudeCode
           turn: Promise.resolve(),
         };
         tasks.set(record.taskId, record);
-        runTurn(record, input.context ? input.goal + '\n\nContext:\n' + JSON.stringify(input.context) : input.goal);
+        // Step 5 L2: a pack failure costs the pack, never the task.
+        let pack: Awaited<ReturnType<ContextPackBuilder>> | null = null;
+        if (levers.contextPack && deps.contextPack) {
+          try {
+            pack = await deps.contextPack({ task: input.goal, worktree: workspace.path }, ctx);
+            record.log.push(
+              `context pack: ${pack.files.length} file(s), ~${pack.tokens} tokens, source=${pack.source}` +
+                (pack.cached ? ' (cached)' : ''),
+            );
+          } catch (error) {
+            log('context pack failed: ' + (error as Error).message);
+          }
+        }
+        const goal = goalWithContextPack(input.goal, pack);
+        runTurn(record, input.context ? goal + '\n\nContext:\n' + JSON.stringify(input.context) : goal);
         return { ok: true, data: { taskId: record.taskId }, meta: meta('startTask', started, DESTINATION) };
       } catch (error) {
         if (token) deps.tokens.revoke(token);
@@ -508,6 +525,15 @@ export function createLiveClaudeCode(cfg: ProviderConfig): AgentRuntimeAdapter {
     workspaces: async () => (await import('../../services/workspaces.service.js')).workspaces(),
     approvals: async () => (await import('../../services/runtime.js')).toolApprovalGate,
     emit: async (runId, event) => (await import('../../services/runtime.js')).bus.emit(runId, event),
+    contextPack: async (input, ctx) => {
+      const runtime = await import('../../services/runtime.js');
+      const { createContextPackBuilder } = await import('../../core/context/index.js');
+      return createContextPackBuilder({
+        decisions: runtime.decisionService,
+        sessions: runtime.sessionStateService,
+        emit: (runId, event) => runtime.bus.emit(runId, event),
+      })(input, ctx);
+    },
     tokens: hookTokens,
     gatewayTokens: gatewayRunTokens,
     gatewayBudget: config.modelGateway.messagesBudget,

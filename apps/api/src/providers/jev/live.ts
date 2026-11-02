@@ -26,6 +26,13 @@ const TOOL_THRESHOLD = 0.5;
 const MAX_EXPOSED_TOOLS = 8;
 const LOCAL_PRECHECK_DESTINATION = 'local://jev-precheck';
 const JEV_TIMEOUT_MS = 20_000;
+/** Ordered scale for `score_files` (Step 5 L2); the answer is a float position on it. */
+const FILE_RELEVANCE_LEVELS = [
+  'Unrelated to the task.',
+  'Background only; skimming it would not change the change.',
+  'Related; likely read or touched.',
+  'Central; the change almost certainly happens or is tested here.',
+] as const;
 
 function decisionSignal(signal?: AbortSignal): AbortSignal {
   const timeout = AbortSignal.timeout(JEV_TIMEOUT_MS);
@@ -568,6 +575,61 @@ export function createLiveJev(
     }
   };
 
+  /**
+   * Step 5 L2: one `score` question per candidate file, all in a single request
+   * (latency is per request, not per question). The state is the task plus a
+   * one-line summary per file; Jev returns a position on an ordered scale, which
+   * is normalized to 0..1. Jev never sees file contents.
+   */
+  const scoreFiles: NonNullable<DecisionAdapter['scoreFiles']> = async (input, ctx) => {
+    const startedAt = Date.now();
+    try {
+      if (input.files.length === 0) {
+        return {
+          ok: true,
+          data: { scores: {}, reasonCodes: ['no-candidate-files'] },
+          meta: meta('score_files', startedAt, LOCAL_PRECHECK_DESTINATION),
+        };
+      }
+      const levels = FILE_RELEVANCE_LEVELS;
+      const questions: Record<string, Experimental_EvaluationQuestion> = Object.fromEntries(
+        input.files.map((file, index) => [
+          'file_' + index,
+          {
+            type: 'score' as const,
+            instructions: `How much does reading file [${index}] ${file.path} help complete the task?`,
+            criteria: levels,
+          },
+        ]),
+      );
+      const result = await evaluate({
+        model: await modelFor(ctx),
+        state: {
+          task: input.task,
+          files: input.files.map((file, index) => ({ index, path: file.path, summary: file.summary })),
+        },
+        questions,
+        maxRetries,
+        abortSignal: decisionSignal(ctx.signal),
+      });
+      const scores: Record<string, number> = {};
+      input.files.forEach((file, index) => {
+        const answer = result.answers['file_' + index];
+        if (!answer || answer.type !== 'score' || !Number.isFinite(answer.score)) {
+          throw new Error('Jev returned an invalid file score.');
+        }
+        scores[file.path] = Math.max(0, Math.min(1, answer.score / (levels.length - 1)));
+      });
+      return {
+        ok: true,
+        data: { scores, reasonCodes: ['jev-file-relevance'] },
+        meta: meta('score_files', startedAt, destination, result.usage, result.providerMetadata),
+      };
+    } catch (error) {
+      return { ok: false, error: providerError(error), meta: meta('score_files', startedAt, destination) };
+    }
+  };
+
   const route: DecisionAdapter['route'] = async (input, ctx) => {
     const startedAt = Date.now();
     try {
@@ -759,6 +821,12 @@ export function createLiveJev(
           ctx,
         )) as ProviderResult<TOut>;
       }
+      if (op === 'score_files') {
+        return (await scoreFiles(
+          input as Parameters<NonNullable<DecisionAdapter['scoreFiles']>>[0],
+          ctx,
+        )) as ProviderResult<TOut>;
+      }
       if (op === 'judge_completion') {
         return (await judgeCompletion(
           input as Parameters<DecisionAdapter['judgeCompletion']>[0],
@@ -777,6 +845,7 @@ export function createLiveJev(
     selectTools,
     recommendActionPolicy,
     judgeCompletion,
+    scoreFiles,
     route,
   };
 }

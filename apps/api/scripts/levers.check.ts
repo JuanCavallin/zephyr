@@ -14,6 +14,15 @@
  *      cancellation, bad filter, missing command.
  *   5. Gate: raw test/build/lint shell runs are denied only for offered kinds;
  *      shaped descriptors resolve to verify/auto; broker end to end.
+ *
+ * L2 context pack (over a fixture git repo built in a temp dir)
+ *   6. Repo index: parsing, git and plain-directory listing, tree-hash
+ *      invalidation, index cache.
+ *   7. Candidates: path mention, symbols, imports, covering tests, co-change.
+ *   8. Pack: Jev path and fallback path, one scorer request, cache hit skips
+ *      Jev, every pick a control.decided event with its source, token cap.
+ *   9. DecisionService.scoreFiles fallbacks; only the sanitized objective
+ *      reaches a live Jev.
  */
 
 process.env.PERSIST_TO_DISK = 'false';
@@ -603,6 +612,402 @@ await test('a handle from another run is refused', async () => {
   } finally {
     worktrees.unbind('run_owner');
   }
+});
+
+/* -------------------------------------------------------------------------- */
+/* L2: Jev-ranked context pack                                                  */
+/* -------------------------------------------------------------------------- */
+
+console.log('\nL2 context pack');
+
+const { buildRepoIndex, parseSource, treeHash, isTestPath } = await import('../src/core/context/repoIndex.js');
+const { selectCandidates, splitWords, taskTerms } = await import('../src/core/context/candidates.js');
+const { buildContextPack, estimateTokens } = await import('../src/core/context/pack.js');
+const { createContextPackBuilder, goalWithContextPack } = await import('../src/core/context/index.js');
+const { create: createJev } = await import('../src/providers/jev/index.js');
+const { execFileSync } = await import('node:child_process');
+type RunEventL2 = import('@htn/shared').RunEvent;
+type ControlDecisionRecordL2 = import('@htn/shared').ControlDecisionRecord;
+type AgentSessionStateL2 = import('@htn/shared').AgentSessionState;
+type FileScorer = import('../src/core/context/pack.js').FileScorer;
+type ProviderConfigL2 = import('../src/config.js').ProviderConfig;
+
+const repoDir = join(scratch, 'repo');
+await mkdir(repoDir, { recursive: true });
+const gitIn = (...args: string[]) =>
+  execFileSync('git', ['-c', 'user.email=check@zephyr.local', '-c', 'user.name=check', '-c', 'commit.gpgsign=false', ...args], {
+    cwd: repoDir,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  }).toString();
+async function put(path: string, text: string): Promise<void> {
+  await mkdir(dirname(join(repoDir, path)), { recursive: true });
+  await writeFile(join(repoDir, path), text, 'utf8');
+}
+
+await put(
+  'src/auth/session.ts',
+  `/** Session lifecycle: refresh and expiry for signed-in users. */
+import { signToken } from './tokens.js';
+export function refreshSession(id: string) { return signToken(id); }
+export const SESSION_TTL_MS = 3600_000;
+`,
+);
+await put('src/auth/tokens.ts', `/** Token signing. */\nexport function signToken(subject: string) { return 'tok_' + subject; }\n`);
+await put('src/auth/session.test.ts', `import { refreshSession } from './session.js';\nrefreshSession('a');\n`);
+await put('src/auth/audit.ts', `export function auditLog(event: string) { return event; }\n`);
+await put('src/billing/invoice.ts', `/** Invoices and line items. */\nexport class Invoice { total = 0; }\n`);
+await put('src/util/format.ts', `export function formatMoney(cents: number) { return (cents / 100).toFixed(2); }\n`);
+await put('tools/report.py', `"""Monthly report generation."""\nfrom .helpers import load\ndef build_report():\n    return load()\n`);
+await put('tools/helpers.py', `def load():\n    return []\n`);
+await put('README.md', '# fixture\n');
+gitIn('init', '-q');
+gitIn('add', '-A');
+gitIn('commit', '-q', '-m', 'initial');
+await put('src/auth/session.ts', readFileSync(join(repoDir, 'src/auth/session.ts'), 'utf8') + '// grace window\n');
+await put('src/auth/audit.ts', `export function auditLog(event: string) { return 'audit:' + event; }\n`);
+gitIn('add', '-A');
+gitIn('commit', '-q', '-m', 'session audit');
+
+const TASK = 'Fix refreshSession so an expired session in src/auth/session.ts is renewed';
+
+await test('parseSource: TS exports, symbols, imports and doc; Python defs and relative imports', () => {
+  const ts = parseSource(
+    'a.ts',
+    `/** Does a thing. */\nimport x from './x.js';\nexport async function go() {}\nexport { a as b, c };\nconst local = 1;\nexport interface Shape {}\n`,
+  );
+  assert.deepEqual([...ts.exports].sort(), ['Shape', 'b', 'c', 'go']);
+  assert.ok(ts.symbols.includes('local'));
+  assert.deepEqual(ts.imports, ['./x.js']);
+  assert.equal(ts.doc, 'Does a thing.');
+  const py = parseSource('m.py', `"""Docs here."""\nfrom .h import f\nimport os\ndef run():\n  pass\ndef _private():\n  pass\n`);
+  assert.deepEqual(py.exports, ['run']);
+  assert.deepEqual([...py.imports].sort(), ['.h', 'os']);
+  assert.equal(py.doc, 'Docs here.');
+  assert.ok(isTestPath('src/a.test.ts') && isTestPath('tests/test_x.py') && isTestPath('pkg/x_test.go'));
+  assert.ok(!isTestPath('src/testing.ts'));
+});
+
+await test('task terms: paths, identifiers and camelCase words without stopwords', () => {
+  const terms = taskTerms(TASK);
+  assert.deepEqual(terms.paths, ['src/auth/session.ts']);
+  assert.ok(terms.identifiers.has('refreshSession'));
+  assert.deepEqual(splitWords('parseHTTPRequest_v2'), ['parse', 'http', 'request', 'v2']);
+  assert.ok(!terms.words.has('the') && !terms.words.has('so'));
+});
+
+await test('repo index: git listing, non-source skipped, cached until the tree changes', async () => {
+  const a = await buildRepoIndex(repoDir);
+  assert.equal(a.git, true);
+  assert.ok(a.files.some((f) => f.path === 'src/auth/session.ts'));
+  assert.ok(!a.files.some((f) => f.path === 'README.md'));
+  assert.strictEqual(await buildRepoIndex(repoDir), a, 'unchanged tree reuses the index');
+  await put('src/util/format.ts', 'export function formatMoney() { return "edited"; }\n');
+  const b = await buildRepoIndex(repoDir);
+  assert.notEqual(b.treeHash, a.treeHash, 'an uncommitted edit changes the tree hash');
+  gitIn('checkout', '--', 'src/util/format.ts');
+  assert.equal(await treeHash(repoDir), a.treeHash, 'reverting restores the hash');
+});
+
+await test('repo index without git: filesystem walk, hash tracks edits', async () => {
+  const plain = join(scratch, 'plain');
+  await mkdir(join(plain, 'lib'), { recursive: true });
+  await mkdir(join(plain, 'node_modules', 'dep'), { recursive: true });
+  await writeFile(join(plain, 'lib', 'one.ts'), 'export const one = 1;\n');
+  await writeFile(join(plain, 'node_modules', 'dep', 'index.js'), 'module.exports = 1;\n');
+  const index = await buildRepoIndex(plain);
+  assert.equal(index.git, false);
+  assert.deepEqual(
+    index.files.map((f) => f.path),
+    ['lib/one.ts'],
+  );
+  const before = index.treeHash;
+  await writeFile(join(plain, 'lib', 'one.ts'), 'export const one = 11;\n');
+  assert.notEqual(await treeHash(plain), before);
+});
+
+await test('candidates: path mention first, then imports, covering test, co-change; unrelated excluded', async () => {
+  const repo = await buildRepoIndex(repoDir);
+  const candidates = await selectCandidates(TASK, repo);
+  const paths = candidates.map((c) => c.path);
+  assert.equal(paths[0], 'src/auth/session.ts');
+  assert.ok(candidates[0]!.reasons.includes('path-mention'));
+  assert.equal(candidates[0]!.score, 1);
+  const reasonsOf = (p: string) => candidates.find((c) => c.path === p)?.reasons ?? [];
+  assert.ok(reasonsOf('src/auth/tokens.ts').some((r) => r.startsWith('imported-by:')));
+  assert.ok(reasonsOf('src/auth/session.test.ts').includes('covering-test'));
+  assert.ok(reasonsOf('src/auth/audit.ts').includes('co-changed'));
+  assert.ok(!paths.includes('src/billing/invoice.ts'));
+  assert.ok(!paths.includes('tools/report.py'));
+  assert.deepEqual(await selectCandidates(TASK, repo), candidates, 'deterministic');
+  const raws = candidates.map((c) => c.raw);
+  assert.deepEqual(raws, [...raws].sort((x, y) => y - x), 'ranked by score');
+});
+
+await test('candidates: Python relative imports widen from a seed; the cap holds', async () => {
+  const repo = await buildRepoIndex(repoDir);
+  const candidates = await selectCandidates('build_report output is empty', repo);
+  assert.equal(candidates[0]?.path, 'tools/report.py');
+  assert.ok(candidates.some((c) => c.path === 'tools/helpers.py' && c.reasons.some((r) => r.startsWith('imported-by:'))));
+  assert.ok((await selectCandidates(TASK, repo, 2)).length <= 2);
+  assert.deepEqual(await selectCandidates('zzz qqq', repo), [], 'no signal, no candidates');
+});
+
+function recorder() {
+  const events: ControlDecisionRecordL2[] = [];
+  return {
+    events,
+    emit: (_runId: string, event: RunEventL2) => {
+      if (event.type === 'control.decided') events.push(event.decision);
+    },
+  };
+}
+
+await test('pack fallback: no scorer -> deterministic rank, every pick a fallback decision event', async () => {
+  const repo = await buildRepoIndex(repoDir);
+  const rec = recorder();
+  const pack = await buildContextPack(TASK, repo, {
+    topK: 3,
+    run: { runId: 'run_l2', stepId: 'stp_1' },
+    emit: rec.emit,
+    cache: new Map(),
+  });
+  assert.equal(pack.source, 'fallback');
+  assert.equal(pack.files[0]!.path, 'src/auth/session.ts');
+  assert.equal(pack.files.length, 3);
+  assert.ok(pack.reasonCodes.includes('deterministic-rank-fallback'));
+  assert.equal(rec.events.length, 3);
+  for (const e of rec.events) {
+    assert.equal(e.operation, 'select_context_files');
+    assert.equal(e.source, 'fallback');
+    assert.equal(e.runId, 'run_l2');
+    assert.equal(e.stepId, 'stp_1');
+    assert.equal(e.selectedIds.length, 1);
+    assert.ok(e.candidateIds.includes(e.selectedIds[0]!));
+  }
+});
+
+await test('pack via Jev: one scorer call for all candidates, Jev order wins, unrelated dropped', async () => {
+  const repo = await buildRepoIndex(repoDir);
+  const rec = recorder();
+  const calls: Parameters<FileScorer>[0][] = [];
+  const scorer: FileScorer = async (input) => {
+    calls.push(input);
+    return {
+      scores: Object.fromEntries(
+        input.files.map((f) => [f.path, f.path === 'src/auth/tokens.ts' ? 1 : f.path === 'src/auth/session.ts' ? 0.66 : 0]),
+      ),
+      reasonCodes: ['jev-file-relevance'],
+    };
+  };
+  const pack = await buildContextPack(TASK, repo, { scorer, run: { runId: 'run_l2' }, emit: rec.emit, cache: new Map() });
+  assert.equal(calls.length, 1, 'a single request');
+  assert.ok(calls[0]!.files.length > 2);
+  assert.ok(calls[0]!.files.some((f) => f.summary.includes('refreshSession')), 'summaries carry exports');
+  assert.ok(!calls[0]!.files.some((f) => f.summary.includes("'tok_'")), 'never file contents');
+  assert.equal(pack.source, 'jev');
+  assert.deepEqual(
+    pack.files.map((f) => f.path),
+    ['src/auth/tokens.ts', 'src/auth/session.ts'],
+  );
+  assert.equal(rec.events.length, 2);
+  assert.ok(rec.events.every((e) => e.source === 'jev'));
+  assert.equal(rec.events[0]!.confidence, 1);
+});
+
+await test('pack cache: same task and tree skip Jev; a fallback is not cached', async () => {
+  const repo = await buildRepoIndex(repoDir);
+  const cache = new Map();
+  let calls = 0;
+  const scorer: FileScorer = async (input) => {
+    calls++;
+    return {
+      scores: Object.fromEntries(input.files.map((f, i) => [f.path, i === 0 ? 1 : 0.5])),
+      reasonCodes: ['jev-file-relevance'],
+    };
+  };
+  const first = await buildContextPack(TASK, repo, { scorer, cache });
+  const rec = recorder();
+  const second = await buildContextPack(TASK, repo, { scorer, cache, run: { runId: 'run_cache' }, emit: rec.emit });
+  assert.equal(calls, 1, 'the cache hit made no scorer call');
+  assert.equal(first.cached, false);
+  assert.equal(second.cached, true);
+  assert.equal(second.prompt, first.prompt);
+  assert.ok(rec.events.length > 0);
+  assert.ok(rec.events.every((e) => e.source === 'jev' && e.reasonCodes.includes('context-pack-cache-hit')));
+  await buildContextPack('a different task about refreshSession', repo, { scorer, cache });
+  assert.equal(calls, 2, 'a different task misses');
+
+  let nullCalls = 0;
+  const unavailable: FileScorer = async () => {
+    nullCalls++;
+    return { scores: null, reasonCodes: ['remote-jev-ineligible', 'deterministic-rank-fallback'] };
+  };
+  const fallbackCache = new Map();
+  await buildContextPack(TASK, repo, { scorer: unavailable, cache: fallbackCache });
+  const again = await buildContextPack(TASK, repo, { scorer: unavailable, cache: fallbackCache });
+  assert.equal(nullCalls, 2);
+  assert.equal(again.cached, false);
+  assert.equal(again.source, 'fallback');
+  assert.deepEqual(again.reasonCodes, ['remote-jev-ineligible', 'deterministic-rank-fallback']);
+});
+
+await test('pack: a throwing scorer degrades to the deterministic rank', async () => {
+  const repo = await buildRepoIndex(repoDir);
+  const pack = await buildContextPack(TASK, repo, {
+    scorer: async () => {
+      throw new Error('gateway down');
+    },
+    cache: new Map(),
+  });
+  assert.equal(pack.source, 'fallback');
+  assert.equal(pack.files[0]!.path, 'src/auth/session.ts');
+  assert.ok(pack.reasonCodes.some((c) => c.startsWith('context-scorer-threw:gateway down')));
+});
+
+await test('pack prompt: map plus full text of the top files, always under the token cap', async () => {
+  const repo = await buildRepoIndex(repoDir);
+  const roomy = await buildContextPack(TASK, repo, { cache: new Map() });
+  assert.match(roomy.prompt, /^Repository context/);
+  assert.ok(roomy.prompt.includes('- src/auth/session.ts — Session lifecycle'));
+  assert.ok(roomy.prompt.includes('--- src/auth/session.ts ---\n/** Session lifecycle'), 'top file inlined');
+  assert.equal(roomy.tokens, estimateTokens(roomy.prompt));
+  assert.ok((roomy.prompt.match(/^--- /gm) ?? []).length <= 3, 'at most three files inlined');
+  for (const cap of [40, 80, 160]) {
+    const tight = await buildContextPack(TASK, repo, { tokenCap: cap, cache: new Map() });
+    assert.ok(tight.tokens <= cap, `prompt ${tight.tokens} tokens under cap ${cap}`);
+  }
+  const mapOnly = await buildContextPack(TASK, repo, { tokenCap: 80, cache: new Map() });
+  assert.ok(!mapOnly.prompt.includes('\n--- '), 'no file fits, none inlined, none truncated');
+  const empty = await buildContextPack('zzz qqq', repo, { cache: new Map() });
+  assert.equal(empty.prompt, '');
+  assert.deepEqual(empty.reasonCodes, ['no-candidate-files']);
+  assert.equal(goalWithContextPack('do it', empty), 'do it');
+  assert.equal(goalWithContextPack('do it', { prompt: 'CTX' }), 'CTX\n\nTask:\ndo it');
+  assert.equal(goalWithContextPack('do it', null), 'do it');
+});
+
+const okL2 = <T>(data: T, op: string) => ({
+  ok: true as const,
+  data,
+  meta: { provider: 'jev' as const, op, mode: 'live' as const, latencyMs: 0, destination: 'gateway' },
+});
+function jevStub(mode: 'live' | 'mock', scoreFiles?: DecisionAdapter['scoreFiles']): DecisionAdapter {
+  return { id: 'jev', mode, capabilities: ['decision'], ...(scoreFiles ? { scoreFiles } : {}) } as unknown as DecisionAdapter;
+}
+const callCtx = { runId: 'run_l2', policyRule: 'check' } as Parameters<NonNullable<DecisionAdapter['scoreFiles']>>[1];
+const twoFiles = {
+  task: 'refresh session',
+  files: [
+    { path: 'a.ts', summary: 'session' },
+    { path: 'b.ts', summary: '' },
+  ],
+};
+const sanitized = { sanitizedForRemote: true, dataLabels: [] };
+
+await test('DecisionService.scoreFiles: unsupported, ineligible and failed calls fall back', async () => {
+  assert.deepEqual(await new DecisionService(jevStub('live')).scoreFiles(sanitized, twoFiles, callCtx), {
+    scores: null,
+    reasonCodes: ['jev-score-files-unsupported', 'deterministic-rank-fallback'],
+  });
+  let called = false;
+  const live = new DecisionService(
+    jevStub('live', (async () => {
+      called = true;
+      return okL2({ scores: { 'a.ts': 1 }, reasonCodes: ['jev-file-relevance'] }, 'score_files');
+    }) as never),
+  );
+  for (const state of [
+    { sanitizedForRemote: false, dataLabels: [] },
+    { sanitizedForRemote: true, dataLabels: ['secret'] },
+    { sanitizedForRemote: true, dataLabels: ['local_only'] },
+  ]) {
+    assert.deepEqual(await live.scoreFiles(state as never, twoFiles, callCtx), {
+      scores: null,
+      reasonCodes: ['remote-jev-ineligible', 'deterministic-rank-fallback'],
+    });
+  }
+  assert.equal(called, false, 'nothing leaves for an ineligible state');
+  const failing = new DecisionService(
+    jevStub('live', (async () => ({
+      ok: false as const,
+      error: { code: 'UPSTREAM', message: 'boom', retryable: true },
+      meta: { provider: 'jev', op: 'score_files', mode: 'live', latencyMs: 0, destination: 'gateway' },
+    })) as never),
+  );
+  assert.deepEqual(await failing.scoreFiles(sanitized, twoFiles, callCtx), {
+    scores: null,
+    reasonCodes: ['jev-score-files-failed', 'deterministic-rank-fallback'],
+  });
+});
+
+await test('DecisionService.scoreFiles: scores clamped, non-candidates dropped, missing -> 0', async () => {
+  const svc = new DecisionService(
+    jevStub('live', (async () =>
+      okL2({ scores: { 'a.ts': 1.7, 'z.ts': 1, 'b.ts': Number.NaN }, reasonCodes: ['jev-file-relevance'] }, 'score_files')) as never),
+  );
+  assert.deepEqual(await svc.scoreFiles(sanitized, twoFiles, callCtx), {
+    scores: { 'a.ts': 1, 'b.ts': 0 },
+    reasonCodes: ['jev-file-relevance'],
+  });
+  assert.deepEqual(await svc.scoreFiles(sanitized, { task: 't', files: [] }, callCtx), {
+    scores: {},
+    reasonCodes: ['no-candidate-files'],
+  });
+});
+
+await test('mock Jev adapter scores files deterministically from task overlap', async () => {
+  const jev = createJev({ mode: 'mock' } as ProviderConfigL2);
+  const result = await jev.scoreFiles!(
+    {
+      task: 'refresh the session token',
+      files: [
+        { path: 'src/auth/session.ts', summary: 'exports refreshSession' },
+        { path: 'src/billing/invoice.ts', summary: 'exports Invoice' },
+      ],
+    },
+    callCtx,
+  );
+  assert.ok(result.ok);
+  if (!result.ok) return;
+  assert.ok(result.data.scores['src/auth/session.ts']! > result.data.scores['src/billing/invoice.ts']!);
+  assert.equal(result.data.scores['src/billing/invoice.ts'], 0);
+});
+
+await test('builder: Jev sees the sanitized objective; no session or a secret label means fallback', async () => {
+  const seen: string[] = [];
+  const adapter = jevStub('live', (async (input: { task: string; files: { path: string }[] }) => {
+    seen.push(input.task);
+    return okL2(
+      { scores: Object.fromEntries(input.files.map((f) => [f.path, 1])), reasonCodes: ['jev-file-relevance'] },
+      'score_files',
+    );
+  }) as never);
+  const session = (labels: string[]) =>
+    ({
+      context: [],
+      objective: TASK,
+      sanitizedObjective: 'Renew expired sessions in the auth module',
+      dataLabels: labels,
+    }) as unknown as AgentSessionStateL2;
+  const rec = recorder();
+  const build = (labels: string[] | null) =>
+    createContextPackBuilder({
+      decisions: new DecisionService(adapter),
+      sessions: { get: async () => (labels ? session(labels) : null) },
+      emit: rec.emit,
+      options: { cache: new Map() },
+    });
+  const noSession = await build(null)({ task: TASK, worktree: repoDir }, { ...callCtx, sessionStateId: 'ses_x' });
+  assert.equal(noSession.source, 'fallback');
+  assert.equal(seen.length, 0);
+  const secret = await build(['secret'])({ task: TASK, worktree: repoDir }, { ...callCtx, sessionStateId: 'ses_x' });
+  assert.equal(secret.source, 'fallback');
+  assert.equal(seen.length, 0);
+  const clean = await build([])({ task: TASK, worktree: repoDir }, { ...callCtx, stepId: 'stp_9', sessionStateId: 'ses_x' });
+  assert.equal(clean.source, 'jev');
+  assert.deepEqual(seen, ['Renew expired sessions in the auth module'], 'the raw task never left');
+  assert.ok(rec.events.some((e) => e.source === 'jev' && e.stepId === 'stp_9'));
+  assert.ok(rec.events.some((e) => e.source === 'fallback'));
 });
 
 await rm(scratch, { recursive: true, force: true }).catch(() => undefined);
