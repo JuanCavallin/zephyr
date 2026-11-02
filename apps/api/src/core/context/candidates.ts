@@ -104,14 +104,14 @@ function resolvePythonImport(from: string, spec: string, paths: Set<string>): st
   return null;
 }
 
-function importsOf(file: IndexedFile, paths: Set<string>): string[] {
+export function importsOf(file: IndexedFile, paths: Set<string>): string[] {
   const py = file.path.endsWith('.py');
   return file.imports
     .map((spec) => (py ? resolvePythonImport(file.path, spec, paths) : resolveImport(file.path, spec, paths)))
     .filter((p): p is string => p !== null && p !== file.path);
 }
 
-function stemOf(path: string): string {
+export function stemOf(path: string): string {
   return posix
     .basename(path)
     .replace(/\.[^.]+$/, '')

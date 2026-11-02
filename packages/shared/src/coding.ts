@@ -353,6 +353,17 @@ const usageSchema = z.object({
 
 const testTallySchema = z.object({ passed: count, failed: count, skipped: count });
 
+const selectedTestSchema = z.object({
+  id,
+  /** Jev relevance score; absent when the deterministic fallback chose it. */
+  score: unit.optional(),
+  fallback: z.boolean(),
+});
+
+/** Step 6: when a verification test run happened relative to the agent's change. */
+export const verifyPhaseSchema = z.enum(['before', 'after', 'full']);
+export type VerifyPhase = z.infer<typeof verifyPhaseSchema>;
+
 /** `evidence.json` for a run that reached `done` (spec §3 Evidence bundle). */
 export const evidenceBundleSchema = z.object({
   id,
@@ -367,14 +378,7 @@ export const evidenceBundleSchema = z.object({
   }),
   checkpoints: z.array(z.object({ turnId: id, ref: z.string().min(1), at: iso })),
   tests: z.object({
-    selected: z.array(
-      z.object({
-        id,
-        /** Jev relevance score; absent when the deterministic fallback chose it. */
-        score: unit.optional(),
-        fallback: z.boolean(),
-      }),
-    ),
+    selected: z.array(selectedTestSchema),
     before: testTallySchema.optional(),
     after: testTallySchema,
     added: z.array(repoPathSchema),
@@ -518,6 +522,27 @@ export const codingEventSchema = z.discriminatedUnion('type', [
     taskId: id.optional(),
     at: iso,
   }),
+  /** Step 6: a per-turn worktree checkpoint, so evidence can list them from the trace. */
+  z.object({
+    type: z.literal('workspace.checkpoint'),
+    runId: id,
+    turnId: id,
+    ref: z.string().min(1),
+    treeHash: z.string().min(1).optional(),
+    at: iso,
+  }),
+  /** Step 6: one verification test run (selected tests before/after the change, or the full suite). */
+  z.object({
+    type: z.literal('verify.tests'),
+    runId: id,
+    phase: verifyPhaseSchema,
+    selected: z.array(selectedTestSchema),
+    /** Who chose `selected`: Jev scores, the deterministic fallback, or the whole suite. */
+    source: z.enum(['jev', 'fallback', 'full']),
+    tally: testTallySchema,
+    failedTests: z.array(z.string().min(1)).optional(),
+    at: iso,
+  }),
 ]);
 export type CodingEvent = z.infer<typeof codingEventSchema>;
 export type CodingEventType = CodingEvent['type'];
@@ -585,4 +610,41 @@ export const DEFAULT_LEVERS: Levers = Object.freeze({
 /** Defaults with any explicitly set lever overriding them. */
 export function resolveLevers(partial?: Partial<Levers> | null): Levers {
   return { ...DEFAULT_LEVERS, ...Object.fromEntries(Object.entries(partial ?? {}).filter(([, v]) => typeof v === 'boolean')) };
+}
+
+/* -------------------------------------------------------------------------- */
+/* Verification policy (step 6, docs/cacp-06-verification-and-evidence.md)    */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * What a run must prove before it publishes, and which paths it may not quietly edit.
+ *
+ * - `protectDefaults`: guard pre-existing test files, snapshots, CI config, lint
+ *   config and lockfiles. Edits to them need an approval carrying the exact diff.
+ * - `protectedGlobs`: extra repo-relative globs guarded the same way.
+ * - `alwaysRun`: test ids (repo paths) or globs selected on every run.
+ * - `fullSuiteBeforePublish`: run every test before `git.publish`; a failure blocks it.
+ * - `coverageMap`: optional source path → test ids that cover it. When present it
+ *   replaces the import-graph heuristic for those sources.
+ */
+export const verifyPolicySchema = z.object({
+  protectDefaults: z.boolean(),
+  protectedGlobs: z.array(repoPathSchema),
+  alwaysRun: z.array(repoPathSchema),
+  fullSuiteBeforePublish: z.boolean(),
+  coverageMap: z.record(z.string().min(1), z.array(z.string().min(1))).optional(),
+});
+export type VerifyPolicy = z.infer<typeof verifyPolicySchema>;
+
+export const DEFAULT_VERIFY_POLICY: VerifyPolicy = Object.freeze({
+  protectDefaults: true,
+  protectedGlobs: [],
+  alwaysRun: [],
+  fullSuiteBeforePublish: false,
+}) as VerifyPolicy;
+
+/** Defaults with any explicitly set field overriding them. Invalid input throws. */
+export function resolveVerifyPolicy(partial?: Partial<VerifyPolicy> | null): VerifyPolicy {
+  const set = Object.fromEntries(Object.entries(partial ?? {}).filter(([, v]) => v !== undefined));
+  return verifyPolicySchema.parse({ ...DEFAULT_VERIFY_POLICY, ...set });
 }

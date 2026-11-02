@@ -254,6 +254,16 @@ await test('coding events parse; unknown type rejected', () => {
       at: AT,
     },
     { type: 'gateway.blocked', runId: 'run_1', reason: 'token_budget', detail: 'run used 4308 of 1000 tokens', at: AT },
+    { type: 'workspace.checkpoint', runId: 'run_1', turnId: 't1', ref: 'refs/zephyr/checkpoints/run_1/1', at: AT },
+    {
+      type: 'verify.tests',
+      runId: 'run_1',
+      phase: 'after',
+      selected: [{ id: 'src/a.test.ts', score: 0.9, fallback: false }],
+      source: 'jev',
+      tally: { passed: 3, failed: 0, skipped: 0 },
+      at: AT,
+    },
   ];
   const covered = new Set(events.map((e) => e.type));
   for (const e of events) assert.deepEqual(parseRunEvent(JSON.parse(JSON.stringify(e))), e);
