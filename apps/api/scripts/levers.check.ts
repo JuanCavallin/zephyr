@@ -23,6 +23,14 @@
  *      Jev, every pick a control.decided event with its source, token cap.
  *   9. DecisionService.scoreFiles fallbacks; only the sanitized objective
  *      reaches a live Jev.
+ *
+ * L3 schema minimization
+ *  10. Task classifier and native-tool policy: deterministic, fails towards more
+ *      tools, never removes Read/Grep/Glob/Bash; one list feeds both the ACP
+ *      session `_meta` and the settings deny rules.
+ *  11. Stable tool set: a session replayed through the gateway (step 4 replay
+ *      harness) carries byte-identical `tools` on every request; a mid-run
+ *      change is flagged on `gateway.call`.
  */
 
 process.env.PERSIST_TO_DISK = 'false';
@@ -1008,6 +1016,189 @@ await test('builder: Jev sees the sanitized objective; no session or a secret la
   assert.deepEqual(seen, ['Renew expired sessions in the auth module'], 'the raw task never left');
   assert.ok(rec.events.some((e) => e.source === 'jev' && e.stepId === 'stp_9'));
   assert.ok(rec.events.some((e) => e.source === 'fallback'));
+});
+
+/* -------------------------------------------------------------------------- */
+/* L3 schema minimization                                                     */
+/* -------------------------------------------------------------------------- */
+
+console.log('\nL3 schema minimization');
+
+const { classifyTask, nativeToolPolicy, claudeCodeSessionMeta, NATIVE_TOOL_GROUPS } = await import(
+  '../src/core/tools/toolPolicy.js'
+);
+const { claudeCodeSettings } = await import('../src/providers/claudecode/settings.js');
+const { ToolSetTracker, toolsText, hashTools } = await import('../src/core/modelGateway/toolSet.js');
+const { AnthropicMessagesGateway } = await import('../src/core/modelGateway/messages.js');
+const { GatewayRunTokenStore } = await import('../src/core/modelGateway/runTokens.js');
+const { createReplayer, readAll, bytes } = await import('../src/core/modelGateway/replay/replayer.js');
+const fx = await import('../src/core/modelGateway/replay/fixtures.js');
+const { parseRunEvent } = await import('@htn/shared');
+
+/** Tools L3 must never take away: without them an agent cannot read or run anything. */
+const ALWAYS_KEPT = ['Bash', 'Glob', 'Grep', 'LS', 'Read', 'TodoWrite'];
+
+await test('classifier: edit verbs win, questions are read, ambiguity is edit', () => {
+  assert.equal(classifyTask('Fix refreshSession so an expired session is renewed').taskClass, 'edit');
+  assert.equal(classifyTask('Explain how the session cache is invalidated').taskClass, 'read');
+  assert.equal(classifyTask('Where is the invoice total computed?').taskClass, 'read');
+  assert.equal(classifyTask('Review src/auth and fix anything unsafe').taskClass, 'edit', 'read + edit = edit');
+  assert.equal(classifyTask('the session thing').taskClass, 'edit', 'no signal falls towards more tools');
+  assert.equal(classifyTask('Rename parseRow to parseRecord').taskClass, 'edit');
+});
+
+await test('classifier: web and notebook needs come from the task text only', () => {
+  assert.equal(classifyTask('Rename a helper in the webpack config').needsWeb, false, 'webpack is not the web');
+  assert.equal(classifyTask('Update the client to match https://example.com/api').needsWeb, true);
+  assert.equal(classifyTask('Look up the latest zod release notes online and upgrade').needsWeb, true);
+  assert.equal(classifyTask('Fix the plot in analysis.ipynb').needsNotebook, true);
+  assert.equal(classifyTask('Fix the plot in analysis.py').needsNotebook, false);
+});
+
+await test('policy: a pure refactor loses web, notebook, subagent and plan tools, keeps the rest', () => {
+  const p = nativeToolPolicy('Refactor the billing module into smaller functions');
+  assert.equal(p.taskClass, 'edit');
+  assert.deepEqual(p.disallowedTools, ['ExitPlanMode', 'NotebookEdit', 'Task', 'WebFetch', 'WebSearch']);
+  assert.equal(p.strictMcpConfig, true);
+  for (const kept of [...ALWAYS_KEPT, 'Edit', 'MultiEdit', 'Write']) assert.ok(!p.disallowedTools.includes(kept), kept);
+});
+
+await test('policy: read tasks also lose the write tools; web and notebook tasks keep theirs', () => {
+  const read = nativeToolPolicy('Explain why the session cache misses on refresh');
+  for (const t of NATIVE_TOOL_GROUPS.write) assert.ok(read.disallowedTools.includes(t), t);
+  for (const kept of ALWAYS_KEPT) assert.ok(!read.disallowedTools.includes(kept), kept);
+  const web = nativeToolPolicy('Update the client to match https://example.com/api');
+  assert.ok(!web.disallowedTools.includes('WebFetch') && !web.disallowedTools.includes('WebSearch'));
+  const nb = nativeToolPolicy('Fix the plot in analysis.ipynb');
+  assert.ok(!nb.disallowedTools.includes('NotebookEdit'));
+  for (const t of NATIVE_TOOL_GROUPS.always) assert.ok(nb.disallowedTools.includes(t), 'always off: ' + t);
+});
+
+await test('policy: same task, same bytes; sorted and unique; the fingerprint tracks the set', () => {
+  const task = 'Fix refreshSession so an expired session in src/auth/session.ts is renewed';
+  const first = JSON.stringify(nativeToolPolicy(task));
+  for (let i = 0; i < 50; i += 1) assert.equal(JSON.stringify(nativeToolPolicy(task)), first);
+  const p = nativeToolPolicy(task);
+  assert.deepEqual(p.disallowedTools, [...new Set(p.disallowedTools)].sort());
+  assert.match(p.fingerprint, /^[0-9a-f]{12}$/);
+  assert.notEqual(nativeToolPolicy('Explain the auth flow').fingerprint, p.fingerprint);
+  assert.equal(nativeToolPolicy('Refactor billing').fingerprint, nativeToolPolicy('Rename the auth helpers').fingerprint);
+});
+
+await test('policy is applied twice from one list: ACP session _meta and settings deny rules', () => {
+  const p = nativeToolPolicy('Refactor the billing module');
+  const meta = claudeCodeSessionMeta(p) as {
+    claudeCode: { options: { disallowedTools: string[]; extraArgs: Record<string, null> } };
+  };
+  assert.deepEqual(meta.claudeCode.options.disallowedTools, p.disallowedTools);
+  assert.deepEqual(meta.claudeCode.options.extraArgs, { 'strict-mcp-config': null });
+  meta.claudeCode.options.disallowedTools.push('Bash');
+  assert.ok(!p.disallowedTools.includes('Bash'), 'the meta holds a copy');
+  const s = claudeCodeSettings({ hookUrl: 'http://127.0.0.1:1/h', deny: p.disallowedTools });
+  assert.deepEqual(s.permissions.deny, p.disallowedTools);
+  assert.equal(s.permissions.disableBypassPermissionsMode, 'disable');
+  assert.equal(claudeCodeSettings({ hookUrl: 'http://127.0.0.1:1/h' }).permissions.deny, undefined);
+  assert.equal(claudeCodeSettings({ hookUrl: 'http://127.0.0.1:1/h', deny: [] }).permissions.deny, undefined);
+});
+
+await test('levers: schemaMin defaults on and can be switched off on its own', () => {
+  assert.equal(DEFAULT_LEVERS.schemaMin, true);
+  assert.deepEqual(resolveLevers({ schemaMin: false }), { shapedTools: true, contextPack: true, schemaMin: false });
+});
+
+await test('tool-set tracker: exact bytes, per run and model; tool-less calls are not tracked', () => {
+  const t = new ToolSetTracker();
+  const raw = toolsText(fx.TURN1_REQUEST)!;
+  assert.ok(raw.startsWith('[{"name": "Read"') && raw.endsWith(']'));
+  assert.equal(toolsText('{"model":"m","messages":[]}'), undefined);
+  assert.equal(toolsText('{"model":"m","tools":[],"messages":[]}'), undefined);
+  const a = t.observe('run_a', 'm', fx.TURN1_REQUEST)!;
+  assert.deepEqual(a, { hash: hashTools(raw), names: ['Read', 'Bash'], changed: false });
+  assert.equal(t.observe('run_a', 'm', fx.TURN2_REQUEST)!.changed, false, 'same tools, longer transcript');
+  const reformatted = fx.TURN2_REQUEST.replace(raw, JSON.stringify(JSON.parse(raw)));
+  assert.equal(t.observe('run_a', 'm', reformatted)!.changed, true, 'whitespace alone breaks the cache prefix');
+  assert.equal(t.observe('run_a', 'small', reformatted)!.changed, false, 'another model is its own baseline');
+  assert.equal(t.observe('run_b', 'm', reformatted)!.changed, false, 'another run is its own baseline');
+  assert.equal(t.observe('run_a', 'm', '{"model":"m","messages":[]}'), undefined);
+  const [main] = t.run('run_a').filter((r) => r.model === 'm');
+  assert.equal(main!.requests, 3);
+  assert.equal(main!.changes, 1);
+  t.forget('run_a');
+  assert.deepEqual(t.run('run_a'), []);
+});
+
+/**
+ * The step 4 replay harness: a whole session through the gateway, every request
+ * recorded at the fake upstream. The L3 promise is that the `tools` bytes are
+ * identical on every request in the run.
+ */
+async function replaySession(bodies: string[]) {
+  const replay = createReplayer(
+    bodies.map((_, i) => ({
+      status: 200,
+      headers: fx.STREAM_HEADERS,
+      body: i === 0 ? fx.TURN1_STREAM : fx.TURN2_STREAM,
+    })),
+  );
+  const tokens = new GatewayRunTokenStore();
+  const events: import('@htn/shared').RunEvent[] = [];
+  const gateway = new AnthropicMessagesGateway({
+    upstream: replay.upstream,
+    tokens,
+    emit: (_runId, event) => {
+      events.push(parseRunEvent(event));
+    },
+  });
+  const runId = 'run_l3_' + bodies.length + '_' + events.length + Math.random().toString(36).slice(2, 8);
+  const token = tokens.mint({ runId, harness: 'claudecode', budget: {} });
+  for (const body of bodies) {
+    const reply = await gateway.messages({
+      path: '/v1/messages',
+      search: '',
+      body: bytes(body),
+      headers: { 'content-type': 'application/json', authorization: 'Bearer ' + token },
+    });
+    assert.equal(reply.status, 200);
+    await readAll(reply.body);
+  }
+  const calls = events.filter(
+    (e): e is Extract<import('@htn/shared').RunEvent, { type: 'gateway.call' }> => e.type === 'gateway.call',
+  );
+  return { gateway, replay, calls, runId };
+}
+
+await test('stable tool set: every gateway request in a replayed run carries identical tool bytes', async () => {
+  const sideCall = JSON.stringify({ ...JSON.parse(fx.TURN1_REQUEST), model: 'claude-haiku-5-5', tools: undefined });
+  const { gateway, replay, calls, runId } = await replaySession([
+    fx.TURN1_REQUEST,
+    fx.TURN2_REQUEST,
+    sideCall,
+    fx.TURN2_REQUEST,
+  ]);
+  const withTools = replay.requests.map((r) => toolsText(r.text)).filter((t): t is string => t !== undefined);
+  assert.equal(withTools.length, 3);
+  assert.ok(withTools.every((t) => t === withTools[0]), 'byte-identical tools at the upstream');
+  assert.equal(calls.length, 4);
+  const hashes = calls.filter((c) => c.toolsHash).map((c) => c.toolsHash);
+  assert.deepEqual(hashes, [hashTools(withTools[0]!), hashTools(withTools[0]!), hashTools(withTools[0]!)]);
+  assert.ok(calls.every((c) => c.toolSetChanged !== true));
+  assert.equal(calls[2]!.toolsHash, undefined, 'the tool-less side call is not tracked');
+  const [set] = gateway.toolSets.run(runId);
+  assert.equal(set!.changes, 0);
+  assert.deepEqual(set!.names, ['Read', 'Bash']);
+});
+
+await test('stable tool set: a mid-run change is flagged on the call that broke it', async () => {
+  const raw = toolsText(fx.TURN2_REQUEST)!;
+  const reordered = JSON.parse(raw) as unknown[];
+  reordered.reverse();
+  const drifted = fx.TURN2_REQUEST.replace(raw, JSON.stringify(reordered));
+  const { gateway, calls, runId } = await replaySession([fx.TURN1_REQUEST, drifted, fx.TURN2_REQUEST]);
+  assert.deepEqual(
+    calls.map((c) => c.toolSetChanged),
+    [false, true, false],
+  );
+  assert.equal(gateway.toolSets.run(runId)[0]!.changes, 1);
 });
 
 await rm(scratch, { recursive: true, force: true }).catch(() => undefined);

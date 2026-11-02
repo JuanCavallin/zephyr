@@ -489,6 +489,13 @@ export const codingEventSchema = z.discriminatedUnion('type', [
     /** Run-level cache hit rate after this call, 0..1. */
     runCacheHitRate: unit,
     toolUses: count,
+    /**
+     * Step 5 L3: hash of the request's `tools` bytes. Absent when the request
+     * carried no tools.
+     */
+    toolsHash: z.string().regex(/^[0-9a-f]{16}$/).optional(),
+    /** The tool set differs from the run's first one on this model (a cache-prefix break). */
+    toolSetChanged: z.boolean().optional(),
     error: z.object({ type: z.string().min(1), message: z.string() }).optional(),
     at: iso,
   }),

@@ -28,7 +28,12 @@ export interface HttpHook {
 
 export interface ClaudeCodeSettings {
   hooks: Record<HookEventName, { matcher: string; hooks: HttpHook[] }[]>;
-  permissions: { defaultMode: 'default'; disableBypassPermissionsMode: 'disable' };
+  permissions: {
+    defaultMode: 'default';
+    disableBypassPermissionsMode: 'disable';
+    /** Step 5 L3: native tools disabled for this run, the same list the session was opened with. */
+    deny?: string[];
+  };
   env?: Record<string, string>;
 }
 
@@ -48,12 +53,18 @@ export function claudeCodeSettings(opts: {
   hookUrl: string;
   timeoutSec?: number;
   env?: Record<string, string>;
+  /** Tool names to deny outright (bare names: the whole tool). */
+  deny?: readonly string[];
 }): ClaudeCodeSettings {
   const timeout = opts.timeoutSec ?? 30;
   const entry = () => [{ matcher: '*', hooks: [{ type: 'http' as const, url: opts.hookUrl, timeout }] }];
   return {
     hooks: { PreToolUse: entry(), PostToolUse: entry(), Stop: entry() },
-    permissions: { defaultMode: 'default', disableBypassPermissionsMode: 'disable' },
+    permissions: {
+      defaultMode: 'default',
+      disableBypassPermissionsMode: 'disable',
+      ...(opts.deny && opts.deny.length > 0 ? { deny: [...opts.deny] } : {}),
+    },
     ...(opts.env ? { env: opts.env } : {}),
   };
 }

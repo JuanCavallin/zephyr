@@ -8,6 +8,7 @@
  *
  *   complete            text chunks + a tool call, then end_turn
  *   write:<name>=<text> write <text> to <session cwd>/<name>, then end_turn
+ *   session-meta        write the session/new `_meta` to <cwd>/session-meta.json, then end_turn
  *   permission          ask session/request_permission; write permitted.txt
  *                       and say "allowed" if granted, say "denied" otherwise
  *   error               answer the prompt with a JSON-RPC error
@@ -57,7 +58,7 @@ export function mockPeerHarness(overrides: Partial<AcpHarnessConfig> = {}): AcpH
 type Json = Record<string, unknown>;
 
 function runPeer(): void {
-  const sessions = new Map<string, { cwd: string; cancelled: boolean }>();
+  const sessions = new Map<string, { cwd: string; cancelled: boolean; meta?: unknown }>();
   const pending = new Map<number, (result: Json) => void>();
   let nextId = 1;
   let nextSession = 1;
@@ -118,6 +119,11 @@ function runPeer(): void {
     const scenario = text.split('\n')[0]!.trim();
     const done = (stopReason = 'end_turn') => respond(id, { stopReason });
 
+    if (scenario === 'session-meta') {
+      // Echo the `_meta` this session was opened with, so a check can see it.
+      writeFileSync(resolve(session.cwd, 'session-meta.json'), JSON.stringify(session.meta ?? null));
+      return done();
+    }
     if (scenario === 'complete') {
       say(sessionId, 'hello ');
       say(sessionId, 'world');
@@ -298,7 +304,7 @@ function runPeer(): void {
     }
     if (method === 'session/new') {
       const sessionId = 'mock-session-' + nextSession++;
-      sessions.set(sessionId, { cwd: String(params.cwd ?? process.cwd()), cancelled: false });
+      sessions.set(sessionId, { cwd: String(params.cwd ?? process.cwd()), cancelled: false, meta: params._meta });
       return respond(id, { sessionId });
     }
     if (method === 'session/prompt') {

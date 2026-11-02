@@ -23,6 +23,7 @@ import { newId, nowIso } from '../../lib/ids.js';
 import { CacheLedger, mergeUsage, parseAnthropicUsage, ZERO_USAGE } from './cacheLedger.js';
 import { PlaceholderSessions } from './placeholders.js';
 import { appendItem, appendMember, applySplices, entry, scanJson, type Splice } from './rawJson.js';
+import { ToolSetTracker, type ToolSetObservation } from './toolSet.js';
 import {
   gatewayRunTokens,
   presentedCredential,
@@ -100,6 +101,8 @@ export interface MessagesGatewayOptions {
   tokens?: GatewayRunTokenStore;
   ledger?: CacheLedger;
   placeholders?: PlaceholderSessions;
+  /** Step 5 L3: per-run tool-set fingerprints. */
+  toolSets?: ToolSetTracker;
   emit?: (runId: string, event: RunEvent) => unknown;
   maxToolCallsPerTurn?: number;
   rewrite?: RewriteHook;
@@ -302,13 +305,17 @@ const utf8 = new TextDecoder('utf-8', { fatal: true });
 export class AnthropicMessagesGateway {
   readonly ledger: CacheLedger;
   readonly tokens: GatewayRunTokenStore;
+  readonly toolSets: ToolSetTracker;
   private readonly placeholders: PlaceholderSessions;
+  /** The tool-set observation of each in-flight call, consumed by `recordCall`. */
+  private readonly callTools = new Map<string, ToolSetObservation>();
   private readonly maxToolCallsPerTurn: number;
 
   constructor(private readonly options: MessagesGatewayOptions) {
     this.ledger = options.ledger ?? new CacheLedger();
     this.tokens = options.tokens ?? gatewayRunTokens;
     this.placeholders = options.placeholders ?? new PlaceholderSessions();
+    this.toolSets = options.toolSets ?? new ToolSetTracker();
     this.maxToolCallsPerTurn = options.maxToolCallsPerTurn ?? DEFAULT_MAX_TOOL_CALLS_PER_TURN;
   }
 
@@ -383,6 +390,9 @@ export class AnthropicMessagesGateway {
 
     const model = typeof request.model === 'string' ? request.model : undefined;
     const callId = newId('gwc');
+    // The forwarded `tools` bytes: L3 promises they never change within a run.
+    const tools = hasTools ? this.toolSets.observe(binding.runId, model, text) : undefined;
+    if (tools) this.callTools.set(callId, tools);
     const upstream = this.options.upstreamFor?.({ binding, model }) ?? this.options.upstream;
     let response: Response;
     try {
@@ -669,6 +679,8 @@ export class AnthropicMessagesGateway {
     },
   ): void {
     const usage = call.usage ?? { ...ZERO_USAGE };
+    const tools = this.callTools.get(callId);
+    this.callTools.delete(callId);
     const recorded = this.ledger.record({ callId, runId: binding.runId, model: call.model, usage });
     const run = this.ledger.run(binding.runId);
     this.emit(binding.runId, {
@@ -682,6 +694,7 @@ export class AnthropicMessagesGateway {
       ...(recorded.costCents !== undefined ? { costCents: recorded.costCents } : {}),
       runCacheHitRate: run.cacheHitRate,
       toolUses: call.toolUses ?? 0,
+      ...(tools ? { toolsHash: tools.hash, toolSetChanged: tools.changed } : {}),
       ...(call.error ? { error: call.error } : {}),
       at: recorded.at,
     });

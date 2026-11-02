@@ -737,6 +737,48 @@ await test('Step 5 L2: the context pack precedes the goal; a failing pack costs 
   assert.equal(await readFile(join(packed.task(off.data.taskId)!.worktree, 'off.txt'), 'utf8'), 'lever-off');
   await packed.cancelTask(off.data.taskId, { runId: run3.runId, policyRule: 'check' });
 });
+await test('Step 5 L3: one tool set per session, sent as ACP _meta and written as settings deny rules', async () => {
+  const runtime = createClaudeCodeRuntime({
+    harness: mockPeerHarness({ harness: 'claudecode', env: claudeCodeHarness().env }),
+    workspaces: async () => workspaces,
+    apiBaseUrl,
+    gatewayUrl: 'http://127.0.0.1:1/never',
+    tokens,
+    requireGatewayCredentials: false,
+    stderr: 'ignore',
+    log: () => {},
+  });
+  const open = async (goal: string, levers?: { schemaMin: boolean }) => {
+    const run = await seedRun('run_l3_' + Math.random().toString(36).slice(2, 8));
+    const started = await runtime.startTask({ goal, ...(levers ? { levers } : {}) }, { ...run, policyRule: 'check' });
+    assert.ok(started.ok, JSON.stringify(started));
+    const task = runtime.task(started.data.taskId)!;
+    await task.turn;
+    const meta = JSON.parse(await readFile(join(task.worktree, 'session-meta.json'), 'utf8'));
+    const settings = JSON.parse(await readFile(join(task.stateDir!, 'settings.json'), 'utf8'));
+    const polled = await runtime.pollTask(started.data.taskId, { runId: run.runId, policyRule: 'check' });
+    await runtime.cancelTask(started.data.taskId, { runId: run.runId, policyRule: 'check' });
+    return { meta, settings, log: polled.ok ? (polled.data.log ?? []) : [] };
+  };
+
+  const edit = await open('session-meta\nRefactor the billing module');
+  const off = ['ExitPlanMode', 'NotebookEdit', 'Task', 'WebFetch', 'WebSearch'];
+  assert.deepEqual(edit.meta, {
+    claudeCode: { options: { disallowedTools: off, extraArgs: { 'strict-mcp-config': null } } },
+  });
+  assert.deepEqual(edit.settings.permissions.deny, off, 'the settings deny the same list');
+  assert.ok(edit.log.some((l: string) => /^tool set: edit task, 5 native tool\(s\) off .*strict MCP, fingerprint [0-9a-f]{12}$/.test(l)));
+
+  const read = await open('session-meta\nExplain where the session cache is checked');
+  const readOff = read.meta.claudeCode.options.disallowedTools as string[];
+  for (const t of ['Edit', 'MultiEdit', 'Write']) assert.ok(readOff.includes(t), t);
+  assert.deepEqual(read.settings.permissions.deny, readOff);
+
+  const lever = await open('session-meta\nRefactor the billing module', { schemaMin: false });
+  assert.equal(lever.meta, null, 'levers.schemaMin=false sends no _meta');
+  assert.equal(lever.settings.permissions.deny, undefined);
+  assert.ok(!lever.log.some((l: string) => l.startsWith('tool set:')));
+});
 await test('startTask requires a gateway credential by default', async () => {
   const strict = createClaudeCodeRuntime({
     harness: mockPeerHarness({ harness: 'claudecode' }),

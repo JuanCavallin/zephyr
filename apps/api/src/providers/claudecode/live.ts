@@ -63,6 +63,7 @@ import type { WorkspacesService } from '../../services/workspaces.service.js';
 import { newId, nowIso } from '../../lib/ids.js';
 import { claudeCodeSettings, hookUrl } from './settings.js';
 import { offeredShapedKinds } from '../../core/tools/shaped/index.js';
+import { claudeCodeSessionMeta, nativeToolPolicy } from '../../core/tools/toolPolicy.js';
 import { runWorktrees, type RunWorktrees } from '../../core/tools/shaped/worktrees.js';
 import { goalWithContextPack, type ContextPackBuilder } from '../../core/context/index.js';
 
@@ -346,7 +347,12 @@ export function createClaudeCodeRuntime(deps: ClaudeCodeRuntimeDeps): ClaudeCode
           },
           MANAGED_HOOK_TTL_MS,
         );
-        const settings = claudeCodeSettings({ hookUrl: hookUrl(deps.apiBaseUrl, token) });
+        // Step 5 L3: the tool set is fixed here, once, for the whole session.
+        const toolPolicy = levers.schemaMin ? nativeToolPolicy(input.goal) : null;
+        const settings = claudeCodeSettings({
+          hookUrl: hookUrl(deps.apiBaseUrl, token),
+          ...(toolPolicy ? { deny: toolPolicy.disallowedTools } : {}),
+        });
         await writeFile(join(stateDir, 'settings.json'), JSON.stringify(settings, null, 2), 'utf8');
 
         gatewayToken = deps.gatewayTokens?.mint({
@@ -382,6 +388,7 @@ export function createClaudeCodeRuntime(deps: ClaudeCodeRuntimeDeps): ClaudeCode
         const session = await client.newSession({
           cwd: workspace.path,
           mcpServers: deps.harness.mcpServers(launch),
+          ...(toolPolicy ? { meta: claudeCodeSessionMeta(toolPolicy) } : {}),
         });
         record = {
           taskId: session.sessionId,
@@ -402,6 +409,12 @@ export function createClaudeCodeRuntime(deps: ClaudeCodeRuntimeDeps): ClaudeCode
           turn: Promise.resolve(),
         };
         tasks.set(record.taskId, record);
+        if (toolPolicy) {
+          record.log.push(
+            `tool set: ${toolPolicy.taskClass} task, ${toolPolicy.disallowedTools.length} native tool(s) off ` +
+              `(${toolPolicy.disallowedTools.join(', ')}), strict MCP, fingerprint ${toolPolicy.fingerprint}`,
+          );
+        }
         // Step 5 L2: a pack failure costs the pack, never the task.
         let pack: Awaited<ReturnType<ContextPackBuilder>> | null = null;
         if (levers.contextPack && deps.contextPack) {
