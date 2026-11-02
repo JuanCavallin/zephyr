@@ -204,6 +204,33 @@ export interface FlakyTestInput {
   touchedByDiff: boolean;
 }
 
+/** Step 7: one routing candidate, with its history and current load. */
+export interface RouteCandidateInput {
+  /** Stable label, e.g. `agent:claudecode:cheap` or `human`. */
+  key: string;
+  assignee: import('./coding.js').Assignee;
+  /** Board tasks this candidate finished and failed. */
+  history: { done: number; failed: number };
+  /** Tasks it is running now. */
+  load: number;
+  /** Recorded design preferences (UI taste) for this candidate. */
+  designPreferences: number;
+}
+
+/** Step 7: the features Jev routes a task on. No source code, no prose to generate. */
+export interface RouteTaskInput {
+  task: {
+    title: string;
+    acceptance: string;
+    writeScope: string[];
+    /** Touches UI files or reads as UI work. */
+    ui: boolean;
+    /** Times this task already failed. */
+    failures: number;
+  };
+  candidates: RouteCandidateInput[];
+}
+
 export interface DecisionAdapter extends ProviderAdapter {
   /** Cheap, fast classify-or-route call. Deliberately tiny. */
   decide(
@@ -295,6 +322,17 @@ export interface DecisionAdapter extends ProviderAdapter {
     input: FlakyTestInput,
     ctx: ProviderCallContext,
   ): Promise<ProviderResult<{ flakyProbability: number; reasonCodes: string[] }>>;
+
+  /**
+   * Step 7: pick ONE candidate (by `key`) for a board task, a `choice` over the
+   * supplied candidates. Optional: without it the deterministic routing rules decide.
+   */
+  routeTask?(
+    input: RouteTaskInput,
+    ctx: ProviderCallContext,
+  ): Promise<
+    ProviderResult<{ choice: string; confidence: number; probabilities: Record<string, number>; reasonCodes: string[] }>
+  >;
 
   /**
    * Route a subtask BEFORE it starts: pick a model tier and filter the

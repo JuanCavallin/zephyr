@@ -746,6 +746,65 @@ export function createLiveJev(
     }
   };
 
+  /**
+   * Step 7: one `choice` over the routing candidates. Criteria are keyed by index
+   * (`1`..`n`) and mapped back to candidate keys, so a key's punctuation never
+   * reaches the criteria map.
+   */
+  const routeTask: NonNullable<DecisionAdapter['routeTask']> = async (input, ctx) => {
+    const startedAt = Date.now();
+    try {
+      if (input.candidates.length === 0) throw new Error('No routing candidates.');
+      const criteria: Record<string, string> = {};
+      input.candidates.forEach((c, i) => {
+        const who =
+          c.assignee.kind === 'human'
+            ? 'a human engineer'
+            : `the ${c.assignee.harness} agent on the ${c.assignee.tier} model tier`;
+        criteria[String(i + 1)] =
+          `${who}: finished ${c.history.done}, failed ${c.history.failed}, ` +
+          `running ${c.load} now, ${c.designPreferences} recorded design preferences.`;
+      });
+      const result = await evaluate({
+        model: await modelFor(ctx),
+        state: { task: input.task },
+        questions: {
+          assignee: {
+            type: 'choice',
+            instructions:
+              'Which candidate should do this task? Small tasks suit cheap tiers; UI work suits ' +
+              'whoever has the most design preferences; a task that failed twice needs a stronger ' +
+              'tier or a human; prefer a good track record and low load.',
+            criteria,
+          },
+        },
+        maxRetries,
+        abortSignal: decisionSignal(ctx.signal),
+      });
+      const answer = result.answers.assignee;
+      if (!answer || answer.type !== 'choice') throw new Error('Jev returned an invalid routing choice.');
+      const chosen = input.candidates[Number(answer.choice) - 1];
+      if (!chosen) throw new Error('Jev returned an unknown routing candidate.');
+      const probabilities: Record<string, number> = {};
+      for (const [index, p] of Object.entries(answer.probabilities ?? {})) {
+        const c = input.candidates[Number(index) - 1];
+        if (c && Number.isFinite(p)) probabilities[c.key] = p;
+      }
+      return {
+        ok: true,
+        data: {
+          choice: chosen.key,
+          confidence: probabilityForChoice(answer.choice, answer.probabilities),
+          probabilities,
+          reasonCodes: ['jev-route-task'],
+        },
+        meta: meta('route_task', startedAt, destination, result.usage, result.providerMetadata),
+      };
+    } catch (error) {
+      return { ok: false, error: providerError(error), meta: meta('route_task', startedAt, destination) };
+    }
+  };
+
   /** Step 6: probability a failing test is flaky, from its outcome history. */
   const judgeFlaky: NonNullable<DecisionAdapter['judgeFlaky']> = async (input, ctx) => {
     const startedAt = Date.now();
@@ -989,6 +1048,12 @@ export function createLiveJev(
           ctx,
         )) as ProviderResult<TOut>;
       }
+      if (op === 'route_task') {
+        return (await routeTask(
+          input as Parameters<NonNullable<DecisionAdapter['routeTask']>>[0],
+          ctx,
+        )) as ProviderResult<TOut>;
+      }
       if (op === 'judge_flaky') {
         return (await judgeFlaky(
           input as Parameters<NonNullable<DecisionAdapter['judgeFlaky']>>[0],
@@ -1017,6 +1082,7 @@ export function createLiveJev(
     scoreTests,
     judgeCodingCompletion,
     judgeFlaky,
+    routeTask,
     route,
   };
 }

@@ -9,6 +9,7 @@
  *   2. State machine and derived progress.
  *   3. Leases: grant, deny reasons, extension, expiry, hot files, broker integration.
  *   4. Hot-file intents: typed appliers, serial integrator, concurrent package.json edits.
+ *   5. Routing: pin beats Jev, fallback rules, Jev down -> source fallback.
  */
 
 process.env.PERSIST_TO_DISK = 'false';
@@ -569,6 +570,118 @@ await test('two concurrent package.json intents both land, in submission order, 
     integrator.submit({ taskId: 't1', path: '../escape.json', kind: 'other', description: 'x' }),
     IntentRejectedError,
   );
+});
+
+console.log('5. routing');
+
+const { DecisionService } = await import('../src/core/decisions/service.js');
+const { fallbackRoute, routeFeatures, candidateKey, isUiTask } = await import('../src/core/decisions/routing.js');
+const { create: createJev } = await import('../src/providers/jev/index.js');
+type ProviderConfig = import('../src/config.js').ProviderConfig;
+type DecisionAdapter = import('@htn/shared').DecisionAdapter;
+type Assignee = import('@htn/shared').Assignee;
+type RouteCandidateInput = import('@htn/shared').RouteCandidateInput;
+
+const routeCtx = { runId: 'run_board', policyRule: 'check' } as Parameters<DecisionAdapter['decide']>[1];
+const routeEligible = { sanitizedForRemote: true, dataLabels: [] };
+function candidate(a: Assignee, over: Partial<RouteCandidateInput> = {}): RouteCandidateInput {
+  return { key: candidateKey(a), assignee: a, history: { done: 0, failed: 0 }, load: 0, designPreferences: 0, ...over };
+}
+const cheap: Assignee = { kind: 'agent', harness: 'claudecode', tier: 'cheap' };
+const standard: Assignee = { kind: 'agent', harness: 'codex', tier: 'standard' };
+const frontier: Assignee = { kind: 'agent', harness: 'claudecode', tier: 'frontier' };
+const person: Assignee = { kind: 'human', reason: 'reviewer' };
+const pool = [
+  candidate(cheap),
+  candidate(standard, { designPreferences: 4 }),
+  candidate(frontier, { designPreferences: 1 }),
+  candidate(person),
+];
+const jevStubAdapter = (routeTask?: DecisionAdapter['routeTask'], mode: 'live' | 'mock' = 'live') =>
+  ({ id: 'jev', mode, routeTask }) as unknown as DecisionAdapter;
+
+await test('fallback rules: small -> cheap, UI -> design preferences, failed twice -> escalate', () => {
+  assert.equal(candidateKey(cheap), 'agent:claudecode:cheap');
+  assert.equal(isUiTask({ title: 'wire api', writeScope: ['apps/web/src/Board.tsx'] }), true);
+  assert.equal(isUiTask({ title: 'add lease table', writeScope: ['apps/api/src/x.ts'] }), false);
+  const small = routeFeatures(makeTask('s', { writeScope: ['src/a.ts'] }), pool);
+  assert.deepEqual(fallbackRoute(small), { assignee: cheap, rule: 'small-cheap' });
+  const ui = routeFeatures(makeTask('u', { title: 'Board page layout', writeScope: ['apps/web/src/**'] }), pool);
+  assert.deepEqual(fallbackRoute(ui), { assignee: standard, rule: 'ui-design-preferences' });
+  const big = routeFeatures(makeTask('b', { writeScope: ['src/a/**', 'src/b/**', 'src/c/**'] }), pool);
+  assert.equal(fallbackRoute(big).rule, 'standard');
+  const twice = routeFeatures(makeTask('f', { writeScope: ['src/a.ts'] }), pool, 2);
+  assert.deepEqual(fallbackRoute(twice, cheap), { assignee: standard, rule: 'escalate' });
+  assert.deepEqual(fallbackRoute(twice, frontier).assignee, person, 'nothing above frontier -> a human');
+  assert.equal(fallbackRoute(routeFeatures(makeTask('h'), [candidate(person)])).assignee.kind, 'human');
+});
+
+await test('routeTask: a pin beats Jev, and Jev is not asked', async () => {
+  let asked = 0;
+  const decisions = new DecisionService(
+    jevStubAdapter(async () => {
+      asked++;
+      return {
+        ok: true,
+        data: { choice: candidateKey(frontier), confidence: 0.9, probabilities: {}, reasonCodes: ['jev'] },
+        meta: { provider: 'jev', op: 'route_task', mode: 'live', latencyMs: 0, destination: 'gateway' },
+      };
+    }),
+  );
+  const pinned = makeTask('p', { assignee: cheap, pinned: true });
+  const r = await decisions.routeTask(routeEligible, pinned, pool, routeCtx);
+  assert.deepEqual(r.assignee, cheap);
+  assert.equal(r.source, 'pin');
+  assert.equal(asked, 0);
+  const free = await decisions.routeTask(routeEligible, makeTask('q', { assignee: cheap }), pool, routeCtx);
+  assert.equal(free.source, 'jev');
+  assert.deepEqual(free.assignee, frontier, 'unpinned: Jev is followed');
+  assert.equal(asked, 1);
+});
+
+await test('routeTask: Jev down / unknown key / ineligible / unsupported -> rule result, source fallback', async () => {
+  const task = makeTask('d', { writeScope: ['src/a.ts'] });
+  const down = new DecisionService(
+    jevStubAdapter(async () => ({
+      ok: false,
+      error: { code: 'UPSTREAM', message: 'down', retryable: true },
+      meta: { provider: 'jev', op: 'route_task', mode: 'live', latencyMs: 0, destination: 'gateway' },
+    })),
+  );
+  const r = await down.routeTask(routeEligible, task, pool, routeCtx);
+  assert.equal(r.source, 'fallback');
+  assert.deepEqual(r.assignee, cheap);
+  assert.deepEqual(r.reasonCodes, ['jev-route-task-failed', 'route-rule-small-cheap']);
+  const bogus = new DecisionService(
+    jevStubAdapter(async () => ({
+      ok: true,
+      data: { choice: 'agent:nope:frontier', confidence: 1, probabilities: {}, reasonCodes: [] },
+      meta: { provider: 'jev', op: 'route_task', mode: 'live', latencyMs: 0, destination: 'gateway' },
+    })),
+  );
+  assert.equal((await bogus.routeTask(routeEligible, task, pool, routeCtx)).reasonCodes[0], 'jev-route-task-unknown-choice');
+  const unsanitized = { sanitizedForRemote: false, dataLabels: [] };
+  assert.equal((await bogus.routeTask(unsanitized, task, pool, routeCtx)).reasonCodes[0], 'remote-jev-ineligible');
+  const none = new DecisionService(jevStubAdapter(undefined));
+  assert.equal((await none.routeTask(routeEligible, task, pool, routeCtx)).reasonCodes[0], 'jev-route-task-unsupported');
+});
+
+await test('mock Jev routes like the rules on the clear cases', async () => {
+  const decisions = new DecisionService(createJev({ mode: 'mock' } as ProviderConfig));
+  const small = await decisions.routeTask(routeEligible, makeTask('s', { writeScope: ['src/a.ts'] }), pool, routeCtx);
+  assert.equal(small.source, 'jev');
+  assert.deepEqual(small.assignee, cheap);
+  const ui = await decisions.routeTask(
+    routeEligible,
+    makeTask('u', { title: 'Board page', writeScope: ['apps/web/src/**'] }),
+    pool,
+    routeCtx,
+  );
+  assert.deepEqual(ui.assignee, standard);
+  const failed = await decisions.routeTask(routeEligible, makeTask('f'), pool, routeCtx, 2);
+  assert.ok(failed.assignee.kind === 'human' || failed.assignee.tier === 'frontier', 'escalated');
+  const sum = Object.values(small.probabilities).reduce((a, b) => a + b, 0);
+  assert.ok(Math.abs(sum - 1) < 1e-9, 'a distribution over every candidate');
 });
 
 console.log(`\n${passed} passed`);

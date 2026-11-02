@@ -251,6 +251,39 @@ function createMock(cfg: ProviderConfig): DecisionAdapter {
         { tokensIn: estimateTokens(input.task) + 24, tokensOut: 8 },
       );
     },
+    async routeTask(input, ctx) {
+      // Deterministic score per candidate: success rate, minus load, plus a tier fit
+      // (escalate after two failures, design preferences for UI, cheap for small).
+      const tierRank = { local: 0, cheap: 1, standard: 2, frontier: 3 } as const;
+      const scores = input.candidates.map((c) => {
+        const rate = (c.history.done + 1) / (c.history.done + c.history.failed + 2);
+        let fit = 0;
+        if (c.assignee.kind === 'agent') {
+          const rank = tierRank[c.assignee.tier];
+          if (input.task.failures >= 2) fit = rank;
+          else if (input.task.ui) fit = c.designPreferences;
+          else fit = input.task.writeScope.length <= 2 ? 3 - rank : rank === 2 ? 2 : 0;
+        } else fit = input.task.failures >= 2 ? 3.5 : -2;
+        return { key: c.key, score: rate + fit - 0.25 * c.load };
+      });
+      const exp = scores.map((s) => Math.exp(s.score));
+      const total = exp.reduce((a, b) => a + b, 0) || 1;
+      const probabilities = Object.fromEntries(scores.map((s, i) => [s.key, exp[i]! / total]));
+      const top = scores.reduce((a, b) => (b.score > a.score ? b : a), scores[0]!);
+      return mockCall(
+        'jev',
+        'route_task',
+        cfg.mode,
+        ctx,
+        () => ({
+          choice: top.key,
+          confidence: probabilities[top.key] ?? 0,
+          probabilities,
+          reasonCodes: ['mock-route-task'],
+        }),
+        { tokensIn: estimateTokens(input.task.title) + 12 * input.candidates.length, tokensOut: 4 },
+      );
+    },
     async judgeFlaky(input, ctx) {
       // Deterministic: a test that has passed and failed without this diff touching
       // it flips; a test the diff touches is almost certainly a real failure.

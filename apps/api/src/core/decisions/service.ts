@@ -1,5 +1,6 @@
 import type {
   ActionPolicy,
+  Assignee,
   ActionPolicyRecommendation,
   AuthorizationDecision,
   CodingCompletionInput,
@@ -11,7 +12,9 @@ import type {
   ModelRoute,
   ModelSelectionDecision,
   ProviderCallContext,
+  RouteCandidateInput,
   SessionCheckpoint,
+  Task,
   ToolAction,
   ToolDescriptor,
   ToolFamilySelectionDecision,
@@ -26,6 +29,7 @@ import {
   escalateLowConfidence,
   strictestActionPolicy,
 } from './eligibility.js';
+import { fallbackRoute, routeFeatures } from './routing.js';
 
 export interface DecisionServiceOptions {
   /**
@@ -490,6 +494,57 @@ export class DecisionService {
     if (!result.ok || !Number.isFinite(result.data.flakyProbability)) return real('jev-flaky-failed');
     const probability = Math.max(0, Math.min(1, result.data.flakyProbability));
     return { flaky: probability >= 0.5, probability, reasonCodes: result.data.reasonCodes, source: 'jev' };
+  }
+
+  /**
+   * Step 7: who runs a board task. A user pin wins outright and Jev is not asked.
+   * Otherwise Jev picks one candidate key (followed at any confidence); without Jev,
+   * when the task may not leave the machine, or when Jev's choice is not a
+   * candidate, the deterministic rules in `routing.ts` decide.
+   */
+  async routeTask(
+    eligibility: Pick<DecisionState, 'sanitizedForRemote' | 'dataLabels'>,
+    task: Pick<Task, 'title' | 'acceptance' | 'writeScope' | 'assignee' | 'pinned'>,
+    candidates: RouteCandidateInput[],
+    ctx: ProviderCallContext,
+    failures = 0,
+  ): Promise<{
+    assignee: Assignee;
+    source: 'pin' | 'jev' | 'fallback';
+    confidence: number;
+    probabilities: Record<string, number>;
+    reasonCodes: string[];
+  }> {
+    if (task.pinned && task.assignee) {
+      return { assignee: task.assignee, source: 'pin', confidence: 1, probabilities: {}, reasonCodes: ['user-pin'] };
+    }
+    const input = routeFeatures(task, candidates, failures);
+    const fallback = (reason: string) => {
+      const rule = fallbackRoute(input, task.assignee);
+      return {
+        assignee: rule.assignee,
+        source: 'fallback' as const,
+        confidence: 1,
+        probabilities: {},
+        reasonCodes: [reason, 'route-rule-' + rule.rule],
+      };
+    };
+    if (candidates.length === 0) return fallback('no-candidates');
+    if (!this.adapter.routeTask) return fallback('jev-route-task-unsupported');
+    if (this.adapter.mode === 'live' && !canSendToRemoteDecisionModel(eligibility)) {
+      return fallback('remote-jev-ineligible');
+    }
+    const result = await this.adapter.routeTask(input, ctx);
+    if (!result.ok) return fallback('jev-route-task-failed');
+    const chosen = candidates.find((c) => c.key === result.data.choice);
+    if (!chosen) return fallback('jev-route-task-unknown-choice');
+    return {
+      assignee: chosen.assignee,
+      source: 'jev',
+      confidence: result.data.confidence,
+      probabilities: result.data.probabilities,
+      reasonCodes: result.data.reasonCodes,
+    };
   }
 
   private fallbackCompletion(checkpoint: SessionCheckpoint): 'continue' | 'blocked' {
