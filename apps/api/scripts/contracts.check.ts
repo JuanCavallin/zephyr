@@ -240,6 +240,20 @@ await test('coding events parse; unknown type rejected', () => {
     { type: 'learning.activated', entry: 'preference', id: 'pref_1', version: 1, at: AT },
     { type: 'learning.retired', entry: 'skill', id: 'skill_1', reason: 'superseded', at: AT },
     { type: 'harness.turn.ended', runId: 'run_1', sessionId: 's1', turnId: 't1', harness: 'codex', stopReason: 'end_turn', at: AT },
+    {
+      type: 'gateway.call',
+      runId: 'run_1',
+      callId: 'gwc_1',
+      model: 'claude-opus-5-5',
+      status: 200,
+      stream: true,
+      usage: { inputTokens: 9, outputTokens: 15, cacheCreationInputTokens: 180, cacheReadInputTokens: 4200 },
+      costCents: 0.1,
+      runCacheHitRate: 0.49,
+      toolUses: 1,
+      at: AT,
+    },
+    { type: 'gateway.blocked', runId: 'run_1', reason: 'token_budget', detail: 'run used 4308 of 1000 tokens', at: AT },
   ];
   const covered = new Set(events.map((e) => e.type));
   for (const e of events) assert.deepEqual(parseRunEvent(JSON.parse(JSON.stringify(e))), e);

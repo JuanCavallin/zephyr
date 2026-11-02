@@ -25,28 +25,47 @@ writes. `/v1/responses` (Codex) is added later in the same shape.
 
 - [ ] **Record first.** Capture real Claude Code ↔ Anthropic traffic (a short session with
       tool use and thinking) as fixtures. Scrub keys. This is the oracle for fidelity.
-- [ ] Passthrough streaming: SSE events (`message_start`, `content_block_delta`,
+- [x] Passthrough streaming: SSE events (`message_start`, `content_block_delta`,
       thinking deltas, `tool_use` blocks, `message_delta`, `message_stop`) forwarded
       byte-for-byte in order. Replay test: gateway output equals recorded upstream output.
-- [ ] Errors: upstream 4xx/5xx/overloaded and mid-stream disconnects surface as the same
+- [x] Errors: upstream 4xx/5xx/overloaded and mid-stream disconnects surface as the same
       status and error body shape Anthropic returns. Test each from a fake upstream.
-- [ ] Cache safety (the central invariant): forward `cache_control` untouched; request
+- [x] Cache safety (the central invariant): forward `cache_control` untouched; request
       body prefix bytes identical to the client's. Test: send two consecutive turns through
       the gateway and assert the upstream received an unmodified prefix.
-- [ ] Deterministic redaction placeholders `[[PII_n]]` stable per session. Test: same
+- [x] Deterministic redaction placeholders `[[PII_n]]` stable per session. Test: same
       secret across turns → same placeholder; different run → independent numbering.
-- [ ] Rewrite hook exists but is **off outside compaction points** (used later by L5);
+- [x] Rewrite hook exists but is **off outside compaction points** (used later by L5);
       test that an ordinary turn is never modified.
-- [ ] `cacheLedger`: record `input`, `output`, `cache_creation_input_tokens`,
+- [x] `cacheLedger`: record `input`, `output`, `cache_creation_input_tokens`,
       `cache_read_input_tokens` separately per call and per run; expose hit rate. Test with
       fixtures containing cache fields and without them.
-- [ ] Budget: per-run token/cost cap; over budget → `blocked` event and a well-formed
+- [x] Budget: per-run token/cost cap; over budget → `blocked` event and a well-formed
       refusal the harness surfaces, never a silent continue.
-- [ ] Per-turn tool budget (default 8) applies to harness traffic via the existing logic.
-- [ ] `/v1/messages/count_tokens` passthrough.
-- [ ] Auth: scoped per-run token validated on every call; unknown token → 401; token for a
+- [x] Per-turn tool budget (default 8) applies to harness traffic via the existing logic.
+- [x] `/v1/messages/count_tokens` passthrough.
+- [x] Auth: scoped per-run token validated on every call; unknown token → 401; token for a
       finished run → 403.
-- [ ] `pnpm check:gateway` = replay + cache-prefix + ledger + budget tests, offline.
+- [x] `pnpm check:gateway` = replay + cache-prefix + ledger + budget tests, offline.
+
+## Status (2026-11-02)
+
+Everything except recording is done; `pnpm check:gateway` is 46/46 offline and part of
+`check:all`.
+
+- **Recording is pending an Anthropic key.** This environment runs `ANTHROPIC_MODE=mock`,
+  so `replay/fixtures.ts` is hand-built in Anthropic's documented wire format (two-turn
+  session: thinking + signature, text, `tool_use`, cache write then cache read). Replace it
+  with a recorded session when a key exists; the tests use only the exported names.
+- The passthrough is `messages.ts`; `service.ts` only wires it in. Its handlers live in
+  `api/anthropicMessages.routes.ts` (raw body, per-run token auth), mounted from
+  `modelGateway.routes.ts` ahead of the OpenAI surface's JSON parsing and session-binding
+  auth, which are the opposite of what this surface needs. The tool-budget default and
+  instruction moved to `turnBudget.ts`, shared by both surfaces.
+- Budget is checked before each call, so the call that crosses the cap completes; the
+  next one is refused (400, `x-should-retry: false`, `gateway.blocked`).
+- Redaction rewrites outbound text only; responses are not rehydrated.
+- Not done: the live "Done when" run below (same blocker as recording).
 
 ## Done when
 
