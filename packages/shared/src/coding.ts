@@ -427,6 +427,10 @@ export type GatewayBlockReason = z.infer<typeof gatewayBlockReasonSchema>;
 
 export const codingEventSchema = z.discriminatedUnion('type', [
   z.object({ type: z.literal('task.created'), task: taskSchema }),
+  /** A task's fields changed during review (scope, title, pin, dependencies). */
+  z.object({ type: z.literal('task.updated'), task: taskSchema }),
+  /** A task left the board during review (split or merged into others). */
+  z.object({ type: z.literal('task.removed'), taskId: id, at: iso }),
   z.object({
     type: z.literal('task.status'),
     taskId: id,

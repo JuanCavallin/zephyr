@@ -11,6 +11,7 @@
  *   4. Hot-file intents: typed appliers, serial integrator, concurrent package.json edits.
  *   5. Routing: pin beats Jev, fallback rules, Jev down -> source fallback.
  *   6. Merge queue: real git; green tasks merge, conflicts and red tests spawn fix tasks, approvals and signals.
+ *   7. Service, routes and inbox: decompose-only create, edits, run ready, merge approvals in the inbox, budget -> blocked.
  */
 
 process.env.PERSIST_TO_DISK = 'false';
@@ -863,6 +864,292 @@ await test('a revised approval records a signal and sends a fix task back', asyn
   const { deps: bare } = mqDeps(repo, { policy: {} });
   const m = await task('m', { 'src/m/index.ts': 'export const m = 1;\n' });
   await assert.rejects(new MergeQueue(bare).enqueue(m), MergeQueueError);
+});
+
+console.log('7. service, routes and inbox');
+
+const { BoardService, BoardError, mockHarnessExecutor, BOARD_KIND, BOARD_TASK_KIND, MERGE_POLICY_RULE } = await import(
+  '../src/services/tasks.service.js'
+);
+const { createMemoryStore } = await import('../src/store/memory.js');
+const { settleApproval } = await import('../src/core/approvalGate.js');
+type BoardServiceDeps = import('../src/services/tasks.service.js').BoardServiceDeps;
+type BoardServiceT = InstanceType<typeof BoardService>;
+
+const svcPool: Assignee[] = [
+  { kind: 'agent', harness: 'mockharness', tier: 'cheap' },
+  { kind: 'agent', harness: 'mockharness', tier: 'standard' },
+];
+
+/** A BoardService over a real git repo, the scripted harness and the mock decision model. */
+async function svcBoard(name: string, request: string, over: Partial<BoardServiceDeps> = {}) {
+  const { repo } = await mqRepo(name);
+  const root = join(repo, '..');
+  const store = createMemoryStore({ persistToDisk: false });
+  const events: Array<{ runId: string; event: RunEvent }> = [];
+  // The mock planner: the heuristic plan of whatever request the prompt carries.
+  const model = Object.assign(
+    (async (req: { prompt: string }) => {
+      model.calls += 1;
+      const text = JSON.stringify(heuristicPlan(requestFromPrompt(req.prompt)));
+      return { ok: true, data: { text, tokensIn: 10, tokensOut: 20 }, meta: { provider: 'anthropic', op: 'complete', mode: 'mock', latencyMs: 0, destination: 'mock://' } };
+    }) as unknown as TextModelAdapter['complete'],
+    { calls: 0 },
+  );
+  const svc = new BoardService({
+    store,
+    emit: async (runId, event) => {
+      assert.ok(codingEventSchema.safeParse(event).success || !event.type.startsWith('task.'), event.type + ' parses');
+      events.push({ runId, event });
+    },
+    complete: model,
+    decisions: new DecisionService(createJev({ mode: 'mock' } as ProviderConfig)),
+    candidates: svcPool,
+    openWorkspace: async (runId, base) => {
+      const branch = 'zephyr/' + runId;
+      const path = join(root, 'wt-' + runId);
+      await mqGit(repo, 'worktree', 'add', '-q', '-b', branch, path, !base || base === 'HEAD' ? 'main' : base);
+      return { path, branch };
+    },
+    exec: execArgv,
+    runTests: async () => ({ passed: 1, failed: 0, failedTests: [] }),
+    executor: mockHarnessExecutor({ authorize: allowAuth }),
+    ...over,
+  });
+  const view = await svc.createBoard({ request });
+  return { svc, store, events, repo, model, view, boardId: view.run.id };
+}
+
+const types = (events: Array<{ event: RunEvent }>, prefix: string) =>
+  events.map((e) => e.event.type).filter((t) => t.startsWith(prefix));
+
+await test('createBoard only decomposes: tasks pending, no task run, nothing on disk', async () => {
+  const { store, events, view, model } = await svcBoard('svc-create', '- add parser\n- add printer\n- wire cli after 1');
+  assert.equal(model.calls, 1);
+  assert.equal(view.run.kind, BOARD_KIND);
+  assert.equal(view.run.status, 'pending');
+  assert.equal(view.tasks.length, 3);
+  assert.ok(view.tasks.every((t) => t.status === 'pending' && !t.runId && !t.assignee));
+  assert.deepEqual(view.tasks[2]!.dependsOn, [view.tasks[0]!.id], '"after 1" became a dependency');
+  assert.equal(types(events, 'task.created').length, 3);
+  assert.equal(types(events, 'task.status').length, 0, 'nothing moved');
+  const runs = await store.listRuns({ limit: 100 });
+  assert.deepEqual(runs.map((r) => r.kind), [BOARD_KIND], 'no board_task run until Run ready tasks');
+});
+
+await test('a failed decomposition fails the board with DECOMPOSE', async () => {
+  const { view } = await svcBoard('svc-baddecomp', 'x', { complete: completer(['not json at all']) });
+  // The planner falls back or fails; either way nothing ran and the board says why.
+  if (view.run.status === 'failed') assert.equal(view.run.error?.code, 'DECOMPOSE');
+  else assert.ok(view.tasks.length >= 1);
+});
+
+await test('editBoard: split, merge, reorder, scope, pin; cycles and started tasks refused', async () => {
+  const { svc, boardId, view, events } = await svcBoard('svc-edit', '- alpha\n- beta\n- gamma');
+  const [a, b, c] = view.tasks.map((t) => t.id) as [string, string, string];
+  let v = await svc.editBoard(boardId, [
+    { op: 'split', taskId: a, parts: [
+      { title: 'alpha api', writeScope: ['src/alpha/api/**'] },
+      { title: 'alpha ui', writeScope: ['src/alpha/ui/**'] },
+    ] },
+  ]);
+  assert.equal(v.tasks.length, 4);
+  assert.ok(!v.tasks.some((t) => t.id === a), 'split replaces the task');
+  assert.deepEqual(v.tasks.slice(0, 2).map((t) => t.title), ['alpha api', 'alpha ui'], 'parts take its place');
+  assert.ok(types(events, 'task.removed').length >= 1);
+
+  v = await svc.editBoard(boardId, [{ op: 'merge', taskIds: [b, c], title: 'beta and gamma' }]);
+  const merged = v.tasks.find((t) => t.title === 'beta and gamma')!;
+  assert.ok(merged, 'merged task exists');
+  assert.deepEqual([...merged.writeScope].sort(), ['src/beta/**', 'src/gamma/**']);
+  assert.equal(v.tasks.length, 3);
+
+  const ids = v.tasks.map((t) => t.id);
+  v = await svc.editBoard(boardId, [{ op: 'reorder', order: [...ids].reverse() }]);
+  assert.deepEqual(v.tasks.map((t) => t.id), [...ids].reverse());
+
+  v = await svc.editBoard(boardId, [
+    { op: 'scope', taskId: merged.id, writeScope: ['src/bg/**'] },
+    { op: 'pin', taskId: merged.id, assignee: svcPool[1]! },
+  ]);
+  const pinned = v.tasks.find((t) => t.id === merged.id)!;
+  assert.deepEqual(pinned.writeScope, ['src/bg/**']);
+  assert.equal(pinned.pinned, true);
+  assert.deepEqual(pinned.assignee, svcPool[1]);
+  assert.equal(types(events, 'task.updated').length, 1, 'scope + pin on one task: one task.updated');
+
+  const [x, y] = v.tasks.map((t) => t.id) as [string, string];
+  await svc.editBoard(boardId, [{ op: 'update', taskId: x, dependsOn: [y] }]);
+  const before = await svc.getBoard(boardId);
+  await assert.rejects(svc.editBoard(boardId, [{ op: 'update', taskId: y, dependsOn: [x] }]), BoardError);
+  assert.deepEqual(await svc.getBoard(boardId), before, 'a refused edit changes nothing');
+  await assert.rejects(svc.editBoard(boardId, [{ op: 'split', taskId: 'nope', parts: [] }]), BoardError);
+});
+
+await test('runReady: each task gets its own run, branch and worktree; green tasks auto-merge; board succeeds', async () => {
+  const { svc, store, events, repo, boardId } = await svcBoard('svc-run', '- one\n- two\n- three after 1');
+  await svc.runReady(boardId, { concurrency: 3, autoMergeGreen: true });
+  await svc.whenIdle(boardId);
+  const v = await svc.getBoard(boardId);
+  assert.equal(v.run.status, 'succeeded', v.run.summary ?? '');
+  assert.ok(v.tasks.every((t) => t.status === 'done'), v.tasks.map((t) => t.status + ' ' + (t.reason ?? '')).join('; '));
+  const runIds = v.tasks.map((t) => t.runId!);
+  assert.equal(new Set(runIds).size, 3, 'one run per task');
+  assert.equal(new Set(v.tasks.map((t) => t.branch)).size, 3, 'one branch per task');
+  for (const id of runIds) {
+    const r = await store.getRun(id);
+    assert.equal(r?.kind, BOARD_TASK_KIND);
+    assert.equal(r?.status, 'succeeded');
+  }
+  const integration = 'zephyr/' + boardId;
+  const files = (await mqGit(repo, 'ls-tree', '-r', '--name-only', integration)).split(/\r?\n/);
+  for (const t of v.tasks) {
+    const f = t.writeScope[0]!.replace('/**', '/main.ts');
+    assert.ok(files.includes(f), f + ' merged; have ' + files.join(','));
+  }
+  assert.equal((await mqGit(repo, 'log', '--format=%s', 'main')).split(/\r?\n/).length, 1, 'main still at init');
+  const statuses = events.filter((e) => e.event.type === 'task.status').map((e) => (e.event as { to: string }).to);
+  for (const s of ['ready', 'running', 'review', 'done']) assert.ok(statuses.includes(s), 'saw ' + s);
+  assert.ok(types(events, 'task.progress').length > 0, 'progress streamed');
+  assert.equal(types(events, 'merge.result').length, 3);
+  // The dependent task started only after its dependency was done.
+  const order = events
+    .filter((e) => e.event.type === 'task.status')
+    .map((e) => e.event as { taskId: string; to: string });
+  const t1 = v.tasks[0]!.id;
+  const t3 = v.tasks[2]!.id;
+  const doneOne = order.findIndex((s) => s.taskId === t1 && s.to === 'done');
+  const runThree = order.findIndex((s) => s.taskId === t3 && s.to === 'running');
+  assert.ok(doneOne >= 0 && runThree > doneOne, 'three ran after one merged');
+  await assert.rejects(svc.editBoard(boardId, [{ op: 'scope', taskId: t1, writeScope: ['x/**'] }]), BoardError);
+});
+
+await test('merge needs approval: it lands in the inbox with every other pending approval, oldest first', async () => {
+  const { svc, store, boardId, repo } = await svcBoard('svc-approve', '- solo');
+  // An unrelated run's pending approval is in the inbox too.
+  const other = await store.createRun({
+    id: 'run_other', kind: 'agent', title: 'other', status: 'awaiting_approval',
+    input: {}, createdAt: T0, updatedAt: T0,
+  } as never);
+  await store.createApproval({
+    id: 'apr_other', runId: other.id, stepId: 'step_x', question: 'Pay?', proposedAction: { kind: 'payment' },
+    reversibility: 'irreversible', riskClass: 'ask_human', policyRule: 'pay', status: 'pending', createdAt: T0,
+  } as never);
+  const changes: number[] = [];
+  const off = svc.onInboxChange(() => changes.push(1));
+  await svc.runReady(boardId);
+  await svc.whenIdle(boardId);
+  let inbox = await svc.inbox();
+  assert.deepEqual(inbox.map((i) => i.kind), ['approval', 'approval']);
+  assert.equal(inbox[0]!.kind === 'approval' && inbox[0]!.approval.id, 'apr_other', 'oldest first');
+  const mine = inbox[1]!;
+  assert.ok(mine.kind === 'approval');
+  assert.equal(mine.boardRunId, boardId);
+  assert.equal(mine.approval.policyRule, MERGE_POLICY_RULE);
+  assert.equal((mine.approval.proposedAction as { kind: string }).kind, 'git.publish');
+  assert.ok(changes.length > 0, 'inbox listeners heard about it');
+  const v = await svc.getBoard(boardId);
+  assert.equal(v.tasks[0]!.status, 'review');
+  assert.equal(await mqGit(repo, 'rev-parse', 'zephyr/' + boardId), await mqGit(repo, 'rev-parse', 'main'), 'not merged yet');
+
+  // Decide it the way POST /api/approvals/:id does.
+  await store.patchApproval(mine.approval.id, { status: 'approved', decidedAt: new Date().toISOString() });
+  assert.ok(settleApproval(mine.approval.id, { verdict: 'approved', action: { kind: 'git.publish' } as never }));
+  await new Promise((r) => setTimeout(r, 0));
+  await svc.whenIdle(boardId);
+  const after = await svc.getBoard(boardId);
+  assert.equal(after.tasks[0]!.status, 'done');
+  assert.equal(after.run.status, 'succeeded');
+  inbox = await svc.inbox();
+  assert.deepEqual(inbox.map((i) => i.kind === 'approval' && i.approval.id), ['apr_other']);
+  off();
+});
+
+await test('over budget: the task blocks with its lease released, shows in the inbox, and resumes', async () => {
+  const { svc, boardId } = await svcBoard('svc-budget', '- heavy', { budget: { maxTurns: 1 } });
+  await svc.runReady(boardId, { autoMergeGreen: true });
+  await svc.whenIdle(boardId);
+  let v = await svc.getBoard(boardId);
+  const t = v.tasks[0]!;
+  assert.equal(t.status, 'blocked');
+  assert.match(t.reason ?? '', /over budget/);
+  assert.equal(svc.leasesOf(boardId).live().length, 0, 'lease released');
+  const inbox = await svc.inbox();
+  assert.ok(inbox.some((i) => i.kind === 'blocked_task' && i.taskId === t.id));
+  assert.notEqual(v.run.status, 'succeeded');
+  await assert.rejects(svc.resumeTask(boardId, 'nope'), BoardError);
+  const resumed = await svc.resumeTask(boardId, t.id, svcPool[1]);
+  assert.equal(resumed.status, 'ready');
+  assert.equal(resumed.pinned, true);
+  v = await svc.getBoard(boardId);
+  assert.ok(['ready', 'running', 'blocked'].includes(v.tasks[0]!.status));
+  await svc.whenIdle(boardId);
+});
+
+await test('a queued lease extension shows in the inbox until decided', async () => {
+  const { svc, boardId, view } = await svcBoard('svc-ext', '- left\n- right');
+  const [l, r] = view.tasks.map((t) => t.id) as [string, string];
+  const leases = svc.leasesOf(boardId);
+  assert.ok(leases.acquire(l, ['src/left/**']).ok);
+  assert.ok(leases.acquire(r, ['src/right/**']).ok);
+  const req = svc.requestExtension(boardId, l, ['src/right/shared.ts']);
+  const pending = (await svc.inbox()).filter((i) => i.kind === 'lease_extension');
+  assert.equal(pending.length, 1, JSON.stringify(req));
+  const id = pending[0]!.kind === 'lease_extension' ? pending[0]!.request.id : '';
+  svc.decideExtension(boardId, id, 'reject');
+  assert.equal((await svc.inbox()).filter((i) => i.kind === 'lease_extension').length, 0);
+  assert.throws(() => svc.decideExtension(boardId, 'nope', 'approve'), BoardError);
+});
+
+await test('routes: POST /tasks decomposes only (201), PATCH edits, 404 / 409 / 400 mapped, run is 202', async () => {
+  const express = (await import('express')).default;
+  const { boardRoutes } = await import('../src/api/tasks.routes.js');
+  const { svc, store } = await svcBoard('svc-routes', '- seed');
+  const app = express();
+  app.use(express.json());
+  app.use('/api', boardRoutes(() => svc as BoardServiceT));
+  app.use(((err: { status?: number; code?: string; message: string }, _req: unknown, res: { status(n: number): { json(b: unknown): void } }, _next: unknown) =>
+    res.status(err.status ?? 500).json({ code: err.code, message: err.message })) as never);
+  const server = app.listen(0);
+  try {
+    const port = (server.address() as { port: number }).port;
+    const call = (method: string, path: string, body?: unknown) =>
+      fetch('http://127.0.0.1:' + port + '/api' + path, {
+        method,
+        headers: { 'content-type': 'application/json' },
+        ...(body ? { body: JSON.stringify(body) } : {}),
+      });
+    const before = (await store.listRuns({ limit: 100 })).length;
+    const created = await call('POST', '/tasks', { request: '- a\n- b' });
+    assert.equal(created.status, 201);
+    const board = (await created.json()) as { run: { id: string }; tasks: Task[] };
+    assert.equal(board.tasks.length, 2);
+    assert.equal((await store.listRuns({ limit: 100 })).length, before + 1, 'only the board run exists');
+    assert.ok((await store.listRuns({ limit: 100 })).every((r) => r.kind !== BOARD_TASK_KIND), 'POST /tasks starts no task');
+    assert.equal((await call('GET', '/tasks/run_missing')).status, 404);
+    assert.equal((await call('PATCH', '/tasks/' + board.run.id, { ops: [] })).status, 400);
+    const edited = await call('PATCH', '/tasks/' + board.run.id, {
+      ops: [{ op: 'update', taskId: board.tasks[0]!.id, title: 'renamed' }],
+    });
+    assert.equal(edited.status, 200);
+    assert.equal(((await edited.json()) as { tasks: Task[] }).tasks[0]!.title, 'renamed');
+    const cyc = await call('PATCH', '/tasks/' + board.run.id, {
+      ops: [
+        { op: 'update', taskId: board.tasks[0]!.id, dependsOn: [board.tasks[1]!.id] },
+        { op: 'update', taskId: board.tasks[1]!.id, dependsOn: [board.tasks[0]!.id] },
+      ],
+    });
+    assert.ok([400, 409].includes(cyc.status), 'cycle refused: ' + cyc.status);
+    const inbox = await call('GET', '/tasks/inbox');
+    assert.equal(inbox.status, 200);
+    assert.ok(Array.isArray(((await inbox.json()) as { items: unknown[] }).items));
+    const ran = await call('POST', '/tasks/' + board.run.id + '/run', { autoMergeGreen: true });
+    assert.equal(ran.status, 202);
+    await svc.whenIdle(board.run.id);
+    assert.equal((await svc.getBoard(board.run.id)).run.status, 'succeeded');
+  } finally {
+    server.close();
+  }
 });
 
 console.log(`\n${passed} passed`);

@@ -140,6 +140,15 @@ export class MergeQueue {
     );
   }
 
+  /**
+   * Run `fn` holding the queue: nothing merges meanwhile. For other writers of the
+   * integration branch (the hot-file integrator committing an intent), so a task
+   * rebased onto the old tip never meets a moved branch at `merge --ff-only`.
+   */
+  exclusive<T>(fn: (signal?: AbortSignal) => Promise<T>, signal?: AbortSignal): Promise<T> {
+    return this.serial(fn, signal);
+  }
+
   /** Revert a merged commit on the integration branch and record a `revert` signal. */
   revert(taskId: string, commit: string, signal?: AbortSignal): Promise<string> {
     return this.serial(async (s) => {
