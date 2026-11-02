@@ -7,6 +7,7 @@
  *
  *   1. Decomposition and waves: glob overlap, conflict graph, plan validation.
  *   2. State machine and derived progress.
+ *   3. Leases: grant, deny reasons, extension, expiry, hot files, broker integration.
  */
 
 process.env.PERSIST_TO_DISK = 'false';
@@ -316,4 +317,169 @@ await test('stuck or over budget -> a breach reason', () => {
   assert.match(budgetBreach(tracker, { maxTokens: 10 }, 5002)!, /over budget: 50 tokens/);
 });
 
+console.log('3. leases');
+
+const { LeaseTable, isHotFile } = await import('../src/core/coordination/leases.js');
+const { createPermissionBridge } = await import('../src/core/tools/permissionBridge.js');
+type AuthorizationDecision = import('@htn/shared').AuthorizationDecision;
+type NativeToolRequest = import('@htn/shared').NativeToolRequest;
+type LeaseEvent = import('../src/core/coordination/leases.js').LeaseEvent;
+
+function leaseTable(ttlMs = 60_000) {
+  const clock = { now: Date.parse(T0) };
+  const events: LeaseEvent[] = [];
+  const table = new LeaseTable({ ttlMs, now: () => clock.now, onEvent: (e) => events.push(e) });
+  return { table, clock, events };
+}
+
+await test('hot files are recognised and never leased', () => {
+  for (const p of [
+    'package.json',
+    'apps/web/package.json',
+    'pnpm-lock.yaml',
+    'apps/api/src/api/index.ts',
+    'packages/shared/src/coding.ts',
+    'apps/api/src/app.ts',
+  ])
+    assert.equal(isHotFile(p), true, p);
+  for (const p of ['src/a/x.ts', 'apps/web/src/board/Board.tsx', 'apps/api/src/core/coordination/leases.ts'])
+    assert.equal(isHotFile(p), false, p);
+  const { table } = leaseTable();
+  const r = table.acquire('t1', ['src/a/**', 'package.json']);
+  assert.equal(r.ok, false);
+  assert.equal(!r.ok && r.reason, 'hot_file');
+  assert.ok(table.acquire('t1', ['**']).ok, 'a broad glob is fine; hot files inside it are still denied');
+  const d = table.checkLease('t1', 'apps/web/package.json', 'write');
+  assert.equal(d.allowed, false);
+  assert.equal(!d.allowed && d.reason, 'hot_file');
+});
+
+await test('grant, inside -> allow, outside / other / none -> each deny reason; reads are free', () => {
+  const { table, events } = leaseTable();
+  assert.ok(table.acquire('t1', ['src/a/**']).ok);
+  assert.ok(table.acquire('t2', ['src/b/**']).ok);
+  const overlap = table.acquire('t3', ['src/**']);
+  assert.equal(overlap.ok, false);
+  assert.deepEqual(!overlap.ok && overlap.heldBy, ['t1', 't2']);
+
+  assert.equal(table.checkLease('t1', 'src/a/x.ts', 'write').allowed, true);
+  const reason = (d: ReturnType<typeof table.checkLease>) => (d.allowed ? 'allowed' : d.reason);
+  assert.equal(reason(table.checkLease('t1', 'src/c/x.ts', 'write')), 'outside_lease');
+  const other = table.checkLease('t1', 'src/b/y.ts', 'write');
+  assert.equal(reason(other), 'held_by_other');
+  assert.equal(!other.allowed && other.heldBy, 't2');
+  assert.equal(reason(table.checkLease('t9', 'src/z.ts', 'write')), 'no_lease');
+  assert.equal(reason(table.checkLease('t1', '../etc/passwd', 'write')), 'invalid_path');
+  assert.equal(reason(table.checkLease('t1', 'C:\\x\\y.ts', 'write')), 'invalid_path');
+  assert.equal(reason(table.checkLease('t9', 'src/b/y.ts', 'read')), 'allowed');
+  assert.equal(events.filter((e) => e.type === 'lease.denied').length, 5);
+  assert.equal(events.filter((e) => e.type === 'lease.granted').length, 2);
+});
+
+await test('extension: auto-granted without overlap; queued with overlap; drains on release', () => {
+  const { table, events } = leaseTable();
+  table.acquire('t1', ['src/a/**']);
+  table.acquire('t2', ['src/b/**']);
+  const free = table.requestExtension('t1', ['src/shared/util.ts']);
+  assert.equal(free.status, 'granted');
+  assert.equal(table.checkLease('t1', 'src/shared/util.ts', 'write').allowed, true);
+  assert.equal(events.filter((e) => e.type === 'lease.extended').length, 1);
+
+  const blocked = table.requestExtension('t1', ['src/b/shared.ts']);
+  assert.equal(blocked.status, 'queued');
+  if (blocked.status !== 'queued') return;
+  assert.deepEqual(blocked.request.blockedBy, ['t2']);
+  assert.equal(table.pending().length, 1);
+  assert.equal(table.checkLease('t1', 'src/b/shared.ts', 'write').allowed, false);
+  // Approving while t2 still holds it keeps it queued: two live leases never overlap.
+  assert.equal(table.decideExtension(blocked.request.id, 'approve')?.status, 'queued');
+  table.release('t2');
+  assert.equal(table.pending().length, 0);
+  assert.equal(table.checkLease('t1', 'src/b/shared.ts', 'write').allowed, true);
+
+  table.acquire('t3', ['src/c/**']);
+  const q = table.requestExtension('t3', ['src/a/**']);
+  assert.equal(q.status, 'queued');
+  if (q.status !== 'queued') return;
+  assert.equal(table.decideExtension(q.request.id, 'reject')?.status, 'rejected');
+  assert.equal(table.pending().length, 0);
+  assert.equal(table.requestExtension('t9', ['src/q/**']).status, 'rejected');
+  assert.equal(table.requestExtension('t3', ['pnpm-lock.yaml']).status, 'rejected');
+});
+
+await test('leases expire; renew keeps them; resume re-requests', () => {
+  const { table, clock, events } = leaseTable(1000);
+  table.acquire('t1', ['src/a/**']);
+  table.acquire('t2', ['src/b/**']);
+  clock.now += 600;
+  assert.equal(table.renew('t1'), true);
+  clock.now += 600; // t2 lapsed at +1000; t1 was renewed to +1600
+  const d = table.checkLease('t2', 'src/b/x.ts', 'write');
+  assert.equal(!d.allowed && d.reason, 'no_lease');
+  assert.equal(table.checkLease('t1', 'src/a/x.ts', 'write').allowed, true);
+  assert.deepEqual(
+    events.filter((e) => e.type === 'lease.expired').map((e) => e.taskId),
+    ['t2'],
+  );
+  assert.equal(table.renew('t2'), false);
+  assert.ok(table.acquire('t2', ['src/b/**']).ok, 'resume re-requests the lapsed lease');
+  assert.equal(table.checkLease('t2', 'src/b/x.ts', 'write').allowed, true);
+  clock.now += 5000;
+  assert.equal(table.live().length, 0);
+});
+
+const allowAuth = async (): Promise<AuthorizationDecision> =>
+  ({
+    actionId: 'check',
+    recommendation: 'auto',
+    finalPolicy: 'auto',
+    allowed: true,
+    reasonCodes: [],
+    at: new Date().toISOString(),
+  }) as unknown as AuthorizationDecision;
+const { mkdtemp, rm } = await import('node:fs/promises');
+const { tmpdir } = await import('node:os');
+const { join } = await import('node:path');
+const scratch = await mkdtemp(join(tmpdir(), 'board-check-'));
+
+await test('the broker denies an out-of-lease edit with the lease reason; board-less writes are unchanged', async () => {
+  const { table } = leaseTable();
+  table.acquire('t1', ['src/a/**']);
+  table.acquire('t2', ['src/b/**']);
+  const bridge = createPermissionBridge({
+    harness: 'claudecode',
+    worktree: scratch,
+    authorize: allowAuth,
+    run: { runId: 'r', stepId: 's' },
+    leases: table,
+  });
+  const write = (path: string, taskId?: string): NativeToolRequest =>
+    ({
+      harness: 'claudecode',
+      toolName: 'Write',
+      rawInput: { file_path: path, content: 'x' },
+      sessionId: 'sess',
+      ...(taskId ? { taskId } : {}),
+    }) as NativeToolRequest;
+  const ok = await bridge.decide(write('src/a/x.ts', 't1'));
+  assert.equal(ok.verdict, 'allow');
+  assert.equal(ok.lease?.allowed, true);
+  const out = await bridge.decide(write('src/b/x.ts', 't1'));
+  assert.equal(out.verdict, 'deny');
+  assert.match(out.reason, /^lease held_by_other: .*t2/);
+  const hot = await bridge.decide(write('package.json', 't1'));
+  assert.equal(hot.verdict, 'deny');
+  assert.match(hot.reason, /hot_file.*HotFileIntent/);
+  const read = await bridge.decide({
+    harness: 'claudecode',
+    toolName: 'Read',
+    rawInput: { file_path: 'src/b/x.ts' },
+    sessionId: 'sess',
+    taskId: 't1',
+  } as NativeToolRequest);
+  assert.equal(read.verdict, 'allow');
+  assert.equal((await bridge.decide(write('src/b/x.ts'))).verdict, 'allow', 'no taskId: not a board task');
+});
+
 console.log(`\n${passed} passed`);
+await rm(scratch, { recursive: true, force: true }).catch(() => undefined);

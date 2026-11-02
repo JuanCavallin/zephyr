@@ -22,7 +22,9 @@ import type {
   AuthorizationDecision,
   HarnessId,
   Json,
+  LeaseDecision,
   NativeToolRequest,
+  PermissionBridgeSeam,
   PermissionVerdict,
   ToolAction,
   ToolDescriptor,
@@ -60,6 +62,8 @@ export interface BridgeDecision {
   policy: ActionPolicy;
   reason: string;
   exact?: ExactAction;
+  /** The lease check's answer, for board-task writes. */
+  lease?: LeaseDecision;
   action?: ToolAction;
   authorization?: AuthorizationDecision;
   approvalId?: string;
@@ -93,6 +97,12 @@ export interface PermissionBridgeOptions {
   runCreated?: Set<string>;
   /** Current content of a worktree file, or null when it does not exist. */
   readWorktreeFile?: (relative: string) => string | null;
+  /**
+   * Step 7 write leases. When set and the request carries a `taskId` (a board task),
+   * every native file write must fall inside that task's lease; a denial carries the
+   * lease reason so the agent can request an extension or submit a hot-file intent.
+   */
+  leases?: PermissionBridgeSeam;
 }
 
 export interface PermissionBridge {
@@ -172,7 +182,7 @@ export function createPermissionBridge(opts: PermissionBridgeOptions): Permissio
 
   async function build(
     req: NativeToolRequest,
-  ): Promise<{ exact: ExactAction; action: ToolAction } | BridgeDecision> {
+  ): Promise<{ exact: ExactAction; action: ToolAction; lease?: LeaseDecision } | BridgeDecision> {
     let exact: ExactAction;
     try {
       exact = mapNativeTool(req, {
@@ -210,6 +220,30 @@ export function createPermissionBridge(opts: PermissionBridgeOptions): Permissio
         diffHash: binding.diffHash,
       };
       exact = { ...exact, arguments: args };
+    }
+
+    // Step 7: a board task writes only inside its lease. Checked before anything is
+    // asked of a person: an out-of-lease write is denied, never escalated.
+    let lease: LeaseDecision | undefined;
+    if (
+      opts.leases &&
+      req.taskId &&
+      exact.toolId === 'fs.write' &&
+      exact.defaultPolicy !== 'deny' &&
+      typeof args.path === 'string'
+    ) {
+      lease = opts.leases.checkLease(req.taskId, args.path.replace(/\\/g, '/'), 'write');
+      if (!lease.allowed) {
+        const reason = 'lease ' + lease.reason + ': ' + lease.message;
+        log('deny ' + req.toolName + ': ' + reason);
+        return {
+          verdict: 'deny',
+          policy: 'deny',
+          reason,
+          lease,
+          exact: { ...exact, reasonCodes: [...exact.reasonCodes, 'lease-' + lease.reason] },
+        };
+      }
     }
 
     // Step 6: protected paths. An edit to one is irreversible and needs an approval
@@ -261,7 +295,7 @@ export function createPermissionBridge(opts: PermissionBridgeOptions): Permissio
       ...(protectedReview !== undefined ? { review: protectedReview } : {}),
     };
     action.previewFingerprint = actionFingerprint(action);
-    return { exact, action };
+    return { exact, action, ...(lease ? { lease } : {}) };
   }
 
   async function classify(
@@ -270,7 +304,7 @@ export function createPermissionBridge(opts: PermissionBridgeOptions): Permissio
   ): Promise<BridgeDecision> {
     const built = await build(req);
     if ('verdict' in built) return built;
-    const { exact, action } = built;
+    const { exact, action, lease } = built;
     let authorization: AuthorizationDecision;
     try {
       authorization = await authorize(exact.descriptor, action, signal);
@@ -297,6 +331,7 @@ export function createPermissionBridge(opts: PermissionBridgeOptions): Permissio
       exact,
       action,
       authorization: final,
+      ...(lease ? { lease } : {}),
     };
   }
 
