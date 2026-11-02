@@ -8,6 +8,7 @@
  */
 
 import { existsSync } from 'node:fs';
+import { resolve as resolvePath } from 'node:path';
 import { z } from 'zod';
 import { PROVIDER_IDS, type ProviderId, type ProviderMode } from '@htn/shared';
 
@@ -152,6 +153,15 @@ const envSchema = z.object({
   // Mock by default so a keyless clone still exercises the outbound-text check
   // end to end; GPTZERO_API_KEY plus GPTZERO_MODE=live scores for real.
   GPTZERO_MODE: modeEnum.default('mock'),
+
+  // Per-run git worktrees for coding harnesses. Mock keeps a fresh clone from
+  // touching the repo: workspaces are plain temp dirs with in-memory checkpoints.
+  // live = real `git worktree` under WORKSPACES_DIR on branch zephyr/<runId>.
+  GIT_MODE: modeEnum.default('mock'),
+  // The repository runs branch from. Default: the monorepo root (api runs in apps/api).
+  GIT_REPO_ROOT: optionalString,
+  // Keep it short: Windows long-path limits bite deep worktree paths.
+  WORKSPACES_DIR: optionalString,
   GPTZERO_API_KEY: optionalString,
   GPTZERO_BASE_URL: optionalUrl,
   /** P(ai) at or above which an authorized outbound send stops for a human. */
@@ -198,6 +208,10 @@ export interface ProviderConfig {
   discoveryLimit?: number;
   /** Explicit model allowlist exposed to Jev. */
   models?: { cheap: string; standard?: string; frontier: string };
+  /** Repository workspaces branch from (git only). */
+  repoRoot?: string;
+  /** Directory holding one worktree per run (git only). */
+  workspacesDir?: string;
   /** Name of the env var that would enable live mode. Shown in health detail. */
   keyVar: string;
 }
@@ -275,6 +289,16 @@ function resolveLocalBrowser(): ProviderConfig {
   };
 }
 
+function resolveGit(): ProviderConfig {
+  const repoRoot = resolvePath(env.GIT_REPO_ROOT ?? resolvePath(process.cwd(), '../..'));
+  return {
+    mode: env.MOCK_ALL ? 'mock' : env.GIT_MODE,
+    repoRoot,
+    workspacesDir: resolvePath(env.WORKSPACES_DIR ?? resolvePath(repoRoot, '.data/workspaces')),
+    keyVar: 'GIT_MODE',
+  };
+}
+
 const providers: Record<ProviderId, ProviderConfig> = {
   hermes: resolveHermes(),
   jev: resolve(
@@ -322,6 +346,7 @@ const providers: Record<ProviderId, ProviderConfig> = {
   gptzero: resolve(env.GPTZERO_MODE, env.GPTZERO_API_KEY, 'GPTZERO_API_KEY', {
     baseUrl: env.GPTZERO_BASE_URL,
   }),
+  git: resolveGit(),
 };
 
 export const config = Object.freeze({

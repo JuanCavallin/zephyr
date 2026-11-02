@@ -4,6 +4,7 @@ import { flushObservability, initObservability } from './lib/observability.js';
 import { seedGraphs } from './services/graphs.service.js';
 import { store } from './store/index.js';
 import { initializeRuntimeProviders, recoverInterruptedRuns } from './services/runtime.js';
+import { reapOrphanWorkspaces } from './services/workspaces.service.js';
 
 async function main(): Promise<void> {
   // Before anything else emits, so the boot sequence itself is traced. Returns
@@ -20,6 +21,8 @@ async function main(): Promise<void> {
   // SQLite performs schema setup at construction; memory hydrate is a no-op.
   await store.hydrate();
   await recoverInterruptedRuns();
+  // A crashed process leaves its runs' worktrees on disk; nothing is active yet.
+  await reapOrphanWorkspaces();
 
   // So the canvas is never empty on a cold start. Never overwrites an edit.
   await seedGraphs();

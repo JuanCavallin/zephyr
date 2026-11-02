@@ -37,24 +37,24 @@ interface WorkspaceProvider {
 
 ## Tasks
 
-- [ ] **Characterize first.** Before touching `hermes/live.ts`, record what the existing
+- [x] **Characterize first.** Before touching `hermes/live.ts`, record what the existing
       Hermes check script covers; the refactor must keep it green unchanged.
-- [ ] Extract client/transport into `_acp/client.ts`; make Hermes a config. Test: existing
+- [x] Extract client/transport into `_acp/client.ts`; make Hermes a config. Test: existing
       Hermes check passes, and the mock peer drives a full session (start, text chunks,
       permission request, cancel).
-- [ ] Mock peer scenarios: normal completion, permission request allowed, permission denied,
+- [x] Mock peer scenarios: normal completion, permission request allowed, permission denied,
       peer crash mid-turn, malformed JSON-RPC line. Assert each ends in a typed terminal
       state, never a hang (timeouts enforced by the client).
-- [ ] Implement git provider: worktree under `.data/workspaces/<runId>` on branch
+- [x] Implement git provider: worktree under `.data/workspaces/<runId>` on branch
       `zephyr/<runId>`. Test against a temp repo fixture: create, edit, diff, dispose.
-- [ ] Checkpoint = `git stash create` (or commit on a shadow ref); rewind restores tree
+- [x] Checkpoint = `git stash create` (or commit on a shadow ref); rewind restores tree
       exactly. Test: write file, checkpoint, write more, rewind → bytes equal checkpoint.
-- [ ] Scrubbed env helper: given process env, return only gateway URL + scoped token + a
+- [x] Scrubbed env helper: given process env, return only gateway URL + scoped token + a
       minimal PATH/HOME allowlist. Test that ambient `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`,
       `AI_GATEWAY_API_KEY` are absent.
-- [ ] Cleanup on terminal status unless the branch is kept; test that a crashed run's
+- [x] Cleanup on terminal status unless the branch is kept; test that a crashed run's
       worktree is reaped on next startup.
-- [ ] `pnpm check:acp` = mock peer suite + git provider suite.
+- [x] `pnpm check:acp` = mock peer suite + git provider suite.
 
 ## Windows notes
 

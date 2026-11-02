@@ -31,6 +31,7 @@ import { create as createMcp } from './mcp/index.js';
 import { create as createAnthropic } from './anthropic/index.js';
 import { create as createGemini } from './gemini/index.js';
 import { create as createGptzero } from './gptzero/index.js';
+import { create as createGit } from './git/index.js';
 
 type Factory = (cfg: ProviderConfig) => ProviderAdapter;
 
@@ -46,6 +47,7 @@ const FACTORIES: Record<ProviderId, Factory> = {
   anthropic: createAnthropic,
   gemini: createGemini,
   gptzero: createGptzero,
+  git: createGit,
 };
 
 /** THE re-wiring knob. One line per capability. */
@@ -61,6 +63,7 @@ const BINDINGS: Record<Capability, ProviderId> = {
   toolbox: 'composio',
   'text.model': 'anthropic',
   'content.analysis': 'gptzero',
+  workspace: 'git',
 };
 
 export interface ProviderRegistry {
@@ -84,7 +87,9 @@ export function createProviderRegistry(record: RecordEgress): ProviderRegistry {
       id === 'browserbase' || id === 'browserless' || id === 'localbrowser'
         ? withBrowserOwnership(raw as BrowserAdapter)
         : raw;
-    const adapter = withEgress(owned, record, newId);
+    // Workspaces are local disk work with no egress and no ProviderCallContext
+    // argument, so the ledger proxy (which keys on that argument) skips them.
+    const adapter = id === 'git' ? owned : withEgress(owned, record, newId);
     cache.set(id, adapter);
     return adapter;
   }

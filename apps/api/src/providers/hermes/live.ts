@@ -8,6 +8,11 @@
  * scoped model/MCP credentials. Continuations retain that context's ACP session;
  * unrelated contexts never share process environment or conversation history.
  *
+ * The transport (spawn, framing, sessions, drain, permission requests,
+ * cancellation, process-tree kill) is the harness-agnostic client in
+ * ../_acp/client.ts. What lives here is Hermes itself: its launch config, its
+ * profile, and the bridge from ACP sessions to start/poll/cancel.
+ *
  * VERIFIED, not guessed: this shape (persistent `.connect()`, `_meta` as the
  * documented extension point on `NewSessionRequest`, `session/cancel` as the
  * real cancellation notification, newline-delimited framing) was proven
@@ -32,7 +37,7 @@
  *
  * `startTask`/`pollTask` bridge ACP's session+event model onto this
  * interface's start/poll/cancel shape: startTask opens a session and returns
- * immediately with sessionId-as-taskId; a background drain loop updates an
+ * immediately with sessionId-as-taskId; a background turn updates an
  * in-memory record; pollTask just reads that record. This deliberately keeps
  * core/orchestrator.ts's existing bounded-polling loop untouched — see its
  * `pollIntervalMs`/`maxPolls` defaults, sized for real Hermes latency
@@ -40,14 +45,17 @@
  * ============================================================================
  */
 
-import { spawn, type ChildProcess } from 'node:child_process';
 import { mkdir, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { basename, resolve } from 'node:path';
-import { Readable, Writable } from 'node:stream';
-import * as acp from '@agentclientprotocol/sdk';
 import type { AgentRuntimeAdapter, ProviderErrorCode, ProviderResult } from '@htn/shared';
 import type { ProviderConfig } from '../../config.js';
+import { AcpClient, denyPermission, type AcpEvent, type AcpSession } from '../_acp/client.js';
+import {
+  buildHarnessEnv,
+  type AcpHarnessConfig,
+  type AcpLaunchContext,
+} from '../_acp/config.js';
 
 interface TaskRecord {
   status: 'running' | 'done' | 'failed';
@@ -57,17 +65,68 @@ interface TaskRecord {
   /** The latest assistant message while the run is still going. */
   partialText?: string;
   error?: string;
-  session: Awaited<ReturnType<acp.SessionBuilder['start']>>;
+  session: AcpSession;
 }
 
 /** Denial cannot fall back to the last option, which may be an allow option. */
-export function denyUnmappedHermesPermission(
-  options: readonly { optionId: string; kind?: string }[],
-): { outcome: 'selected'; optionId: string } | { outcome: 'cancelled' } {
-  const reject =
-    options.find((option) => option.kind === 'reject_once') ??
-    options.find((option) => option.kind === 'reject_always');
-  return reject ? { outcome: 'selected', optionId: reject.optionId } : { outcome: 'cancelled' };
+export const denyUnmappedHermesPermission = denyPermission;
+
+/**
+ * Hermes as an ACP harness.
+ *
+ * `inheritEnv`, `malformedLines: 'ignore'` and no timeouts keep the
+ * pre-extraction behaviour exactly: Hermes always ran with the parent env, the
+ * SDK's tolerance of stray stdout lines, and no client-side deadline
+ * (core/orchestrator.ts's `maxPolls` bounds a run instead).
+ */
+export const hermesHarness: AcpHarnessConfig = {
+  harness: 'hermes',
+  // Spawned with argv, NOT shell:true. `uv` is a real .exe on PATH — Windows
+  // CreateProcess resolves that directly. shell:true instead routes through
+  // cmd.exe (resolved via process.env.ComSpec), which broke under `tsx watch`
+  // specifically (ComSpec apparently doesn't survive tsx watch's nested
+  // process spawn) with `spawn C:\WINDOWS\system32\cmd.exe ENOENT` —
+  // reproduced live, not theoretical.
+  binary: 'uv',
+  args: ['run', 'hermes-acp'],
+  inheritEnv: true,
+  gatewayEnv: (url, token) => ({
+    AGENTOS_GATEWAY_API_KEY: token,
+    // `key_env` in config.yaml does NOT reach the key Hermes actually
+    // sends. For a `custom` provider it resolves, in order:
+    //   explicit api_key -> OPENAI_API_KEY -> same-host main key
+    //   -> the literal "no-key-required"
+    // (hermes-agent/agent/auxiliary_client.py). With none of those set it
+    // sent "no-key-required" and every model call came back 401 against a
+    // gateway token that was correct on both sides -- which reads as a
+    // credentials bug and is not one.
+    //
+    // OPENAI_API_KEY is the supported hook, so it carries the same local
+    // gateway token. Scoped to this child process, and the base URL it
+    // pairs with is loopback, so the value never leaves the machine.
+    OPENAI_API_KEY: token,
+    OPENAI_BASE_URL: url,
+  }),
+  env: (ctx) => ({
+    HERMES_HOME: ctx.stateDir ?? '',
+    HERMES_ACP_SKIP_CONFIGURED_MCP: '0',
+    AGENTOS_MCP_API_KEY: ctx.mcp?.token ?? 'agentos-mcp-local',
+  }),
+  // Hermes reads its MCP servers from the profile's config.yaml, not session/new.
+  mcpServers: () => [],
+  pinnedVersion: null,
+  malformedLines: 'ignore',
+  timeouts: { initializeMs: 0, turnIdleMs: 0, cancelGraceMs: 0 },
+};
+
+/** The launch context a Hermes process gets for this config and profile. */
+export function hermesLaunchContext(cfg: ProviderConfig, profileDir: string): AcpLaunchContext {
+  return {
+    cwd: cfg.cwd ?? process.cwd(),
+    gateway: { url: cfg.baseUrl ?? '', token: cfg.apiKey ?? 'agentos-local' },
+    mcp: { url: cfg.mcpUrl ?? '', token: cfg.mcpApiKey ?? 'agentos-mcp-local' },
+    stateDir: profileDir,
+  };
 }
 
 function meta(op: string, started: number, destination: string | null) {
@@ -169,18 +228,17 @@ function profileDirFor(cfg: ProviderConfig): string {
 
 function createHermesProcess(cfg: ProviderConfig): AgentRuntimeAdapter {
   const tasks = new Map<string, TaskRecord>();
-  let connection: acp.ClientConnection | null = null;
-  let connecting: Promise<acp.ClientConnection> | null = null;
-  let hermesProc: ChildProcess | null = null;
+  let client: AcpClient | null = null;
+  let connecting: Promise<AcpClient> | null = null;
   const connectedToolIds = new Set<string>();
 
   function resetConnection(): void {
-    const processToStop = hermesProc;
-    connection = null;
+    const toClose = client;
+    client = null;
     connecting = null;
-    hermesProc = null;
     connectedToolIds.clear();
-    if (processToStop && processToStop.exitCode === null) processToStop.kill('SIGTERM');
+    // Kills the whole process tree: `uv` AND the Python it started.
+    if (toClose) void toClose.close();
   }
 
   async function prepareProfile(): Promise<string> {
@@ -242,96 +300,32 @@ function createHermesProcess(cfg: ProviderConfig): AgentRuntimeAdapter {
     return profileDir;
   }
 
-  async function connect(): Promise<acp.ClientConnection> {
-    if (connection) return connection;
+  async function connect(): Promise<AcpClient> {
+    if (client) return client;
     if (connecting) return connecting;
 
     connecting = (async () => {
       if (!cfg.cwd) throw new Error('HERMES_CWD is not set');
       const profileDir = await prepareProfile();
-
-      // NOT shell:true. `uv` is a real .exe on PATH — Windows CreateProcess
-      // resolves that directly. shell:true instead routes through cmd.exe
-      // (resolved via process.env.ComSpec), which broke under `tsx watch`
-      // specifically (ComSpec apparently doesn't survive tsx watch's nested
-      // process spawn) with `spawn C:\WINDOWS\system32\cmd.exe ENOENT` —
-      // reproduced live, not theoretical. Passing argv separately here also
-      // sidesteps shell quoting entirely, which is more robust regardless.
-      const spawned = spawn('uv', ['run', 'hermes-acp'], {
-        windowsHide: true,
+      const started = await AcpClient.start({
+        harness: hermesHarness,
         cwd: cfg.cwd,
-        stdio: ['pipe', 'pipe', 'inherit'], // stderr inherited: Hermes's own logs stay visible
-        env: {
-          ...process.env,
-          HERMES_HOME: profileDir,
-          HERMES_ACP_SKIP_CONFIGURED_MCP: '0',
-          AGENTOS_GATEWAY_API_KEY: cfg.apiKey ?? 'agentos-local',
-          // `key_env` in config.yaml does NOT reach the key Hermes actually
-          // sends. For a `custom` provider it resolves, in order:
-          //   explicit api_key -> OPENAI_API_KEY -> same-host main key
-          //   -> the literal "no-key-required"
-          // (hermes-agent/agent/auxiliary_client.py). With none of those set it
-          // sent "no-key-required" and every model call came back 401 against a
-          // gateway token that was correct on both sides -- which reads as a
-          // credentials bug and is not one.
-          //
-          // OPENAI_API_KEY is the supported hook, so it carries the same local
-          // gateway token. Scoped to this child process, and the base URL it
-          // pairs with is loopback, so the value never leaves the machine.
-          OPENAI_API_KEY: cfg.apiKey ?? 'agentos-local',
-          OPENAI_BASE_URL: cfg.baseUrl,
-          AGENTOS_MCP_API_KEY: cfg.mcpApiKey ?? 'agentos-mcp-local',
+        env: buildHarnessEnv(hermesHarness, hermesLaunchContext(cfg, profileDir)),
+        stderr: 'inherit', // Hermes's own logs stay visible
+        log: (m) => console.error('[hermes:live] ' + m),
+        onExit: () => {
+          if (client === started) resetConnection();
         },
-      });
-      hermesProc = spawned;
-
-      // spawn() returning tells you nothing about whether the process
-      // actually started — a bad path/executable surfaces asynchronously as
-      // an 'error' event, and an EventEmitter's UNHANDLED 'error' event is
-      // fatal to the entire Node process. This is exactly what took down the
-      // whole API server (and with it the web dev server's proxy) the one
-      // time this fired — always attach this before doing anything else.
-      await new Promise<void>((resolve, reject) => {
-        spawned.once('error', reject);
-        spawned.once('spawn', () => {
-          spawned.removeListener('error', reject);
-          resolve();
-        });
-      });
-
-      spawned.on('exit', (code) => {
-        console.error('[hermes:live] hermes-acp exited (code ' + code + ')');
-        if (hermesProc === spawned) resetConnection();
-      });
-      // A LATER error (e.g. the process dies mid-session) must not crash the
-      // server either — same reasoning as above, ongoing rather than one-shot.
-      spawned.on('error', (err) => {
-        console.error('[hermes:live] hermes-acp process error:', err.message);
-        if (hermesProc === spawned) resetConnection();
-      });
-
-      const input = Writable.toWeb(spawned.stdin!);
-      const output = Readable.toWeb(spawned.stdout!);
-      const stream = acp.ndJsonStream(input, output);
-
-      const conn = acp
-        .client({ name: 'htn-agentos' })
-        .onRequest(acp.methods.client.session.requestPermission, (ctx) => {
+        onPermission: () => {
           // FAIL CLOSED — see the file header. Never silently approve here.
           console.warn(
             '[hermes:live] denied unmapped native permission; use AgentOS broker tools.',
           );
-          return Promise.resolve({ outcome: denyUnmappedHermesPermission(ctx.params.options) });
-        })
-        .connect(stream);
-
-      await conn.agent.request(acp.methods.agent.initialize, {
-        protocolVersion: acp.PROTOCOL_VERSION,
-        clientCapabilities: { fs: { readTextFile: false, writeTextFile: false } },
+          return 'deny';
+        },
       });
-
-      connection = conn;
-      return conn;
+      client = started;
+      return started;
     })();
 
     try {
@@ -342,8 +336,8 @@ function createHermesProcess(cfg: ProviderConfig): AgentRuntimeAdapter {
     }
   }
 
-  /** Runs in the background from startTask; pollTask only ever reads `record`. */
-  async function drain(record: TaskRecord): Promise<void> {
+  /** Runs one turn in the background; pollTask only ever reads `record`. */
+  function runTurn(record: TaskRecord, text: string): void {
     // Hermes streams EVERY assistant message of a turn as agent_message_chunk:
     // the "Let me search for X" narration before each tool call, then the final
     // answer. Joined into one string, the turn's "result" opened with narration,
@@ -358,48 +352,45 @@ function createHermesProcess(cfg: ProviderConfig): AgentRuntimeAdapter {
     // toolCallId with `tool_call_update`. Recording both counted every call
     // twice (a turn of 8 calls reported toolCallCount 16).
     const seenToolCallIds = new Set<string>();
-    try {
-      for (;;) {
-        const message = await record.session.nextUpdate();
-        if (message.kind === 'stop') {
-          record.result = { text: (messages.at(-1) ?? '').trim() };
-          record.log.push('stop: ' + message.stopReason);
-          record.status = 'done';
-          return;
-        }
-        const update = message.notification.update;
-        if (update.sessionUpdate === 'agent_message_chunk' && update.content.type === 'text') {
-          const chunkMessageId = update.messageId ?? null;
-          if (
-            messages.length === 0 ||
-            toolCallSinceText ||
-            (chunkMessageId !== null && chunkMessageId !== messageId)
-          ) {
-            messages.push('');
-          }
-          messageId = chunkMessageId;
-          toolCallSinceText = false;
-          messages[messages.length - 1] += update.content.text;
-          record.partialText = messages[messages.length - 1];
-        } else if (
-          update.sessionUpdate === 'tool_call' ||
-          update.sessionUpdate === 'tool_call_update'
+
+    const onEvent = (event: AcpEvent) => {
+      if (event.type === 'text') {
+        if (
+          messages.length === 0 ||
+          toolCallSinceText ||
+          (event.messageId !== null && event.messageId !== messageId)
         ) {
-          // Only a NEW call ends the message before it; a late progress update
-          // for an earlier call must not split the final answer.
-          if (seenToolCallIds.has(update.toolCallId)) continue;
-          seenToolCallIds.add(update.toolCallId);
-          toolCallSinceText = true;
-          record.toolCalls.push({
-            tool: 'title' in update ? (update.title ?? update.toolCallId) : update.toolCallId,
-            at: new Date().toISOString(),
-          });
+          messages.push('');
         }
+        messageId = event.messageId;
+        toolCallSinceText = false;
+        messages[messages.length - 1] += event.text;
+        record.partialText = messages[messages.length - 1];
+      } else if (event.type === 'tool_call') {
+        // Only a NEW call ends the message before it; a late progress update
+        // for an earlier call must not split the final answer.
+        if (seenToolCallIds.has(event.toolCallId)) return;
+        seenToolCallIds.add(event.toolCallId);
+        toolCallSinceText = true;
+        record.toolCalls.push({
+          tool: (!event.isUpdate && event.title) || event.toolCallId,
+          at: new Date().toISOString(),
+        });
       }
-    } catch (err) {
-      record.status = 'failed';
-      record.error = (err as Error).message;
-    }
+    };
+
+    void record.session.prompt(text, onEvent).then((terminal) => {
+      if (terminal.kind === 'failed') {
+        record.status = 'failed';
+        record.error = terminal.message;
+        return;
+      }
+      record.result = { text: (messages.at(-1) ?? '').trim() };
+      record.log.push(
+        'stop: ' + (terminal.kind === 'completed' ? terminal.stopReason : 'cancelled'),
+      );
+      record.status = 'done';
+    });
   }
 
   return {
@@ -427,7 +418,7 @@ function createHermesProcess(cfg: ProviderConfig): AgentRuntimeAdapter {
       try {
         const requestedTools = [...new Set(input.tools ?? [])];
         const catalogChanged = requestedTools.some((toolId) => !connectedToolIds.has(toolId));
-        if (connection && catalogChanged) {
+        if (client && catalogChanged) {
           if ([...tasks.values()].some((task) => task.status === 'running')) {
             return failure(
               'startTask',
@@ -455,19 +446,20 @@ function createHermesProcess(cfg: ProviderConfig): AgentRuntimeAdapter {
         // cfg.cwd, which `uv run` requires.
         const workDir = resolve(tmpdir(), 'agentos-hermes-work', basename(profileDirFor(cfg)));
         await mkdir(workDir, { recursive: true });
-        const request = conn.agent.buildSession(workDir).toRequest();
-        request._meta = { enabled_toolsets: requestedTools };
-        const session = await conn.agent.buildSession(request).start();
+        const session = await conn.newSession({
+          cwd: workDir,
+          meta: { enabled_toolsets: requestedTools },
+        });
 
         const record: TaskRecord = { status: 'running', log: ['started'], toolCalls: [], session };
         tasks.set(session.sessionId, record);
 
-        session.prompt(
+        runTurn(
+          record,
           input.context
             ? input.goal + '\n\nContext:\n' + JSON.stringify(input.context)
             : input.goal,
         );
-        void drain(record);
 
         return {
           ok: true,
@@ -528,12 +520,12 @@ function createHermesProcess(cfg: ProviderConfig): AgentRuntimeAdapter {
         record.error = undefined;
         record.toolCalls = [];
         record.log.push('continued');
-        record.session.prompt(
+        runTurn(
+          record,
           input.context
             ? input.instruction + '\n\nContext:\n' + JSON.stringify(input.context)
             : input.instruction,
         );
-        void drain(record);
         return {
           ok: true,
           data: null,
@@ -550,15 +542,11 @@ function createHermesProcess(cfg: ProviderConfig): AgentRuntimeAdapter {
       const record = tasks.get(taskId);
       if (!record) return { ok: true, data: null, meta: meta('cancelTask', started, null) };
 
-      try {
-        const conn = await connect();
-        // Verified real: Hermes logs "Interrupt requested" / "Cancelled
-        // session" in direct response to this. A client-side give-up alone
-        // does NOT stop the turn on Hermes's side — this does.
-        await conn.agent.notify(acp.methods.agent.session.cancel, { sessionId: taskId });
-      } catch (err) {
-        console.error('[hermes:live] session/cancel failed:', err);
-      }
+      // Verified real: Hermes logs "Interrupt requested" / "Cancelled session"
+      // in direct response to session/cancel. A client-side give-up alone does
+      // NOT stop the turn on Hermes's side — this does. No grace period: the
+      // process is torn down right after, as it always was.
+      await record.session.cancel({ graceMs: 0 });
       record.session.dispose();
       tasks.delete(taskId);
       resetConnection();

@@ -20,7 +20,8 @@ export type ProviderId =
   | 'mcp' // user-configured upstream MCP connections
   | 'anthropic' // frontier text model
   | 'gemini' // direct Google cloud model route (second cloud vendor)
-  | 'gptzero'; // outbound-text authenticity check
+  | 'gptzero' // outbound-text authenticity check
+  | 'git'; // per-run git worktrees for coding harnesses (local, no egress)
 
 export const PROVIDER_IDS = [
   'hermes',
@@ -34,6 +35,7 @@ export const PROVIDER_IDS = [
   'anthropic',
   'gemini',
   'gptzero',
+  'git',
 ] as const satisfies readonly ProviderId[];
 
 export type ProviderMode = 'mock' | 'live' | 'disabled';
@@ -59,7 +61,8 @@ export type Capability =
   | 'browser.local'
   | 'toolbox'
   | 'text.model'
-  | 'content.analysis';
+  | 'content.analysis'
+  | 'workspace';
 
 /** Passed to every provider call. Feeds the egress ledger. */
 export interface ProviderCallContext {
@@ -422,6 +425,36 @@ export interface ContentAnalysisAdapter extends ProviderAdapter {
 }
 
 /** Maps a capability to the adapter interface that serves it. */
+/**
+ * An isolated checkout per run. Coding harnesses edit `path`, never the main
+ * checkout; every turn is checkpointed so a run can be rewound exactly.
+ *
+ * Deliberately NOT ProviderResult-shaped and takes no ProviderCallContext: it is
+ * local filesystem work with no egress, so the registry does not wrap it in the
+ * egress ledger. Failures throw.
+ */
+export interface WorkspaceProvider {
+  /** `<workspaces dir>/<runId>` on a new branch `zephyr/<runId>` cut from `base`. */
+  create(runId: string, base: string): Promise<{ path: string; branch: string }>;
+  /** Snapshot the whole working tree (tracked + untracked, minus ignored). */
+  checkpoint(runId: string, turn: number): Promise<{ ref: string; treeHash: string }>;
+  /** Restore the working tree to exactly a checkpoint's bytes. */
+  rewind(runId: string, ref: string): Promise<void>;
+  /** Working tree vs `since` (default: the run's base commit). */
+  diff(runId: string, since?: string): Promise<{ stat: string; hash: string; patch: string }>;
+  /** Remove the worktree and its checkpoint refs; delete the branch unless kept. */
+  dispose(runId: string, keepBranch: boolean): Promise<void>;
+}
+
+export interface WorkspaceAdapter extends ProviderAdapter, WorkspaceProvider {
+  /** Run ids with a workspace on disk, including ones left by a crashed process. */
+  list(): Promise<string[]>;
+  /** Directory of a run's workspace, or undefined when it has none. */
+  pathOf(runId: string): string | undefined;
+  /** Commits on the run branch beyond its base: work worth keeping when reaping. */
+  commitsAhead(runId: string): Promise<number>;
+}
+
 export interface CapabilityMap {
   'agent.runtime': AgentRuntimeAdapter;
   decision: DecisionAdapter;
@@ -430,6 +463,7 @@ export interface CapabilityMap {
   toolbox: ToolboxAdapter;
   'text.model': TextModelAdapter;
   'content.analysis': ContentAnalysisAdapter;
+  workspace: WorkspaceAdapter;
 }
 
 /** Shape returned by GET /api/providers. */
