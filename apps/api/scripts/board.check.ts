@@ -8,6 +8,7 @@
  *   1. Decomposition and waves: glob overlap, conflict graph, plan validation.
  *   2. State machine and derived progress.
  *   3. Leases: grant, deny reasons, extension, expiry, hot files, broker integration.
+ *   4. Hot-file intents: typed appliers, serial integrator, concurrent package.json edits.
  */
 
 process.env.PERSIST_TO_DISK = 'false';
@@ -479,6 +480,95 @@ await test('the broker denies an out-of-lease edit with the lease reason; board-
   } as NativeToolRequest);
   assert.equal(read.verdict, 'allow');
   assert.equal((await bridge.decide(write('src/b/x.ts'))).verdict, 'allow', 'no taskId: not a board task');
+});
+
+console.log('4. hot-file intents');
+
+const { Integrator, worktreeFs } = await import('../src/core/coordination/integrator.js');
+const { applyAddDependency, applyExportSymbol, IntentRejectedError } = await import(
+  '../src/core/coordination/intents.js'
+);
+const { codingEventSchema } = await import('@htn/shared');
+const { readFile: readText, writeFile: writeText, mkdir } = await import('node:fs/promises');
+
+await test('add_dependency keeps indent, EOL and sorted keys; is idempotent; refuses a version change', () => {
+  const crlf = '{\r\n    "name": "x",\r\n    "dependencies": {\r\n        "zod": "^4.0.0"\r\n    }\r\n}\r\n';
+  const next = applyAddDependency(crlf, { name: 'express', version: '^5.1.0' });
+  assert.ok(next.endsWith('}\r\n'));
+  assert.ok(next.includes('\r\n    "dependencies"'), 'four-space indent kept');
+  assert.deepEqual(Object.keys(JSON.parse(next).dependencies), ['express', 'zod']);
+  assert.equal(applyAddDependency(next, { name: 'express', version: '^5.1.0' }), next, 'idempotent');
+  assert.throws(() => applyAddDependency(next, { name: 'express', version: '^4.0.0' }), IntentRejectedError);
+  assert.throws(() => applyAddDependency(next, { name: 'zod', version: '^4.0.0', dev: true }), IntentRejectedError);
+  assert.throws(() => applyAddDependency(next, { name: 'x; rm -rf /', version: '1' }), IntentRejectedError);
+  assert.throws(() => applyAddDependency('not json', { name: 'a', version: '1' }), IntentRejectedError);
+  const dev = JSON.parse(applyAddDependency('{"name":"x"}\n', { name: 'tsx', version: '^4', dev: true }));
+  assert.deepEqual(dev.devDependencies, { tsx: '^4' });
+});
+
+await test('export_symbol appends once', () => {
+  const a = applyExportSymbol("export * from './a.js';\n", { from: './board.js', symbols: ['Board', 'Lane'] });
+  assert.equal(a, "export * from './a.js';\nexport { Board, Lane } from './board.js';\n");
+  assert.equal(applyExportSymbol(a, { from: './board.js', symbols: ['Board', 'Lane'] }), a);
+  assert.equal(applyExportSymbol('', { from: './x.js' }), "export * from './x.js';\n");
+  assert.throws(() => applyExportSymbol('', { from: 'lodash' }), IntentRejectedError);
+});
+
+await test('two concurrent package.json intents both land, in submission order, as valid JSON', async () => {
+  const root = join(scratch, 'integration');
+  await mkdir(root, { recursive: true });
+  await writeText(join(root, 'package.json'), '{\n  "name": "demo",\n  "dependencies": {}\n}\n');
+  const base = worktreeFs(root);
+  const writes: string[] = [];
+  // A slow read widens the race window: without the lock, the second intent would read
+  // the file before the first wrote it and one dependency would be lost.
+  const fs = {
+    read: async (p: string) => {
+      const v = await base.read(p);
+      await new Promise((r) => setTimeout(r, 20));
+      return v;
+    },
+    write: async (p: string, c: string) => {
+      writes.push(JSON.stringify(Object.keys(JSON.parse(c).dependencies ?? {})));
+      await base.write(p, c);
+    },
+  };
+  const updates: Array<{ status: string; error?: string }> = [];
+  const integrator = new Integrator({
+    fs,
+    onUpdate: (intent, error) => {
+      assert.ok(codingEventSchema.safeParse({ type: 'intent.updated', intent, ...(error ? { error } : {}) }).success);
+      updates.push({ status: intent.status, ...(error ? { error } : {}) });
+    },
+  });
+  const [a, b, c, d] = await Promise.all([
+    integrator.submit({
+      taskId: 't1', path: 'package.json', kind: 'add_dependency',
+      description: 'add zod@4', payload: { name: 'zod', version: '^4.0.0' },
+    }),
+    integrator.submit({
+      taskId: 't2', path: 'package.json', kind: 'add_dependency',
+      description: 'add express@5', payload: { name: 'express', version: '^5.1.0' },
+    }),
+    integrator.submit({
+      taskId: 't3', path: 'package.json', kind: 'register_route',
+      description: 'register /api/board', payload: { route: '/api/board' },
+    }),
+    integrator.submit({ taskId: 't3', path: 'src/a/x.ts', kind: 'other', description: 'not hot' }),
+  ]);
+  assert.deepEqual([a.status, b.status, c.status, d.status], ['applied', 'applied', 'rejected', 'rejected']);
+  assert.deepEqual(writes, ['["zod"]', '["express","zod"]'], 'serial, in submission order');
+  const pkg = JSON.parse(await readText(join(root, 'package.json'), 'utf8'));
+  assert.deepEqual(pkg.dependencies, { express: '^5.1.0', zod: '^4.0.0' });
+  assert.match(integrator.errorOf(c.id) ?? '', /needs a person/);
+  assert.match(integrator.errorOf(d.id) ?? '', /not a hot file/);
+  assert.equal(updates.filter((u) => u.status === 'pending').length, 4);
+  assert.equal(integrator.list({ status: 'applied' }).length, 2);
+  assert.equal(integrator.list({ taskId: 't3' }).length, 2);
+  await assert.rejects(
+    integrator.submit({ taskId: 't1', path: '../escape.json', kind: 'other', description: 'x' }),
+    IntentRejectedError,
+  );
 });
 
 console.log(`\n${passed} passed`);

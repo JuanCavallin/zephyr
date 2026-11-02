@@ -458,6 +458,20 @@ export const codingEventSchema = z.discriminatedUnion('type', [
     addedGlobs: z.array(repoPathSchema).min(1),
   }),
   z.object({ type: z.literal('lease.expired'), leaseId: id, taskId: id, at: iso }),
+  /** A hot-file intent was submitted, applied or rejected by the integrator. */
+  z.object({ type: z.literal('intent.updated'), intent: hotFileIntentSchema, error: z.string().min(1).optional() }),
+  /** A merge-queue outcome for one task. */
+  z.object({
+    type: z.literal('merge.result'),
+    taskId: id,
+    outcome: z.enum(['merged', 'conflict', 'tests_failed', 'awaiting_approval', 'rejected']),
+    /** Head commit on the integration branch after a merge. */
+    commit: z.string().min(1).optional(),
+    /** The fix task spawned for a conflict or red tests. */
+    fixTaskId: id.optional(),
+    detail: z.string().min(1).optional(),
+    at: iso,
+  }),
   z.object({ type: z.literal('learning.signal'), signal: preferenceSignalSchema }),
   z.object({
     type: z.literal('learning.candidate'),
