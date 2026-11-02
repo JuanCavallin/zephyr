@@ -31,33 +31,46 @@ assembleEvidence(runId: string): Promise<EvidenceBundle>;   // schema from step 
 
 ## Tasks
 
-- [ ] Test inventory: discover tests per runner from file patterns; coverage map when
+- [x] Test inventory: discover tests per runner from file patterns; coverage map when
       present, else import graph + path heuristics. Test on a fixture repo with two runners.
-- [ ] `selectTests`: candidates intersect the diff plus policy always-run; Jev `score` per
+- [x] `selectTests`: candidates intersect the diff plus policy always-run; Jev `score` per
       test; fallback runs every candidate. Test both sources; unavailable Jev never
       shrinks the set.
-- [ ] Protected paths (default: pre-existing test files, snapshots, CI config, lint config,
+- [x] Protected paths (default: pre-existing test files, snapshots, CI config, lint config,
       `*.lock`): edits classified **irreversible** → approval carrying the exact diff; new
       test files allowed and flagged. Tests: edit existing test → approval; add new test →
       auto + flagged; lockfile via a hot-file intent (step 7) still goes through approval.
-- [ ] Completion judge: Jev `done`/`continue`/`blocked` from test digest, diff stat and turn
+- [x] Completion judge: Jev `done`/`continue`/`blocked` from test digest, diff stat and turn
       count; fallback rule on test status + budget. Test: failing tests never yield `done`
       from the fallback.
-- [ ] Flaky-vs-real: Jev `probability` from per-test failure history; default treat as real.
-- [ ] Evidence bundle assembly from the trace and ledger: diff stat + hash, per-turn
+- [x] Flaky-vs-real: Jev `probability` from per-test failure history; default treat as real.
+- [x] Evidence bundle assembly from the trace and ledger: diff stat + hash, per-turn
       checkpoints, tests (scores, fallback flag, before/after), added/modified tests,
       protected-path approvals, tokens in/out/cache read/write, cost, wall time, egress
       summary. Test against a mock run: every field populated, and a missing optional
       section (no UI walkthrough) does not fail assembly.
-- [ ] Render to markdown for PR bodies; attach on `git.publish`. Test the body stays under
+- [x] Render to markdown for PR bodies; attach on `git.publish`. Test the body stays under
       the host's size limit by truncating sections, never the header.
-- [ ] Full-suite-before-publish when policy says so; test it blocks publish on failure.
-- [ ] `pnpm check:verify`.
+- [x] Full-suite-before-publish when policy says so; test it blocks publish on failure.
+- [x] `pnpm check:verify`.
 
 ## Done when
 
 A mock-harness run that edits code produces `evidence.json` and a rendered summary, and a
 Zephyr-opened PR (live, manual) carries the bundle.
+
+**Status (2026-11-02).** The offline half is done and in `pnpm check:verify` (section
+6, e2e): a mock-harness run edits a real git worktree, `evidence.json` validates,
+`evidence.md` is rendered, and publish pushes to a local bare remote with `gh pr create
+--body-file evidence.md`. `gh` is stubbed there and the pushed diff equals the approved
+one. Still open:
+
+- **The live, manual PR has not been opened.** The entry point is
+  `publishRunLive(runId, { title, stepId })` in `apps/api/src/services/publish.service.ts`.
+  No HTTP route calls it yet.
+- Only the Zephyr executor attaches the bundle. A harness that runs `gh pr create`
+  itself still meets the `git.publish` approval, but its PR body is whatever the
+  harness wrote.
 
 ## Deferred (step G in the spec)
 
