@@ -544,5 +544,263 @@ await test('a protected edit with no approval gate denies', async () => {
 });
 
 await rm(scratch, { recursive: true, force: true }).catch(() => undefined);
+/* ------------------------------ 5. evidence ----------------------------- */
+
+console.log('evidence');
+const { buildEvidence } = await import('../src/core/verify/evidence.js');
+const { renderEvidence, GITHUB_BODY_LIMIT } = await import('../src/core/verify/render.js');
+const { createEvidenceService } = await import('../src/services/evidence.service.js');
+const { createMemoryStore } = await import('../src/store/memory.js');
+const { evidenceBundleSchema } = await import('@htn/shared');
+type RunEvent = import('@htn/shared').RunEvent;
+type Run = import('@htn/shared').Run;
+type EgressEvent = import('@htn/shared').EgressEvent;
+
+const RUN = 'run_evidence';
+const evidencePatch = [
+  'diff --git a/src/math.ts b/src/math.ts',
+  'index 1111111..2222222 100644',
+  '--- a/src/math.ts',
+  '+++ b/src/math.ts',
+  '@@ -1 +1,2 @@',
+  '-export const add = (a, b) => a + b;',
+  '+export const add = (a: number, b: number) => a + b;',
+  '+export const sub = (a: number, b: number) => a - b;',
+  'diff --git a/src/math.test.ts b/src/math.test.ts',
+  'index 3333333..4444444 100644',
+  '--- a/src/math.test.ts',
+  '+++ b/src/math.test.ts',
+  '@@ -1 +1,2 @@',
+  ' expect(add(1, 2)).toBe(3);',
+  '+expect(add(2, 2)).toBe(4);',
+  'diff --git a/src/sub.test.ts b/src/sub.test.ts',
+  'new file mode 100644',
+  'index 0000000..5555555',
+  '--- /dev/null',
+  '+++ b/src/sub.test.ts',
+  '@@ -0,0 +1 @@',
+  '+expect(sub(3, 1)).toBe(2);',
+  '',
+].join('\n');
+
+const at = (s: number) => new Date(Date.UTC(2026, 10, 2, 12, 0, s)).toISOString();
+function mockRunEvents(): RunEvent[] {
+  const gw = (callId: string, input: number, output: number, write: number, read: number, cost?: number): RunEvent => ({
+    type: 'gateway.call',
+    runId: RUN,
+    callId,
+    model: 'claude-sonnet-5-5',
+    status: 200,
+    stream: true,
+    usage: { inputTokens: input, outputTokens: output, cacheCreationInputTokens: write, cacheReadInputTokens: read },
+    ...(cost === undefined ? {} : { costCents: cost }),
+    runCacheHitRate: 0.5,
+    toolUses: 1,
+    at: at(5),
+  });
+  const approved = (approvalId: string, review: Record<string, unknown> | undefined): RunEvent =>
+    ({
+      type: 'tool.lifecycle',
+      lifecycle: {
+        id: 'tl_' + approvalId,
+        runId: RUN,
+        stepId: 'step_1',
+        sessionStateId: 'ss_1',
+        phase: 'approved',
+        action: { id: 'act_' + approvalId, ...(review ? { review } : {}) },
+        approvalId,
+        at: at(7),
+      },
+    }) as unknown as RunEvent;
+  const selected = [
+    { id: 'src/math.test.ts', score: 0.92, fallback: false },
+    { id: 'src/sub.test.ts', score: 0.81, fallback: false },
+  ];
+  return [
+    { type: 'verify.tests', runId: RUN, phase: 'before', selected, source: 'jev', tally: { passed: 1, failed: 1, skipped: 0 }, at: at(2) },
+    gw('call_1', 100, 50, 2000, 0, 1.25),
+    { type: 'workspace.checkpoint', runId: RUN, turnId: 'turn_1', ref: 'refs/zephyr/checkpoints/run_evidence/1', treeHash: 'a'.repeat(40), at: at(10) },
+    approved('apr_1', { protectedPath: 'src/math.test.ts', protection: 'existing-test', diff: '...' }),
+    approved('apr_1', { protectedPath: 'src/math.test.ts', protection: 'existing-test', diff: '...' }),
+    approved('apr_2', undefined),
+    gw('call_2', 40, 30, 0, 2000),
+    gw('call_other', 999, 999, 999, 999, 99),
+    { type: 'workspace.checkpoint', runId: RUN, turnId: 'turn_2', ref: 'refs/zephyr/checkpoints/run_evidence/2', at: at(20) },
+    { type: 'verify.tests', runId: RUN, phase: 'after', selected, source: 'jev', tally: { passed: 3, failed: 0, skipped: 1 }, at: at(25) },
+  ].map((e) => (e.type === 'gateway.call' && 'callId' in e && e.callId === 'call_other' ? { ...e, runId: 'run_other' } : e)) as RunEvent[];
+}
+const mockEgress = [
+  { destination: 'api.anthropic.com' },
+  { destination: 'api.anthropic.com' },
+  { destination: 'ai-gateway.vercel.sh' },
+];
+
+await test('assembly: a mock run populates every field from the trace and ledgers', () => {
+  const b = buildEvidence({
+    runId: RUN,
+    taskId: 'task_1',
+    events: mockRunEvents(),
+    egress: mockEgress,
+    diff: { patch: evidencePatch, hash: 'b'.repeat(64) },
+    startedAt: at(0),
+    endedAt: at(30),
+    walkthrough: { previewUrl: 'http://localhost:5173/', steps: [{ description: 'open the calculator' }] },
+    baseline: { tokensIn: 900, tokensOut: 300, cacheReadTokens: 0, cacheWriteTokens: 0, costCents: 9, wallMs: 90_000 },
+  });
+  assert.ok(evidenceBundleSchema.safeParse(b).success);
+  assert.match(b.id, /^evb_[0-9a-f]{16}$/);
+  assert.equal(b.taskId, 'task_1');
+  assert.deepEqual(b.diff, { files: 3, insertions: 4, deletions: 1, hash: 'b'.repeat(64) });
+  assert.deepEqual(b.checkpoints.map((c) => c.turnId), ['turn_1', 'turn_2']);
+  assert.deepEqual(b.tests.selected.map((s) => [s.id, s.score, s.fallback]), [
+    ['src/math.test.ts', 0.92, false],
+    ['src/sub.test.ts', 0.81, false],
+  ]);
+  assert.deepEqual(b.tests.before, { passed: 1, failed: 1, skipped: 0 });
+  assert.deepEqual(b.tests.after, { passed: 3, failed: 0, skipped: 1 });
+  assert.deepEqual(b.tests.added, ['src/sub.test.ts']);
+  assert.deepEqual(b.tests.modified, ['src/math.test.ts']);
+  assert.deepEqual(b.protectedPathApprovals, [{ path: 'src/math.test.ts', approvalId: 'apr_1' }], 'deduped; non-protected approvals ignored');
+  assert.deepEqual(b.usage, { tokensIn: 140, tokensOut: 80, cacheReadTokens: 2000, cacheWriteTokens: 2000, costCents: 1.25, wallMs: 30_000 });
+  assert.equal(b.baseline?.tokensIn, 900);
+  assert.deepEqual(b.egress, { calls: 3, destinations: ['ai-gateway.vercel.sh', 'api.anthropic.com'] });
+  assert.equal(b.walkthrough?.steps.length, 1);
+});
+
+await test('assembly: missing optional sections (walkthrough, baseline, before) do not fail', () => {
+  const events = mockRunEvents().filter((e) => !(e.type === 'verify.tests' && e.phase === 'before'));
+  const b = buildEvidence({ runId: RUN, events, egress: [], diff: { patch: evidencePatch }, startedAt: at(0), endedAt: at(1) });
+  assert.equal(b.walkthrough, undefined);
+  assert.equal(b.baseline, undefined);
+  assert.equal(b.tests.before, undefined);
+  assert.match(b.diff.hash, /^[0-9a-f]{64}$/, 'hash falls back to sha256 of the patch');
+  assert.deepEqual(b.egress, { calls: 0, destinations: [] });
+
+  const bare = buildEvidence({ runId: RUN, events: [], egress: [], diff: { patch: '' }, startedAt: at(0), endedAt: at(0) });
+  assert.deepEqual(bare.tests.after, { passed: 0, failed: 0, skipped: 0 });
+  assert.deepEqual(bare.tests.selected, []);
+  assert.deepEqual(bare.checkpoints, []);
+});
+
+await test('assembly: a full-suite run stands in for after; fallback selections keep their flag', () => {
+  const sel = [{ id: 'src/math.test.ts', fallback: true }];
+  const b = buildEvidence({
+    runId: RUN,
+    events: [{ type: 'verify.tests', runId: RUN, phase: 'full', selected: sel, source: 'full', tally: { passed: 9, failed: 0, skipped: 0 }, at: at(1) }],
+    egress: [],
+    diff: { patch: evidencePatch },
+    startedAt: at(0),
+    endedAt: at(2),
+  });
+  assert.deepEqual(b.tests.after, { passed: 9, failed: 0, skipped: 0 });
+  assert.deepEqual(b.tests.selected, sel);
+});
+
+await test('service: assembleEvidence reads the store and workspace, writes evidence.json and evidence.md', async () => {
+  const store = createMemoryStore({ persistToDisk: false });
+  await store.createRun({ id: RUN, status: 'succeeded', createdAt: at(0), updatedAt: at(42) } as unknown as Run);
+  for (const e of mockRunEvents()) await store.appendEvent(RUN, e);
+  for (const [i, e] of mockEgress.entries())
+    await store.appendEgress({ id: 'eg_' + i, runId: RUN, at: at(3), providerId: 'anthropic', op: 'messages', dataSpans: [], policyRule: 'r', decision: 'allowed', ...e } as EgressEvent);
+  const evidenceDir = join(scratch, 'evidence');
+  const service = createEvidenceService({
+    store,
+    workspaces: async () => ({ diff: async () => ({ stat: '', hash: 'c'.repeat(64), patch: evidencePatch }) }),
+    evidenceDir,
+    clock: () => at(50),
+  });
+  const bundle = await service.assembleEvidence(RUN);
+  assert.equal(bundle.usage.wallMs, 42_000, 'a terminal run ends at updatedAt');
+  assert.equal(bundle.diff.hash, 'c'.repeat(64));
+  assert.equal(bundle.egress.calls, 3);
+
+  const out = await service.produce(RUN);
+  const { readFile } = await import('node:fs/promises');
+  const written = JSON.parse(await readFile(out.path!, 'utf8'));
+  assert.ok(evidenceBundleSchema.safeParse(written).success, 'evidence.json validates');
+  assert.equal(await readFile(join(evidenceDir, RUN, 'evidence.md'), 'utf8'), out.markdown);
+
+  const broken = createEvidenceService({
+    store,
+    workspaces: async () => ({ diff: async () => { throw new Error('workspace disposed'); } }),
+    evidenceDir,
+  });
+  await assert.rejects(broken.assembleEvidence(RUN), /no diff for run/);
+  await assert.rejects(service.assembleEvidence('run_missing'), /no run/);
+});
+
+function bigBundle(selectedCount: number) {
+  return buildEvidence({
+    runId: RUN,
+    taskId: 'task_1',
+    events: [
+      ...mockRunEvents(),
+      {
+        type: 'verify.tests',
+        runId: RUN,
+        phase: 'after',
+        selected: Array.from({ length: selectedCount }, (_, i) => ({ id: `src/generated/case_${String(i).padStart(5, '0')}.test.ts`, score: 0.5, fallback: false })),
+        source: 'jev',
+        tally: { passed: selectedCount, failed: 2, skipped: 0 },
+        at: at(29),
+      },
+    ],
+    egress: mockEgress,
+    diff: { patch: evidencePatch },
+    startedAt: at(0),
+    endedAt: at(30),
+  });
+}
+
+await test('render: header first, every section present when it fits', () => {
+  const md = renderEvidence(buildEvidence({
+    runId: RUN, taskId: 'task_1', events: mockRunEvents(), egress: mockEgress, diff: { patch: evidencePatch },
+    startedAt: at(0), endedAt: at(30),
+    walkthrough: { previewUrl: 'http://localhost:5173/', steps: [{ description: 'open the calculator', screenshotUrl: 'shots/1.png' }] },
+  }));
+  assert.ok(md.startsWith('## Zephyr evidence\n'));
+  for (const needle of [
+    'Run `run_evidence` · task `task_1`',
+    '- **Diff:** 3 files, +4 −1',
+    '- **Tests:** 3 passed, 0 failed, 1 skipped — all passing (before: 1 passed, 1 failed)',
+    '- **Protected-path approvals:** 1',
+    '140 in, 80 out, 2000 cache read, 2000 cache write · $0.0125 · 30.0 s',
+    '- **Egress:** 3 calls to 2 destinations',
+    '| `src/math.test.ts` | 0.92 | Jev |',
+    '- added `src/sub.test.ts`',
+    '- modified `src/math.test.ts`',
+    '- `src/math.test.ts` — approval `apr_1`',
+    '### Checkpoints (2)',
+    '### Usage',
+    '- `api.anthropic.com`',
+    '### UI walkthrough',
+    '([screenshot](shots/1.png))',
+  ]) assert.ok(md.includes(needle), needle);
+  assert.ok(!md.includes('cut for size') && !md.includes('Omitted for size'));
+});
+
+await test('render: stays under the host limit by truncating sections, never the header', () => {
+  const b = bigBundle(5000);
+  const full = renderEvidence(b, { limit: 10_000_000 });
+  assert.ok(full.length > GITHUB_BODY_LIMIT, 'fixture overflows the GitHub limit');
+  const md = renderEvidence(b);
+  assert.ok(md.length <= GITHUB_BODY_LIMIT, `body ${md.length} <= ${GITHUB_BODY_LIMIT}`);
+  const header = full.slice(0, full.indexOf('\n### '));
+  assert.ok(md.startsWith(header), 'the header survives whole');
+  assert.ok(md.includes('**2 failing**'));
+  assert.match(md, /_… \d+ more lines cut for size; see `evidence.json`\._/);
+  for (const small of ['- `src/math.test.ts` — approval `apr_1`', '### Usage', '- `api.anthropic.com`', '- added `src/sub.test.ts`'])
+    assert.ok(md.includes(small), `a large section never pushes out a small one: ${small}`);
+  assert.ok(md.trimEnd().endsWith('._'), 'footer kept');
+
+  for (const limit of [3000, 1500, 1200]) {
+    const small = renderEvidence(b, { limit });
+    assert.ok(small.length <= limit, `limit ${limit}: ${small.length}`);
+    assert.ok(small.startsWith(header));
+  }
+  const tiny = renderEvidence(b, { limit: 10 });
+  assert.ok(tiny.startsWith(header), 'a limit below the header still emits the header whole');
+});
+
 console.log(`\nverify: ${passed} passed`);
 process.exit(0);

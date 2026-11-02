@@ -238,10 +238,19 @@ export function createClaudeCodeRuntime(deps: ClaudeCodeRuntimeDeps): ClaudeCode
     };
 
     record.turn = (async () => {
+      const turnId = newId('turn');
       try {
         const ws = await deps.workspaces();
         const checkpoint = await ws.checkpointTurn(record.runId);
         record.log.push('checkpoint: turn ' + checkpoint.turn + ' @ ' + checkpoint.ref);
+        await emit(record.runId, {
+          type: 'workspace.checkpoint',
+          runId: record.runId,
+          turnId,
+          ref: checkpoint.ref,
+          treeHash: checkpoint.treeHash,
+          at: nowIso(),
+        });
       } catch (error) {
         // No checkpoint means the turn could not be rewound: do not run it.
         record.status = 'failed';
@@ -253,7 +262,7 @@ export function createClaudeCodeRuntime(deps: ClaudeCodeRuntimeDeps): ClaudeCode
         type: 'harness.turn.ended',
         runId: record.runId,
         sessionId: record.session.sessionId,
-        turnId: newId('turn'),
+        turnId,
         harness: 'claudecode',
         stopReason: turnStopReason(terminal),
         at: nowIso(),
