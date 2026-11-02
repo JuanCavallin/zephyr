@@ -1,0 +1,23 @@
+
+ RUN  v2.1.0 /repo
+
+ ✓ src/math.test.ts > math > adds 2ms
+ × src/math.test.ts > math > divides by zero 3ms
+   → expected Infinity to throw
+ ✓ src/math.test.ts > math > multiplies 1ms
+
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 1 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  src/math.test.ts > math > divides by zero
+AssertionError: expected [Function] to throw an error
+ ❯ src/math.test.ts:14:22
+     12|   it('divides by zero', () => {
+     13|     const f = () => divide(1, 0);
+     14|     expect(f).toThrow();
+       |               ^
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/1]⎯
+
+ Test Files  1 failed (1)
+      Tests  1 failed | 2 passed (3)
+   Duration  210ms

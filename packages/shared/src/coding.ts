@@ -546,3 +546,36 @@ export interface RoutingSeam {
 export interface SignalSeam {
   recordSignal(s: PreferenceSignal): Promise<void>;
 }
+
+/* -------------------------------------------------------------------------- */
+/* Token levers (step 5) — run policy, default on                             */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The three token levers a coding run applies. Each is independently switchable so
+ * a run can be measured with and without it; all default on.
+ *
+ * - `shapedTools` (L1): raw test/build/lint shell commands are denied with a pointer
+ *   to `zephyr_run_tests` / `zephyr_build` / `zephyr_lint`, which return a digest.
+ * - `contextPack` (L2): the first prompt carries a ranked file map plus the top
+ *   files' text, so the agent does not spend turns exploring.
+ * - `schemaMin` (L3): strict MCP config and a per-task-class native tool disable
+ *   list, chosen once at session start so tool definitions stay byte-stable.
+ */
+export const leversSchema = z.object({
+  shapedTools: z.boolean(),
+  contextPack: z.boolean(),
+  schemaMin: z.boolean(),
+});
+export type Levers = z.infer<typeof leversSchema>;
+
+export const DEFAULT_LEVERS: Levers = Object.freeze({
+  shapedTools: true,
+  contextPack: true,
+  schemaMin: true,
+}) as Levers;
+
+/** Defaults with any explicitly set lever overriding them. */
+export function resolveLevers(partial?: Partial<Levers> | null): Levers {
+  return { ...DEFAULT_LEVERS, ...Object.fromEntries(Object.entries(partial ?? {}).filter(([, v]) => typeof v === 'boolean')) };
+}

@@ -11,6 +11,7 @@
     "check:acp": "tsx scripts/acp.check.ts",
     "check:claudecode": "tsx scripts/claudecode.check.ts",
     "check:gateway": "tsx scripts/gateway.check.ts",
+    "check:levers": "tsx scripts/levers.check.ts",
     "check:hermes-live": "tsx scripts/hermes-live.check.ts",
     "check:graph": "tsx scripts/graph-schema.check.ts && tsx scripts/graph-synthesis.check.ts && tsx scripts/graph-context.check.ts && tsx scripts/graph-scopes.check.ts",
     "check:graph-scopes": "tsx scripts/graph-scopes.check.ts",

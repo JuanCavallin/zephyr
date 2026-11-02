@@ -22,6 +22,7 @@ import { ToolBroker } from '../core/tools/broker.js';
 import { InMemoryToolExecutorRegistry } from '../core/tools/executors.js';
 import { InMemoryToolRegistry } from '../core/tools/registry.js';
 import { registerCoreLocalTools } from '../core/tools/local.js';
+import { registerShapedTools } from '../core/tools/shaped/index.js';
 import { registerDocumentTools } from '../core/tools/documents.js';
 import { registerBenchmarkFixture } from '../core/tools/benchmarkFixture.js';
 import { registerSearchTool } from '../core/tools/search.js';
@@ -77,6 +78,8 @@ export const toolBroker = new ToolBroker(
   },
 );
 registerCoreLocalTools(toolRegistry, toolExecutors, sessionStateService);
+// Step 5 L1: test/build/lint run by Zephyr and returned as digests.
+export const shapedTools = registerShapedTools(toolRegistry, toolExecutors);
 registerBenchmarkFixture(toolRegistry, toolExecutors);
 registerDocumentTools(toolRegistry, toolExecutors, { mode: config.mock.all ? 'mock' : 'live' });
 registerSearchTool(toolRegistry, toolExecutors, {

@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuites name="vitest tests" tests="5" failures="2" errors="0" skipped="1">
+  <testsuite name="src/cart.test.ts" tests="5" failures="2" skipped="1">
+    <testcase classname="src/cart.test.ts" name="cart &gt; adds an item" time="0.002"/>
+    <testcase classname="src/cart.test.ts" name="cart &gt; totals with tax" time="0.004">
+      <failure message="expected 10.8 to be 10.85" type="AssertionError">AssertionError: expected 10.8 to be 10.85
+ ❯ src/cart.test.ts:21:30</failure>
+    </testcase>
+    <testcase classname="src/cart.test.ts" name="cart &gt; removes an item" time="0.001"/>
+    <testcase classname="src/cart.test.ts" name="cart &gt; applies coupon" time="0.003">
+      <failure message="Cannot read properties of undefined (reading 'pct')" type="TypeError">TypeError: Cannot read properties of undefined (reading 'pct')
+ ❯ applyCoupon src/cart.ts:40:18
+ ❯ src/cart.test.ts:33:5</failure>
+    </testcase>
+    <testcase classname="src/cart.test.ts" name="cart &gt; slow path" time="0">
+      <skipped/>
+    </testcase>
+  </testsuite>
+</testsuites>

@@ -7,7 +7,7 @@
  */
 
 import type { BrowserOperation, BrowserPerformResult, ElementTable } from './browser.js';
-import type { NativeToolRequest, PermissionVerdict } from './coding.js';
+import type { Levers, NativeToolRequest, PermissionVerdict } from './coding.js';
 
 export type ProviderId =
   | 'hermes' // agent runtime (Nous Research)
@@ -139,7 +139,13 @@ export interface ProviderAdapter {
 
 export interface AgentRuntimeAdapter extends ProviderAdapter {
   startTask(
-    input: { goal: string; context?: unknown; tools?: string[] },
+    input: {
+      goal: string;
+      context?: unknown;
+      tools?: string[];
+      /** Token levers for coding harnesses (step 5); unset levers default on. */
+      levers?: Partial<Levers>;
+    },
     ctx: ProviderCallContext,
   ): Promise<ProviderResult<{ taskId: string }>>;
   pollTask(

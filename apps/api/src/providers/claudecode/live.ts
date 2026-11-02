@@ -37,6 +37,7 @@ import type {
   ProviderResult,
   RunEvent,
 } from '@htn/shared';
+import { resolveLevers } from '@htn/shared';
 import { config, type ProviderConfig } from '../../config.js';
 import {
   gatewayRunTokens,
@@ -61,6 +62,8 @@ import { hookTokens, HookTokenStore, MANAGED_HOOK_TTL_MS } from '../../core/hook
 import type { WorkspacesService } from '../../services/workspaces.service.js';
 import { newId, nowIso } from '../../lib/ids.js';
 import { claudeCodeSettings, hookUrl } from './settings.js';
+import { offeredShapedKinds } from '../../core/tools/shaped/index.js';
+import { runWorktrees, type RunWorktrees } from '../../core/tools/shaped/worktrees.js';
 
 /** The claude-agent-acp release this Zephyr build was verified against. */
 export const CLAUDE_AGENT_ACP_VERSION = '0.99.1';
@@ -134,6 +137,8 @@ export interface ClaudeCodeRuntimeDeps {
   requireGatewayCredentials?: boolean;
   stderr?: 'inherit' | 'ignore';
   log?: (message: string) => void;
+  /** Where shaped tools find a run's worktree (Step 5 L1). Defaults to the process registry. */
+  worktrees?: RunWorktrees;
 }
 
 interface TaskRecord {
@@ -186,6 +191,7 @@ export interface ClaudeCodeRuntime extends AgentRuntimeAdapter {
 
 export function createClaudeCodeRuntime(deps: ClaudeCodeRuntimeDeps): ClaudeCodeRuntime {
   const tasks = new Map<string, TaskRecord>();
+  const worktrees = deps.worktrees ?? runWorktrees;
   const log = deps.log ?? ((m: string) => console.warn('[claudecode] ' + m));
   const emit = async (runId: string, event: RunEvent) => {
     try {
@@ -197,6 +203,7 @@ export function createClaudeCodeRuntime(deps: ClaudeCodeRuntimeDeps): ClaudeCode
 
   async function teardown(record: TaskRecord): Promise<void> {
     deps.tokens.revoke(record.token);
+    worktrees.unbind(record.runId, record.worktree);
     if (record.gatewayToken) deps.gatewayTokens?.finish(record.gatewayToken);
     record.session.dispose();
     await record.client.close();
@@ -289,15 +296,24 @@ export function createClaudeCodeRuntime(deps: ClaudeCodeRuntimeDeps): ClaudeCode
       let token: string | undefined;
       let gatewayToken: string | undefined;
       let client: AcpClient | undefined;
+      let boundWorktree: string | undefined;
+      const levers = resolveLevers(input.levers);
       try {
         const ws = await deps.workspaces();
         const workspace = await ws.open(ctx.runId);
+        worktrees.bind(ctx.runId, workspace.path);
+        boundWorktree = workspace.path;
         stateDir = await mkdtemp(join(tmpdir(), 'zephyr-claudecode-'));
+        // Step 5 L1: deny raw test/build/lint only for the kinds whose shaped
+        // tool this task was actually offered over MCP.
+        const shapedTools =
+          levers.shapedTools && deps.mcpUrl ? offeredShapedKinds(input.tools) : [];
         const approvals = ctx.stepId ? await deps.approvals?.() : undefined;
         const bridge = createPermissionBridge({
           harness: 'claudecode',
           worktree: workspace.path,
           ...(deps.platform ? { platform: deps.platform } : {}),
+          ...(shapedTools.length > 0 ? { shapedTools } : {}),
           ...(ctx.stepId
             ? {
                 run: {
@@ -390,6 +406,7 @@ export function createClaudeCodeRuntime(deps: ClaudeCodeRuntimeDeps): ClaudeCode
         if (gatewayToken) deps.gatewayTokens?.finish(gatewayToken);
         if (client) await client.close().catch(() => {});
         if (stateDir) await rm(stateDir, { recursive: true, force: true }).catch(() => {});
+        if (boundWorktree) worktrees.unbind(ctx.runId, boundWorktree);
         return failure('startTask', started, 'UPSTREAM', (error as Error).message);
       }
     },

@@ -37,6 +37,7 @@ import { strictestActionPolicy } from '../decisions/eligibility.js';
 import type { ToolApprovalGate } from './approval.js';
 import { mapNativeTool, UnmappedToolError, type ExactAction } from './nativeDescriptors.js';
 import { hostPlatform, type ShellPlatform } from './pathContainment.js';
+import type { ShapedCommandKind } from './shellClassifier.js';
 
 export type Authorizer = (
   descriptor: ToolDescriptor,
@@ -65,6 +66,8 @@ export interface PermissionBridgeOptions {
   harness: HarnessId;
   worktree: string;
   platform?: ShellPlatform;
+  /** Deny raw test/build/lint shell runs in favour of the shaped tools (Step 5 L1). */
+  shapedTools?: readonly ShapedCommandKind[];
   /** Run binding. Without it actions carry a synthetic run id and approvals deny. */
   run?: { runId: string; stepId: string; sessionStateId?: string };
   authorize?: Authorizer;
@@ -139,7 +142,11 @@ export function createPermissionBridge(opts: PermissionBridgeOptions): Permissio
   ): Promise<{ exact: ExactAction; action: ToolAction } | BridgeDecision> {
     let exact: ExactAction;
     try {
-      exact = mapNativeTool(req, { worktree: opts.worktree, platform });
+      exact = mapNativeTool(req, {
+        worktree: opts.worktree,
+        platform,
+        ...(opts.shapedTools?.length ? { shapedTools: opts.shapedTools } : {}),
+      });
     } catch (error) {
       const reason =
         error instanceof UnmappedToolError ? error.message : 'mapping failed: ' + (error as Error).message;

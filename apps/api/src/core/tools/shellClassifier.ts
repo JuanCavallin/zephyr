@@ -409,3 +409,84 @@ export function classifyShell(cmd: string, ctx: ShellContext): ShellClassificati
           : 'reaches the network: ' + label;
   return result;
 }
+
+/* -------------------------------------------------------------------------- */
+/* Shaped-tool routing (Step 5, lever L1)                                     */
+/* -------------------------------------------------------------------------- */
+
+export type ShapedCommandKind = 'test' | 'build' | 'lint';
+
+const JS_SCRIPT_KIND: Record<string, ShapedCommandKind> = {
+  test: 'test',
+  t: 'test',
+  build: 'build',
+  typecheck: 'build',
+  tsc: 'build',
+  check: 'build',
+  lint: 'lint',
+};
+
+/** A test, build or lint binary, however it is launched. */
+function binaryKind(bin: string | undefined): ShapedCommandKind | null {
+  if (!bin) return null;
+  if (bin === 'pytest' || bin === 'py.test' || bin === 'vitest' || bin === 'jest' || bin === 'mocha') return 'test';
+  if (bin === 'tsc' || bin === 'mypy') return 'build';
+  if (bin === 'eslint' || bin === 'ruff' || bin === 'flake8' || bin === 'pylint') return 'lint';
+  return null;
+}
+
+/** Package-manager launchers that run a binary: `npx jest`, `bunx vitest`. */
+const JS_LAUNCHERS = new Set(['npx', 'pnpx', 'bunx']);
+
+function stageKind(stage: ShellStage, platform: ShellPlatform): ShapedCommandKind | null {
+  const name = commandName(stage.argv[0]!, platform);
+  if (!name) return null;
+  const args = stage.argv.slice(1);
+  const sub = args[0];
+  if (JS_LAUNCHERS.has(name)) return binaryKind(args.find((a) => !a.startsWith('-')));
+  if (JS_PMS.has(name) && sub) {
+    if (sub === 'run' && args[1]) return JS_SCRIPT_KIND[args[1]] ?? null;
+    if (sub === 'test' || sub === 't') return 'test';
+    // `pnpm exec vitest`, `pnpm dlx jest`, `npm exec -- tsc`
+    if (sub === 'exec' || sub === 'dlx' || sub === 'x') return binaryKind(args.slice(1).find((a) => !a.startsWith('-')));
+    // pnpm/yarn/bun run scripts and local binaries without `run`; npm does not.
+    if (name !== 'npm') return JS_SCRIPT_KIND[sub] ?? binaryKind(sub);
+    return null;
+  }
+  if ((name === 'python' || name === 'python3' || name === 'py') && sub === '-m') {
+    if (args[1] === 'pytest' || args[1] === 'unittest') return 'test';
+    if (args[1] === 'ruff' || args[1] === 'flake8' || args[1] === 'pylint') return 'lint';
+    if (args[1] === 'mypy' || args[1] === 'compileall') return 'build';
+    return null;
+  }
+  const direct = binaryKind(name);
+  if (direct) return direct;
+  if (name === 'cargo') {
+    if (sub === 'test') return 'test';
+    if (sub === 'build' || sub === 'check') return 'build';
+    if (sub === 'clippy') return 'lint';
+    return null;
+  }
+  if (name === 'go') {
+    if (sub === 'test') return 'test';
+    if (sub === 'build') return 'build';
+    if (sub === 'vet') return 'lint';
+  }
+  return null;
+}
+
+/**
+ * Whether a shell command is a raw test, build or lint run that a shaped tool
+ * (`zephyr_run_tests`, `zephyr_build`, `zephyr_lint`) replaces. Any pipeline
+ * stage counts: `pnpm test | tail` is still a raw test run. Unparseable commands
+ * return null and are left to the ordinary classifier.
+ */
+export function shapedToolFor(command: string, platform: ShellPlatform): ShapedCommandKind | null {
+  const parsed = parseShell(command, platform);
+  if (!parsed.ok) return null;
+  for (const stage of parsed.stages) {
+    const kind = stageKind(stage, platform);
+    if (kind) return kind;
+  }
+  return null;
+}

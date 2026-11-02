@@ -32,7 +32,14 @@ import type {
   ToolEffect,
 } from '@htn/shared';
 import { containPath, type ContainmentContext } from './pathContainment.js';
-import { classifyShell, parseShell, type ShellClassification } from './shellClassifier.js';
+import {
+  classifyShell,
+  parseShell,
+  shapedToolFor,
+  type ShapedCommandKind,
+  type ShellClassification,
+} from './shellClassifier.js';
+import { SHAPED_HARNESS_NAMES } from './shaped/index.js';
 
 export type NativeToolId =
   | 'fs.read'
@@ -54,7 +61,15 @@ export const NATIVE_TOOL_IDS: NativeToolId[] = [
   'agent.internal',
 ];
 
-export type NativeMapContext = ContainmentContext;
+export interface NativeMapContext extends ContainmentContext {
+  /**
+   * Step 5 lever L1: deny raw test/build/lint shell runs and point the agent at
+   * the shaped tool instead. Only set when those tools are actually offered to
+   * the harness, so a denial never leaves the agent without a way to test.
+   * Lists the kinds whose shaped tool is offered; other kinds stay ordinary shell.
+   */
+  shapedTools?: readonly ShapedCommandKind[];
+}
 
 /** One native call, mapped. `defaultPolicy` is the spec-table default for this row. */
 export interface ExactAction {
@@ -365,6 +380,23 @@ function mapShell(nativeTool: string, fields: Record<string, unknown>, ctx: Nati
       dataLabels: LABELS,
       defaultPolicy: 'auto',
       reasonCodes: ['git-commit-in-worktree'],
+      nativeTool,
+      shell,
+    };
+  }
+
+  const shaped = ctx.shapedTools?.length ? shapedToolFor(command, platform) : null;
+  if (shaped && ctx.shapedTools!.includes(shaped)) {
+    const use = SHAPED_HARNESS_NAMES[shaped];
+    return {
+      toolId: 'shell.exec',
+      descriptor: nativeDescriptor('shell.exec', { effect: 'write', reversibility: 'reversible' }),
+      operation: 'exec',
+      arguments: { tool: nativeTool, command, class: shell.class },
+      destination: 'local://worktree',
+      dataLabels: LABELS,
+      defaultPolicy: 'deny',
+      reasonCodes: ['use-shaped-tool', 'raw ' + shaped + ' run denied: call ' + use + ' instead'],
       nativeTool,
       shell,
     };

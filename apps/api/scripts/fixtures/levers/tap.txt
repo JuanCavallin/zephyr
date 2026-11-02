@@ -1,0 +1,19 @@
+TAP version 13
+# Subtest: parser
+    ok 1 - parses numbers
+    not ok 2 - parses dates
+      ---
+      duration_ms: 1.2
+      failureType: 'testCodeFailure'
+      error: 'Expected values to be strictly equal'
+      stack: |-
+        TestContext.<anonymous> (file:///repo/test/parser.test.js:12:10)
+      ...
+    1..2
+not ok 1 - parser
+ok 2 - formats output
+ok 3 - skipped one # SKIP not ready
+1..3
+# tests 4
+# pass 2
+# fail 1
