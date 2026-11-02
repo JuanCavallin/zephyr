@@ -38,9 +38,12 @@ export class PlaceholderSessions {
   redactText(scopeId: string, text: string): { text: string; count: number } {
     const { spans } = detectPii(text);
     if (spans.length === 0) return { text, count: 0 };
+    // Number in reading order, then splice from the end so offsets stay valid.
+    const placeholders = spans.map((span) => this.placeholderFor(scopeId, span.value));
     let out = text;
-    for (const span of [...spans].reverse()) {
-      out = out.slice(0, span.start) + this.placeholderFor(scopeId, span.value) + out.slice(span.end);
+    for (let i = spans.length - 1; i >= 0; i -= 1) {
+      const span = spans[i]!;
+      out = out.slice(0, span.start) + placeholders[i]! + out.slice(span.end);
     }
     return { text: out, count: spans.length };
   }

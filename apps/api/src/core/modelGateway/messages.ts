@@ -23,9 +23,17 @@ import { newId, nowIso } from '../../lib/ids.js';
 import { CacheLedger, mergeUsage, parseAnthropicUsage, ZERO_USAGE } from './cacheLedger.js';
 import { PlaceholderSessions } from './placeholders.js';
 import { appendItem, appendMember, applySplices, entry, scanJson, type Splice } from './rawJson.js';
-import { gatewayRunTokens, presentedCredential, type GatewayRunBinding, type GatewayRunTokenStore } from './runTokens.js';
+import {
+  gatewayRunTokens,
+  presentedCredential,
+  type GatewayRunBinding,
+  type GatewayRunTokenStore,
+} from './runTokens.js';
 import { SseTap } from './sse.js';
-import { DEFAULT_MAX_TOOL_CALLS_PER_TURN, TOOL_BUDGET_EXHAUSTED_INSTRUCTION } from './turnBudget.js';
+import {
+  DEFAULT_MAX_TOOL_CALLS_PER_TURN,
+  TOOL_BUDGET_EXHAUSTED_INSTRUCTION,
+} from './turnBudget.js';
 
 /* -------------------------------------------------------------------------- */
 /* Wire types                                                                 */
@@ -133,12 +141,20 @@ export function anthropicError(type: string, message: string) {
 
 const encoder = new TextEncoder();
 
-function jsonReply(status: number, body: unknown, extra: Record<string, string> = {}): GatewayReply {
+function jsonReply(
+  status: number,
+  body: unknown,
+  extra: Record<string, string> = {},
+): GatewayReply {
   const headers = new Headers({ 'content-type': 'application/json', ...extra });
   return { status, headers, body: encoder.encode(JSON.stringify(body)) };
 }
 
-function errorReply(status: number, message: string, extra: Record<string, string> = {}): GatewayReply {
+function errorReply(
+  status: number,
+  message: string,
+  extra: Record<string, string> = {},
+): GatewayReply {
   return jsonReply(status, anthropicError(errorTypeForStatus(status), message), extra);
 }
 
@@ -191,7 +207,8 @@ function upstreamHeaders(incoming: IncomingMessagesRequest['headers']): Headers 
   const out = new Headers();
   for (const [name, value] of Object.entries(incoming)) {
     const key = name.toLowerCase();
-    if (value === undefined || DROP_REQUEST_HEADERS.has(key) || key.startsWith('x-zephyr-')) continue;
+    if (value === undefined || DROP_REQUEST_HEADERS.has(key) || key.startsWith('x-zephyr-'))
+      continue;
     out.set(key, Array.isArray(value) ? value.join(', ') : value);
   }
   return out;
@@ -296,20 +313,27 @@ export class AnthropicMessagesGateway {
   }
 
   /** 401 for a token we never issued, 403 for a run that has finished. */
-  authenticate(headers: IncomingMessagesRequest['headers']):
-    | { ok: true; binding: GatewayRunBinding }
-    | { ok: false; reply: GatewayReply } {
+  authenticate(
+    headers: IncomingMessagesRequest['headers'],
+  ): { ok: true; binding: GatewayRunBinding } | { ok: false; reply: GatewayReply } {
     const resolved = this.tokens.resolve(
-      presentedCredential({ authorization: header(headers, 'authorization'), 'x-api-key': header(headers, 'x-api-key') }),
+      presentedCredential({
+        authorization: header(headers, 'authorization'),
+        'x-api-key': header(headers, 'x-api-key'),
+      }),
     );
     if (resolved.status === 'unknown')
       return { ok: false, reply: errorReply(401, 'Invalid or missing Zephyr gateway token.') };
     if (resolved.status === 'finished')
       return {
         ok: false,
-        reply: errorReply(403, 'This Zephyr run has finished; its gateway token can no longer be used.', {
-          'x-should-retry': 'false',
-        }),
+        reply: errorReply(
+          403,
+          'This Zephyr run has finished; its gateway token can no longer be used.',
+          {
+            'x-should-retry': 'false',
+          },
+        ),
       };
     return { ok: true, binding: resolved.binding };
   }
@@ -372,7 +396,12 @@ export class AnthropicMessagesGateway {
       });
     } catch (error) {
       const message = 'Zephyr gateway could not reach the model upstream: ' + errorMessage(error);
-      this.recordCall(binding, callId, { model, status: 502, stream: false, error: { type: 'api_error', message } });
+      this.recordCall(binding, callId, {
+        model,
+        status: 502,
+        stream: false,
+        error: { type: 'api_error', message },
+      });
       return errorReply(502, message);
     }
 
@@ -380,15 +409,25 @@ export class AnthropicMessagesGateway {
 
     const contentType = response.headers.get('content-type') ?? '';
     if (contentType.includes('text/event-stream') && response.body) {
-      return { status: response.status, headers: clientHeaders(response.headers), body: this.tapStream(binding, callId, model, response.status, response.body) };
+      return {
+        status: response.status,
+        headers: clientHeaders(response.headers),
+        body: this.tapStream(binding, callId, model, response.status, response.body),
+      };
     }
 
     let bytes: Uint8Array;
     try {
       bytes = new Uint8Array(await response.arrayBuffer());
     } catch (error) {
-      const message = 'Model upstream disconnected before the response completed: ' + errorMessage(error);
-      this.recordCall(binding, callId, { model, status: 502, stream: false, error: { type: 'api_error', message } });
+      const message =
+        'Model upstream disconnected before the response completed: ' + errorMessage(error);
+      this.recordCall(binding, callId, {
+        model,
+        status: 502,
+        stream: false,
+        error: { type: 'api_error', message },
+      });
       return errorReply(502, message);
     }
     let usage = { ...ZERO_USAGE };
@@ -402,11 +441,18 @@ export class AnthropicMessagesGateway {
       };
       usage = mergeUsage(usage, parseAnthropicUsage(parsed.usage));
       if (typeof parsed.model === 'string') actualModel = parsed.model;
-      if (Array.isArray(parsed.content)) toolUses = parsed.content.filter((b) => b?.type === 'tool_use').length;
+      if (Array.isArray(parsed.content))
+        toolUses = parsed.content.filter((b) => b?.type === 'tool_use').length;
     } catch {
       // Forwarded unchanged; an unparseable 2xx is the upstream's to explain.
     }
-    this.recordCall(binding, callId, { model: actualModel, status: response.status, stream: false, usage, toolUses });
+    this.recordCall(binding, callId, {
+      model: actualModel,
+      status: response.status,
+      stream: false,
+      usage,
+      toolUses,
+    });
     return { status: response.status, headers: clientHeaders(response.headers), body: bytes };
   }
 
@@ -419,7 +465,10 @@ export class AnthropicMessagesGateway {
     // Counted on what the model would actually receive, so redact the same way.
     let body = req.body;
     if (binding.redact) {
-      const redacted = this.placeholders.redactJson(binding.redactionScope ?? binding.runId, decoded.text);
+      const redacted = this.placeholders.redactJson(
+        binding.redactionScope ?? binding.runId,
+        decoded.text,
+      );
       if (redacted.count > 0) body = encoder.encode(redacted.json);
     }
     const model = typeof decoded.request.model === 'string' ? decoded.request.model : undefined;
@@ -435,16 +484,25 @@ export class AnthropicMessagesGateway {
         signal: req.signal,
       });
     } catch (error) {
-      return errorReply(502, 'Zephyr gateway could not reach the model upstream: ' + errorMessage(error));
+      return errorReply(
+        502,
+        'Zephyr gateway could not reach the model upstream: ' + errorMessage(error),
+      );
     }
     let bytes: Uint8Array;
     try {
       bytes = new Uint8Array(await response.arrayBuffer());
     } catch (error) {
-      return errorReply(502, 'Model upstream disconnected before the response completed: ' + errorMessage(error));
+      return errorReply(
+        502,
+        'Model upstream disconnected before the response completed: ' + errorMessage(error),
+      );
     }
     if (!response.ok && !isAnthropicErrorBody(new TextDecoder().decode(bytes))) {
-      return errorReply(response.status, new TextDecoder().decode(bytes).slice(0, 500) || response.statusText);
+      return errorReply(
+        response.status,
+        new TextDecoder().decode(bytes).slice(0, 500) || response.statusText,
+      );
     }
     return { status: response.status, headers: clientHeaders(response.headers), body: bytes };
   }
@@ -474,7 +532,13 @@ export class AnthropicMessagesGateway {
       }
     }
     if (!reason) return null;
-    this.emit(binding.runId, { type: 'gateway.blocked', runId: binding.runId, reason, detail, at: nowIso() });
+    this.emit(binding.runId, {
+      type: 'gateway.blocked',
+      runId: binding.runId,
+      reason,
+      detail,
+      at: nowIso(),
+    });
     // 400 + x-should-retry:false: the Anthropic SDK retries 429/5xx, and a budget
     // refusal that the harness silently retries is a silent continue by another name.
     return errorReply(400, 'Zephyr budget exhausted: ' + detail + '. The run is blocked.', {
@@ -505,7 +569,10 @@ export class AnthropicMessagesGateway {
     } else {
       // A proxy or load balancer answered (HTML, empty, plain text). Keep its
       // status, give the client the shape it knows how to read.
-      error = { type: errorTypeForStatus(response.status), message: text.slice(0, 500) || response.statusText || 'Upstream error' };
+      error = {
+        type: errorTypeForStatus(response.status),
+        message: text.slice(0, 500) || response.statusText || 'Upstream error',
+      };
       body = encoder.encode(JSON.stringify(anthropicError(error.type, error.message)));
       headers.set('content-type', 'application/json');
     }
@@ -541,32 +608,46 @@ export class AnthropicMessagesGateway {
         'event: error\ndata: ' + JSON.stringify(anthropicError('api_error', message)) + '\n\n',
       );
     return new ReadableStream<Uint8Array>({
+      // Read until there is something to enqueue: a pull that resolves without
+      // enqueuing is never called again, so a chunk holding only part of an event
+      // would otherwise stall the client forever.
       async pull(controller) {
-        let result: Awaited<ReturnType<typeof reader.read>>;
-        try {
-          result = await reader.read();
-        } catch (error) {
-          const message = 'Model upstream disconnected mid-stream: ' + errorMessage(error);
-          controller.enqueue(closingError(message));
-          settle({ type: 'api_error', message });
-          controller.close();
-          return;
-        }
-        if (result.done) {
-          const rest = tap.flush();
-          if (rest.length > 0) controller.enqueue(rest);
-          const s = tap.summary;
-          if (!s.sawMessageStop && !s.upstreamError) {
-            // A clean EOF without message_stop is a truncated message, not a finished one.
-            const message = 'Model upstream closed the stream before message_stop.';
+        for (;;) {
+          let result: Awaited<ReturnType<typeof reader.read>>;
+          try {
+            result = await reader.read();
+          } catch (error) {
+            const message = 'Model upstream disconnected mid-stream: ' + errorMessage(error);
             controller.enqueue(closingError(message));
             settle({ type: 'api_error', message });
-          } else settle();
-          controller.close();
-          return;
+            controller.close();
+            return;
+          }
+          if (result.done) {
+            const rest = tap.flush();
+            const s = tap.summary;
+            if (s.sawMessageStop || s.upstreamError) {
+              // Finished (or failed on its own terms): the tail is forwarded as received,
+              // even when the upstream left off the final blank line.
+              if (rest.length > 0) controller.enqueue(rest);
+              settle();
+            } else {
+              // A clean EOF without message_stop is a truncated message, not a finished
+              // one. A held-back partial event is dropped, not forwarded: spliced in front
+              // of the closing error it would corrupt both.
+              const message = 'Model upstream closed the stream before message_stop.';
+              controller.enqueue(closingError(message));
+              settle({ type: 'api_error', message });
+            }
+            controller.close();
+            return;
+          }
+          const out = tap.push(result.value);
+          if (out.length > 0) {
+            controller.enqueue(out);
+            return;
+          }
         }
-        const out = tap.push(result.value);
-        if (out.length > 0) controller.enqueue(out);
       },
       async cancel(reason) {
         settle({ type: 'client_cancelled', message: 'Client closed the stream.' });
