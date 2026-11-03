@@ -7,6 +7,7 @@ import { runTests } from '../core/tools/shaped/runTests.js';
 import type { OutputStore } from '../core/tools/shaped/outputStore.js';
 import type { MergeItem, TestTally } from '../core/coordination/mergeQueue.js';
 import { bus, decisionService, providers, shapedTools, store } from './runtime.js';
+import { learningService } from './learning.runtime.js';
 import { BoardService } from './tasks.service.js';
 import { workspaces } from './workspaces.service.js';
 
@@ -40,6 +41,9 @@ export function boardService(): BoardService {
     openWorkspace: async (runId, base) => (await workspaces()).open(runId, base),
     closeWorkspace: async (runId, status, opts) => (await workspaces()).finish(runId, status, opts),
     runTests: shapedTestTally(shapedTools.store),
+    // The learning loop: merge-queue edits and request wording in, task outcomes to its pass.
+    signals: learningService().signals,
+    onTaskFinished: (t) => learningService().onTaskFinished(t),
   });
   return instance;
 }

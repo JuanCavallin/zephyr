@@ -56,6 +56,7 @@ import {
 } from '../core/coordination/stateMachine.js';
 import type { DecisionService } from '../core/decisions/service.js';
 import { candidateKey } from '../core/decisions/routing.js';
+import { requestWordingSignal } from '../core/learning/signalLog.js';
 import { InMemorySignalLog } from '../core/learning/signals.mock.js';
 import { createPermissionBridge, type Authorizer } from '../core/tools/permissionBridge.js';
 import type { Exec } from '../core/verify/publish.js';
@@ -206,6 +207,12 @@ export interface BoardServiceDeps {
   runTests(item: MergeItem, signal?: AbortSignal): Promise<TestTally>;
   evidence?(item: MergeItem, tests: TestTally): Promise<void> | void;
   signals?: SignalSeam;
+  /**
+   * A task reached a final outcome: merged (passed) or rejected (failed). The learning
+   * loop records it against the skills the run loaded and starts a pass. Must not throw
+   * and must not block; the board never waits on learning.
+   */
+  onTaskFinished?(t: { taskId: string; runId?: string; outcome: 'passed' | 'failed' }): void;
   budget?: TaskBudget;
   leaseTtlMs?: number;
 }
@@ -385,6 +392,12 @@ export class BoardService {
     });
     this.boards.set(run.id, b);
     await this.emit(b, { type: 'run.updated', run });
+    // How the user asks is the weakest preference signal; recording it never blocks the board.
+    if (input.request.trim()) {
+      void Promise.resolve()
+        .then(() => this.signals.recordSignal(requestWordingSignal(input.request, { runId: run.id, private: b.private })))
+        .catch(() => undefined);
+    }
 
     try {
       const plan = await decompose(
@@ -809,6 +822,7 @@ export class BoardService {
       await this.endStep(taskRun.id, step.id, 'failed', reason);
       await this.move(b, taskId, 'failed', { reason });
       await this.finishTaskRun(taskRun.id, 'failed', reason);
+      this.taskFinished(b.tasks.get(taskId)!, 'failed');
       return;
     }
     await this.endStep(taskRun.id, step.id, 'succeeded');
@@ -825,6 +839,7 @@ export class BoardService {
       case 'merged': {
         await this.move(b, taskId, 'done');
         await this.finishTaskRun(task.runId!, 'succeeded', 'merged ' + (result.commit ?? '').slice(0, 12));
+        this.taskFinished(task, 'passed');
         // A merged fix finishes the task it was fixing, and that one's parent in turn.
         let parent = b.fixParents.get(taskId);
         while (parent) {
@@ -850,8 +865,17 @@ export class BoardService {
         await this.move(b, taskId, 'failed', { reason });
         await this.failChainParents(b, taskId, reason);
         if (task.runId) await this.finishTaskRun(task.runId, 'failed', reason);
+        this.taskFinished(task, 'failed');
         return;
       }
+    }
+  }
+
+  private taskFinished(task: Task, outcome: 'passed' | 'failed'): void {
+    try {
+      this.deps.onTaskFinished?.({ taskId: task.id, ...(task.runId ? { runId: task.runId } : {}), outcome });
+    } catch {
+      // Learning is off the critical path.
     }
   }
 

@@ -550,10 +550,13 @@ export function createLiveClaudeCode(cfg: ProviderConfig): AgentRuntimeAdapter {
     contextPack: async (input, ctx) => {
       const runtime = await import('../../services/runtime.js');
       const { createContextPackBuilder } = await import('../../core/context/index.js');
+      const { learningService } = await import('../../services/learning.runtime.js');
       return createContextPackBuilder({
         decisions: runtime.decisionService,
         sessions: runtime.sessionStateService,
         emit: (runId, event) => runtime.bus.emit(runId, event),
+        // What Zephyr learned about this user and repo: guidance, never permissions.
+        knowledge: learningService().knowledgeLoader(),
       })(input, ctx);
     },
     tokens: hookTokens,

@@ -1161,6 +1161,42 @@ await test('routes: POST /tasks decomposes only (201), PATCH edits, 404 / 409 / 
   }
 });
 
+await test('learning hooks: request wording recorded; outcomes reported per task run; a throwing hook breaks nothing', async () => {
+  const signals = new InMemorySignalLog();
+  const calls: Array<{ taskId: string; runId?: string; outcome: string }> = [];
+  const { svc, boardId } = await svcBoard('svc-learning', '- one\n- two', {
+    signals,
+    onTaskFinished: (t) => {
+      calls.push(t);
+      throw new Error('learning is down');
+    },
+  });
+  await svc.runReady(boardId, { concurrency: 2, autoMergeGreen: true });
+  await svc.whenIdle(boardId);
+  const v = await svc.getBoard(boardId);
+  assert.equal(v.run.status, 'succeeded', 'a throwing learning hook does not fail the board');
+  const wording = signals.list().filter((s) => s.kind === 'request_wording');
+  assert.equal(wording.length, 1, 'the request is recorded once');
+  assert.equal(wording[0]!.runId, boardId);
+  assert.ok(preferenceSignalSchema.safeParse(wording[0]).success, 'signal parses');
+  assert.deepEqual(
+    calls.map((c) => [c.taskId, c.runId, c.outcome]).sort(),
+    v.tasks.map((t) => [t.id, t.runId, 'passed']).sort(),
+    'one passed outcome per merged task, with its run',
+  );
+
+  // An executor that changes nothing fails its task, and that is reported as failed.
+  const failedCalls: typeof calls = [];
+  const f = await svcBoard('svc-learning-fail', '- nothing', {
+    executor: mockHarnessExecutor({ authorize: allowAuth, script: () => [] }),
+    onTaskFinished: (t) => failedCalls.push(t),
+  });
+  await f.svc.runReady(f.boardId, { autoMergeGreen: true });
+  await f.svc.whenIdle(f.boardId);
+  assert.deepEqual(failedCalls.map((c) => c.outcome), ['failed']);
+  assert.ok(failedCalls[0]!.runId, 'the failed task run is named');
+});
+
 console.log('8. end to end (the done condition)');
 
 await test('three tasks at once, an out-of-lease edit denied, two package.json intents land, all green merged', async () => {
