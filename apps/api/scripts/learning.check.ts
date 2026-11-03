@@ -1505,5 +1505,49 @@ await test('end to end: three edits -> active preference -> loaded into the next
   store.close();
 });
 
+await test('pnpm learning:export / learning:delete: one command each, never creates a profile', async () => {
+  const { spawnSync } = await import('node:child_process');
+  const { existsSync, readFileSync } = await import('node:fs');
+  const dir = await mkdtemp(join(tmpdir(), 'zephyr-profile-cli-'));
+  try {
+    const db = join(dir, 'profile.db');
+    const cli = (...args: string[]) =>
+      spawnSync(process.execPath, ['--no-warnings', '--import', 'tsx', 'scripts/learning-profile.ts', ...args], {
+        env: { ...process.env, ZEPHYR_PROFILE_DB: db },
+        encoding: 'utf8',
+        timeout: 60_000,
+      });
+    // No profile yet: an empty export, a no-op delete, and still no file.
+    const empty = cli('export');
+    assert.equal(empty.status, 0, empty.stderr);
+    assert.deepEqual(JSON.parse(empty.stdout).signals, []);
+    assert.equal(cli('delete', '--yes').status, 0);
+    assert.equal(existsSync(db), false, 'neither command creates a profile');
+
+    const store = new ProfileStore(db);
+    await store.recordSignal(feedbackSignal('up', 'keep the tests next to the code', { taskId: 't1' }));
+    await store.recordSignal(feedbackSignal('down', undefined, { private: true }));
+    store.close();
+
+    const out = join(dir, 'export.json');
+    const exported = cli('export', out);
+    assert.equal(exported.status, 0, exported.stderr);
+    const json = JSON.parse(readFileSync(out, 'utf8'));
+    assert.equal(json.format, 'zephyr-profile');
+    assert.equal(json.signals.length, 2, 'private signals are exported too: it is the user’s own data');
+
+    const refused = cli('delete');
+    assert.equal(refused.status, 2, 'delete needs --yes');
+    const deleted = cli('delete', '--yes');
+    assert.equal(deleted.status, 0, deleted.stderr);
+    assert.match(deleted.stderr, /deleted 2 signals/);
+    const after = new ProfileStore(db);
+    assert.equal(after.exportAll().signals.length, 0);
+    after.close();
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 console.log(`\n${passed} passed`);
 await rm(scratch, { recursive: true, force: true }).catch(() => undefined);

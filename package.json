@@ -25,6 +25,8 @@
     "check:verify": "pnpm --filter @htn/api check:verify",
     "check:board": "pnpm --filter @htn/api check:board",
     "check:learning": "pnpm --filter @htn/api check:learning",
+    "learning:export": "pnpm --filter @htn/api learning:export",
+    "learning:delete": "pnpm --filter @htn/api learning:delete",
     "check:hermes-live": "pnpm --filter @htn/api check:hermes-live",
     "check:wsl": "wsl.exe -d Ubuntu -- bash scripts/wsl-check.sh",
     "check:graph": "pnpm --filter @htn/api check:graph",
