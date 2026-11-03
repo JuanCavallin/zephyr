@@ -15,6 +15,8 @@
  *   6. `git merge --ff-only <task branch>` in the integration worktree.
  *
  * A rejected or revised approval and a revert each record a preference signal (step 8).
+ * So does a user's edit: what the user changed in the task's worktree while its approval
+ * was pending is diffed against the agent's head and recorded as `user_edit`.
  * Every outcome is emitted as `merge.result`.
  *
  * Git runs as argv through an injected `Exec`, never a shell string.
@@ -22,6 +24,7 @@
 
 import type { PreferenceSignal, SignalSeam, Task } from '@htn/shared';
 import { newId, nowIso } from '../../lib/ids.js';
+import { editDiffFromGit } from '../learning/signalLog.js';
 import { KeyedLock } from '../locks.js';
 import type { Exec } from '../verify/publish.js';
 
@@ -41,6 +44,12 @@ export interface MergeItem {
   /** The task's own worktree, with `branch` checked out. */
   worktree: string;
   branch: string;
+  /**
+   * The commit holding the agent's own output, when the caller knows it. Anything on the
+   * branch past it at merge time is the user's edit, recorded as a `user_edit` signal.
+   * The queue fills this in itself when it parks a task for approval.
+   */
+  agentCommit?: string;
 }
 
 export interface TestTally {
@@ -80,6 +89,8 @@ export interface MergeQueueDeps {
   policy?: { autoMergeGreen?: boolean };
   /** Signals from a private-route run are flagged so only a local model learns from them. */
   privateRun?: boolean;
+  /** Capturing a user edit failed. The merge goes on regardless. */
+  onCaptureError?(error: unknown): void;
   now?: () => string;
 }
 
@@ -173,12 +184,16 @@ export class MergeQueue {
     const { task, worktree } = item;
     const target = this.deps.integration.branch;
 
-    // 1. Commit what the agent left uncommitted.
+    // 1. Commit what the agent left uncommitted, or, past the agent's own commit, what
+    //    the user edited during review.
     const dirty = (await this.git(worktree, ['status', '--porcelain', '--untracked-files=all'], signal)).trim();
     if (dirty) {
       await this.git(worktree, ['add', '-A'], signal);
-      await this.git(worktree, ['commit', '-q', '-m', 'zephyr: ' + task.title], signal);
+      const message = item.agentCommit ? 'review edits: ' + task.title : 'zephyr: ' + task.title;
+      await this.git(worktree, ['commit', '-q', '-m', message], signal);
     }
+    // The user's edit, before the rebase mixes in other tasks' work. Never fails the merge.
+    if (item.agentCommit) await this.captureEdit(item, signal);
 
     // 2. Rebase onto the integration branch.
     const rebase = await this.deps.exec('git', ['rebase', target], { cwd: worktree, ...(signal ? { signal } : {}) });
@@ -210,7 +225,9 @@ export class MergeQueue {
         throw new MergeQueueError('merge needs an approval and no approval gate is configured');
       const verdict = await this.deps.approve(item, tests);
       if (verdict.status === 'pending') {
-        this.parked.set(task.id, { item, approvalId: verdict.approvalId });
+        // Remember the agent's head: what the user changes from here on is their edit.
+        const head = (await this.git(worktree, ['rev-parse', 'HEAD'], signal)).trim();
+        this.parked.set(task.id, { item: { ...item, agentCommit: item.agentCommit ?? head }, approvalId: verdict.approvalId });
         return this.finish({
           taskId: task.id,
           outcome: 'awaiting_approval',
@@ -265,20 +282,48 @@ export class MergeQueue {
     );
   }
 
+  /** `git diff <agentCommit> HEAD` in the task's worktree, recorded as a `user_edit`. */
+  private async captureEdit(item: MergeItem, signal?: AbortSignal): Promise<void> {
+    if (!this.deps.signals || !item.agentCommit) return;
+    try {
+      const r = await this.deps.exec('git', ['diff', '--no-color', '--no-ext-diff', item.agentCommit, 'HEAD'], {
+        cwd: item.worktree,
+        ...(signal ? { signal } : {}),
+      });
+      if (r.code !== 0) return;
+      const edit = editDiffFromGit(r.stdout);
+      if (!edit) return;
+      await this.record(
+        {
+          kind: 'user_edit',
+          diffHash: edit.diffHash,
+          files: edit.files,
+          taskId: item.task.id,
+          ...(item.task.runId ? { runId: item.task.runId } : {}),
+        },
+        { scope: 'personal', detail: edit.diff },
+      );
+    } catch (error) {
+      this.deps.onCaptureError?.(error);
+    }
+  }
+
   private async record(
     s:
       | { kind: 'approval'; approvalId: string; outcome: 'rejected' | 'revised'; comment?: string; taskId: string }
-      | { kind: 'revert'; commit: string; taskId: string },
+      | { kind: 'revert'; commit: string; taskId: string }
+      | { kind: 'user_edit'; diffHash: string; files: string[]; taskId: string; runId?: string },
+    opts: { scope?: 'personal' | 'project'; detail?: string } = {},
   ): Promise<void> {
     if (!this.deps.signals) return;
     const signal = {
       id: newId('sig'),
-      scope: 'project',
+      scope: opts.scope ?? 'project',
       private: this.deps.privateRun ?? false,
       at: this.now(),
       ...s,
     } as PreferenceSignal;
-    await this.deps.signals.recordSignal(signal);
+    await this.deps.signals.recordSignal(signal, opts.detail ? { detail: opts.detail } : undefined);
   }
 
   private finish(r: Omit<MergeResult, 'at'>): MergeResult {

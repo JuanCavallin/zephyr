@@ -15,7 +15,7 @@ process.env.MOCK_MAX_LATENCY_MS = '0';
 process.env.MOCK_FAILURE_RATE = '0';
 
 import assert from 'node:assert/strict';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -305,6 +305,111 @@ await test('the signal log stores, emits learning.signal and wakes the pipeline 
   await tick();
   assert.deepEqual(woke, ['sig_a']);
   assert.equal(errors.length, 1, 'pipeline failure reported, not thrown at the caller');
+});
+
+const { MergeQueue } = await import('../src/core/coordination/mergeQueue.js');
+const { execArgv } = await import('../src/services/publish.service.js');
+type MergeItem = import('../src/core/coordination/mergeQueue.js').MergeItem;
+type MergeQueueDeps = import('../src/core/coordination/mergeQueue.js').MergeQueueDeps;
+type Task = import('@htn/shared').Task;
+
+const git = async (cwd: string, ...args: string[]) => {
+  const r = await execArgv('git', args, { cwd });
+  assert.equal(r.code, 0, `git ${args.join(' ')}: ${r.stderr}`);
+  return r.stdout.trim();
+};
+
+async function editRepo(name: string) {
+  const root = join(scratch, name);
+  const repo = join(root, 'repo');
+  await mkdir(repo, { recursive: true });
+  await git(repo, 'init', '-q', '-b', 'main');
+  await git(repo, 'config', 'user.name', 'Zephyr Check');
+  await git(repo, 'config', 'user.email', 'check@zephyr.invalid');
+  await git(repo, 'config', 'commit.gpgsign', 'false');
+  await git(repo, 'config', 'core.autocrlf', 'false');
+  await writeFile(join(repo, 'README.md'), '# fixture\n');
+  await git(repo, 'add', '-A');
+  await git(repo, 'commit', '-q', '-m', 'init');
+  const branch = 'zephyr/t1';
+  const worktree = join(root, 'wt');
+  await git(repo, 'worktree', 'add', '-q', '-b', branch, worktree, 'main');
+  await mkdir(join(worktree, 'src'), { recursive: true });
+  // The agent's output, left uncommitted as a harness leaves it.
+  await writeFile(join(worktree, 'src', 'parse.ts'), 'export function parse(s: string) {\n  if (s) {\n    return s.trim();\n  }\n  return "";\n}\n');
+  const task: Task = {
+    id: 'task_1',
+    boardRunId: 'run_board',
+    runId: 'run_t1',
+    title: 'add a parser',
+    acceptance: 'tests pass',
+    writeScope: ['src/**'],
+    dependsOn: [],
+    status: 'review',
+    createdAt: T0,
+    updatedAt: T0,
+  };
+  const item: MergeItem = { task, worktree, branch };
+  return { repo, worktree, item };
+}
+
+function queueFor(repo: string, signals: import('@htn/shared').SignalSeam, over: Partial<MergeQueueDeps> = {}) {
+  return new MergeQueue({
+    exec: execArgv,
+    integration: { worktree: repo, branch: 'main' },
+    runTests: async () => ({ passed: 1, failed: 0, failedTests: [] }),
+    approve: async () => ({ status: 'pending', approvalId: 'apr_1' }),
+    createFixTask: () => ({ id: 'fix' }),
+    signals,
+    policy: { autoMergeGreen: false },
+    ...over,
+  });
+}
+
+await test('merge queue: an edit made during review becomes a user_edit with the diff as evidence', async () => {
+  const { repo, worktree, item } = await editRepo('mq-edit');
+  const store = new ProfileStore(':memory:');
+  const log = new SignalLog({ store });
+  const queue = queueFor(repo, log);
+  assert.equal((await queue.enqueue(item)).outcome, 'awaiting_approval');
+  // The user rewrites the nested if as an early return, with Windows line endings.
+  await writeFile(join(worktree, 'src', 'parse.ts'), 'export function parse(s: string) {\r\n  if (!s) return "";\r\n  return s.trim();\r\n}\r\n');
+  const r = await queue.resolveApproval('task_1', { outcome: 'approved' });
+  assert.equal(r.outcome, 'merged');
+  const edits = store.signals().filter((s) => s.signal.kind === 'user_edit');
+  assert.equal(edits.length, 1);
+  const edit = edits[0]!;
+  assert.equal(edit.signal.taskId, 'task_1');
+  assert.equal(edit.signal.runId, 'run_t1');
+  assert.equal(edit.signal.scope, 'personal');
+  assert.deepEqual((edit.signal as { files: string[] }).files, ['src/parse.ts']);
+  assert.match(edit.detail ?? '', /^\+  if \(!s\) return "";/m);
+  assert.match(edit.detail ?? '', /^-  if \(s\) \{/m);
+  // The merged tree holds the user's version, and the commit says so.
+  const log1 = (await git(repo, 'log', '--format=%s')).split(/\r?\n/);
+  assert.deepEqual(log1.slice(0, 2), ['review edits: add a parser', 'zephyr: add a parser']);
+  store.close();
+});
+
+await test('merge queue: an approval with no edit records no user_edit', async () => {
+  const { repo, item } = await editRepo('mq-noedit');
+  const store = new ProfileStore(':memory:');
+  const queue = queueFor(repo, new SignalLog({ store }));
+  await queue.enqueue(item);
+  assert.equal((await queue.resolveApproval('task_1', { outcome: 'approved' })).outcome, 'merged');
+  assert.equal(store.signals().length, 0);
+  store.close();
+});
+
+await test('merge queue: a failing capture never fails the merge', async () => {
+  const { repo, worktree, item } = await editRepo('mq-capture-fails');
+  const errors: unknown[] = [];
+  const exploding = { recordSignal: async () => { throw new Error('profile is locked'); } };
+  const queue = queueFor(repo, exploding, { onCaptureError: (e) => errors.push(e) });
+  await queue.enqueue(item);
+  await writeFile(join(worktree, 'src', 'parse.ts'), 'export const parse = (s: string) => s.trim();\n');
+  assert.equal((await queue.resolveApproval('task_1', { outcome: 'approved' })).outcome, 'merged');
+  assert.equal(errors.length, 1);
 });
 
 console.log(`\n${passed} passed`);
