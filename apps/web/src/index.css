@@ -2,6 +2,7 @@
 @import './workspace.css';
 @import './actions.css';
 @import './board.css';
+@import './learned.css';
 
 /*
  * Tailwind v4 — theme tokens are declared here, not in a JS config file.

@@ -35,6 +35,7 @@ import type {
 } from '@htn/shared';
 export type { BrowserViewer } from '@htn/shared';
 import type { BoardEditOp, BoardSnapshot, InboxItem } from './board';
+import type { FeedItem, LearnedEntry, LearningPassResult, ProjectProposal } from './learning';
 
 export interface CredentialStatus {
   providerId: string;
@@ -394,6 +395,47 @@ export const api = {
     ),
 
   inbox: () => request<{ items: InboxItem[] }>('/tasks/inbox'),
+
+  /* ---------------------------------------------------- What Zephyr learned */
+
+  learningFeed: (filter: { status?: string; kind?: string } = {}) => {
+    const q = new URLSearchParams(Object.entries(filter).filter((e): e is [string, string] => !!e[1]));
+    return request<{ items: FeedItem[] }>('/learning' + (q.size ? '?' + q : ''));
+  },
+
+  learningAction: (id: string, action: 'revert' | 'accept' | 'promote') =>
+    request<{ entry: LearnedEntry }>('/learning/' + encodeURIComponent(id) + '/' + action, { method: 'POST' }),
+
+  learningRestore: (id: string, version: number) =>
+    request<{ entry: LearnedEntry }>('/learning/' + encodeURIComponent(id) + '/restore', {
+      method: 'POST',
+      body: JSON.stringify({ version }),
+    }),
+
+  learningPass: () => request<LearningPassResult>('/learning/pass', { method: 'POST' }),
+
+  learningPropose: (ids: string[]) =>
+    request<ProjectProposal>('/learning/proposals', { method: 'POST', body: JSON.stringify({ ids }) }),
+
+  learningExport: () => request<unknown>('/learning/export'),
+
+  learningDeleteAll: () => request<{ signals: number; entries: number }>('/learning', { method: 'DELETE' }),
+
+  learningFeedback: (body: {
+    rating: 'up' | 'down';
+    comment?: string;
+    taskId?: string;
+    runId?: string;
+    private?: boolean;
+  }) => request<unknown>('/learning/signals/feedback', { method: 'POST', body: JSON.stringify(body) }),
+
+  learningVariantPick: (body: {
+    chosen: string;
+    rejected: string[];
+    taskId?: string;
+    runId?: string;
+    private?: boolean;
+  }) => request<unknown>('/learning/signals/variant-pick', { method: 'POST', body: JSON.stringify(body) }),
 
   decide: (approvalId: string, decision: ApprovalDecision) =>
     request<{ approval: Approval }>('/approvals/' + approvalId + '/decide', {

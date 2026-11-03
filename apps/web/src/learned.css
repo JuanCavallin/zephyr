@@ -1,0 +1,269 @@
+/* What Zephyr learned (pages/Learned.tsx) and the learning feedback widgets. Workspace palette. */
+
+.learned-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+.learned-confirm {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  font-size: 12px;
+  color: var(--danger-text);
+  background: var(--danger-soft);
+  border: 1px solid var(--danger-line);
+  border-radius: 8px;
+}
+.secondary-button.learned-danger {
+  color: var(--danger-text);
+}
+
+.learned-filters {
+  display: flex;
+  gap: 6px;
+  margin: 28px 0 8px;
+}
+.learned-chip {
+  padding: 4px 11px;
+  font-size: 12px;
+  color: var(--secondary);
+  background: transparent;
+  border: 1px solid var(--line-3);
+  border-radius: 99px;
+  cursor: pointer;
+}
+.learned-chip.is-on {
+  color: var(--accent-text);
+  background: var(--accent-soft);
+  border-color: var(--accent-line);
+}
+
+.learned-notice {
+  margin-top: 12px;
+  padding: 8px 12px;
+  font-size: 12px;
+  color: var(--accent-text);
+  background: var(--accent-soft);
+  border: 1px solid var(--accent-line);
+  border-radius: 8px;
+}
+.learn-error {
+  margin-top: 8px;
+  font-size: 12px;
+  color: var(--danger-text);
+}
+.learned-empty {
+  margin-top: 28px;
+  font-size: 13px;
+  color: var(--secondary);
+}
+
+.learned-section {
+  margin-top: 28px;
+}
+.learned-section > h2 {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--secondary);
+}
+.learned-section > h2 > span {
+  color: var(--faint);
+}
+.learned-hint {
+  font-size: 12px;
+  color: var(--faint);
+  margin-top: 4px;
+}
+.learned-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(360px, 1fr));
+  gap: 12px;
+  margin-top: 12px;
+}
+
+.learned-card {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 14px;
+  font-size: 12px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 9px;
+}
+.learned-card.is-candidate {
+  border-color: var(--amber-line-dim);
+}
+.learned-card.is-retired {
+  opacity: 0.75;
+}
+.learned-card > header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.learned-card h3 {
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--text);
+}
+.learned-card p {
+  color: var(--secondary);
+}
+.learned-meta {
+  margin-left: auto;
+  font-size: 11px;
+  color: var(--faint);
+}
+.learned-badge {
+  padding: 1px 7px;
+  font-size: 10px;
+  color: var(--accent-text);
+  background: var(--accent-soft);
+  border: 1px solid var(--accent-line);
+  border-radius: 99px;
+  white-space: nowrap;
+}
+.learned-badge.is-quiet {
+  color: var(--secondary);
+  background: transparent;
+  border-color: var(--line-3);
+}
+.learned-badge.is-private {
+  color: var(--amber-text);
+  background: var(--amber-soft);
+  border-color: var(--amber-line-dim);
+}
+
+.learned-card details > summary {
+  cursor: pointer;
+  color: var(--secondary);
+}
+.learned-card details > summary > span {
+  color: var(--faint);
+}
+.learned-card pre {
+  margin-top: 6px;
+  padding: 8px 10px;
+  white-space: pre-wrap;
+  font-size: 11px;
+  color: var(--text);
+  background: var(--panel-sunken);
+  border: 1px solid var(--line);
+  border-radius: 7px;
+}
+.learned-evidence,
+.learned-versions,
+.learned-arms {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 6px;
+  list-style: none;
+  padding: 0;
+}
+.learned-evidence li,
+.learned-versions li {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  color: var(--secondary);
+}
+.learned-evidence time,
+.learned-versions time {
+  margin-left: auto;
+  font-size: 11px;
+  color: var(--faint);
+}
+.learned-versions .secondary-button,
+.learned-card > footer .secondary-button,
+.learned-card > footer .primary-button {
+  padding: 4px 9px;
+  font-size: 11px;
+}
+.learned-arms li {
+  color: var(--secondary);
+}
+.learned-card > footer {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin-top: 4px;
+}
+
+/* Feedback widgets (components/learning/Feedback.tsx). */
+.learn-thumbs {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  font-size: 11px;
+  color: var(--faint);
+}
+.learn-thumbs .secondary-button {
+  padding: 3px 8px;
+  font-size: 11px;
+}
+.learn-thumbs.is-done {
+  color: var(--accent-text);
+}
+.learn-thumbs-why {
+  display: inline-flex;
+  gap: 6px;
+}
+.learn-thumbs-why input {
+  padding: 4px 8px;
+  font: inherit;
+  font-size: 11px;
+  color: var(--text);
+  background: var(--panel-sunken);
+  border: 1px solid var(--line-3);
+  border-radius: 6px;
+}
+
+.learn-variants h4 {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--secondary);
+}
+.learn-variant-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 8px;
+  margin-top: 8px;
+}
+.learn-variant {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px;
+  text-align: left;
+  font-size: 12px;
+  color: var(--text);
+  background: var(--panel-2, var(--panel));
+  border: 1px solid var(--line-2, var(--line));
+  border-radius: 8px;
+  cursor: pointer;
+}
+.learn-variant:disabled {
+  cursor: default;
+}
+.learn-variant.is-picked {
+  border-color: var(--accent-line);
+  background: var(--accent-soft);
+}
+.learn-variant pre {
+  white-space: pre-wrap;
+  font-size: 11px;
+  color: var(--secondary);
+}

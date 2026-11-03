@@ -5,6 +5,7 @@ import { BoardHome, BoardPage } from './pages/Board';
 import { Compare } from './pages/Compare';
 import { Connections } from './pages/Connections';
 import { GraphEditor } from './pages/GraphEditor';
+import { Learned } from './pages/Learned';
 import { Workspace, LiveRunWorkspace } from './pages/Workspace';
 import { RunHistory } from './pages/RunHistory';
 
@@ -21,6 +22,7 @@ export function App() {
         <Route path="/connections" element={<Connections />} />
         <Route path="/compare" element={<Compare />} />
         <Route path="/benchmarks" element={<Benchmarks />} />
+        <Route path="/learned" element={<Learned />} />
         <Route path="/graphs" element={<GraphEditor />} />
         <Route path="/graphs/:id" element={<GraphEditor key={location.pathname} />} />
         <Route

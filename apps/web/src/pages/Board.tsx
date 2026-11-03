@@ -12,6 +12,8 @@ import type { Task } from '@htn/shared';
 import { Icon } from '../components/ui/Icon';
 import { useBoard, useInbox } from '../hooks/useBoard';
 import { api } from '../lib/api';
+import { canRate, feedbackOrigin, runIsPrivate } from '../lib/learning';
+import { Thumbs } from '../components/learning/Feedback';
 import {
   ASSIGNEES,
   COLUMNS,
@@ -214,6 +216,7 @@ export function BoardPage() {
                   task={task}
                   all={state.tasks}
                   notes={state.notes[task.id] ?? []}
+                  boardPrivate={runIsPrivate(state.run)}
                   selected={selected.includes(task.id)}
                   onSelect={() => toggle(task.id)}
                   onMove={(delta) => {
@@ -244,6 +247,7 @@ function TaskCard({
   task,
   all,
   notes,
+  boardPrivate,
   selected,
   onSelect,
   onMove,
@@ -253,6 +257,7 @@ function TaskCard({
   task: Task;
   all: Record<string, Task>;
   notes: string[];
+  boardPrivate: boolean;
   selected: boolean;
   onSelect: () => void;
   onMove: (delta: -1 | 1) => void;
@@ -366,6 +371,7 @@ function TaskCard({
             Trace
           </Link>
         )}
+        {canRate(task) && <Thumbs origin={feedbackOrigin(task, boardPrivate)} label="Right result?" />}
       </footer>
     </article>
   );
