@@ -43,6 +43,7 @@ test('spreads show the median and the interquartile range', () => {
   assert.equal(spreadLabel(spread(14200, 12000, 16000), 'tokens'), '14k (12k–16k)');
   assert.equal(spreadLabel(spread(0.123, 0.1, 0.15), 'usd'), '$0.12 ($0.10–$0.15)');
   assert.equal(spreadLabel(spread(65_000), 'ms'), '65.0s');
+  assert.equal(spreadLabel(spread(0.0093, 0.0088, 0.0098), 'usd'), '$0.0093 ($0.0088–$0.0098)');
 });
 
 test('savings appear only for comparable arms', () => {

@@ -27,6 +27,7 @@
     "check:learning": "pnpm --filter @htn/api check:learning",
     "check:benchmark-coding": "pnpm --filter @htn/api check:benchmark-coding",
     "check:cli": "pnpm --filter @htn/cli check:cli",
+    "zephyr": "node packages/cli/bin/zephyr.mjs",
     "check:workspace-view": "pnpm --filter @htn/api check:workspace-view",
     "learning:export": "pnpm --filter @htn/api learning:export",
     "learning:delete": "pnpm --filter @htn/api learning:delete",

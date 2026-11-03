@@ -27,7 +27,8 @@ function format(value: number, unit: SpreadUnit): string {
     case 'tokens':
       return compactTokens(Math.round(value));
     case 'usd':
-      return '$' + value.toFixed(2);
+      // Benchmark runs often cost under a cent; two decimals would show them all as $0.01.
+      return '$' + value.toFixed(value !== 0 && Math.abs(value) < 0.1 ? 4 : 2);
     case 'ms':
       return (value / 1000).toFixed(1) + 's';
     case 'count':

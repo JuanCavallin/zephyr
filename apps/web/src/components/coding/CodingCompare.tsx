@@ -73,10 +73,10 @@ export function CodingCompare() {
     };
   }, []);
 
-  if (error) return <p className="text-sm text-rose-400">{error}</p>;
+  if (error) return <p className="mx-auto max-w-6xl p-4 text-sm text-rose-400 sm:p-6">{error}</p>;
   if (!report) {
     return (
-      <div className="flex items-center gap-2 text-sm text-slate-500">
+      <div className="mx-auto flex max-w-6xl items-center gap-2 p-4 text-sm text-slate-500 sm:p-6">
         <Spinner />
         Loading the coding benchmark…
       </div>
@@ -86,7 +86,7 @@ export function CodingCompare() {
   const head = headline(report);
   const note = modeNote(report.mode);
   return (
-    <div className="space-y-5">
+    <div className="mx-auto max-w-6xl space-y-5 p-4 sm:p-6">
       <div className="flex flex-wrap items-baseline justify-between gap-2">
         <h1 className="text-lg font-semibold text-slate-100">Harness alone vs harness under Zephyr</h1>
         <span className="text-xs text-slate-500">
