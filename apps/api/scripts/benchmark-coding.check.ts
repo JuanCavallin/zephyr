@@ -11,7 +11,9 @@
  *   4. Report rule on synthetic results: comparable, not comparable, insufficient.
  *   5. Runner: journal resume (torn last line), network-only retries, errors not retried.
  *   6. Mock arms end to end through the real permission bridge.
- *   7. Live vanilla agent against a fake `claude` binary; live Zephyr arms refused.
+ *   7. Live vanilla agent against a fake `claude` binary.
+ *   8. Live supervised agent (Claude Code under Zephyr) against a fake ACP peer and a
+ *      fake upstream: the gateway meters the tokens, L1 serves the shaped tools over MCP.
  */
 
 process.env.PERSIST_TO_DISK = 'false';
@@ -20,6 +22,7 @@ import assert from 'node:assert/strict';
 import { mkdir, mkdtemp, readFile, rm, writeFile, appendFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import {
   armDiff,
   buildCodingReport,
@@ -437,12 +440,106 @@ await test('a missing binary is an error the runner does not retry', async () =>
   assert.equal(r.results[0]!.status, 'error');
   assert.equal(r.results[0]!.attempts, 1);
 });
-await test('live Zephyr arms are refused up front, vanilla is allowed', () => {
-  assert.deepEqual(liveArmProblems(['vanilla']), []);
-  const p = liveArmProblems(['vanilla', 'supervised', 'loo-L1']);
-  assert.equal(p.length, 2);
-  assert.match(p[0]!, /^supervised:/);
+await test('every arm can run live now (the Zephyr arms through the supervised agent)', () => {
+  assert.deepEqual(liveArmProblems([...CODING_ARM_IDS]), []);
 });
+
+/* ------------------ 8. live supervised agent, fake ACP peer ------------------ */
+
+console.log('live supervised agent (fake ACP peer, fake upstream)');
+{
+  const { supervisedClaudeAgent } = await import('../src/services/benchmarkCoding.supervised.js');
+  const { DecisionService } = await import('../src/core/decisions/service.js');
+  const jev = await import('../src/providers/jev/index.js');
+  const { claudeCodeHarness } = await import('../src/providers/claudecode/live.js');
+  const peer = fileURLToPath(new URL('./fixtures/bench-acp-peer.mjs', import.meta.url));
+  const USAGE = { input_tokens: 1200, output_tokens: 340, cache_read_input_tokens: 5000, cache_creation_input_tokens: 80 };
+  const upstreamCalls: string[] = [];
+  const upstream = async (req: { path: string; headers: Headers }) => {
+    upstreamCalls.push(req.path);
+    return new Response(
+      JSON.stringify({
+        id: 'msg_bench',
+        type: 'message',
+        role: 'assistant',
+        model: 'claude-opus-5-5',
+        content: [{ type: 'text', text: 'ok' }],
+        stop_reason: 'end_turn',
+        usage: USAGE,
+      }),
+      { status: 200, headers: { 'content-type': 'application/json' } },
+    );
+  };
+  const task = set.tasks.find((t) => t.id === 'strkit-slug-trim')!;
+  const runArm = async (armId: CodingArmId) => {
+    const outFile = join(scratch, 'peer-' + armId + '.json');
+    const repo = await prepareRepo(set, task, scratch);
+    const agent = supervisedClaudeAgent({
+      decisions: new DecisionService(jev.create({ mode: 'mock', keyVar: 'AI_GATEWAY_API_KEY' })),
+      upstream: upstream as never,
+      pollMs: 50,
+      timeoutMs: 60_000,
+      log: () => {},
+      model: 'claude-opus-5-5',
+      harness: (_input, defaults) =>
+        claudeCodeHarness(
+          { binary: peer, mcp: CODING_ARMS[armId].levers.shapedTools },
+          {
+            env: (ctx) => ({
+              ...defaults.env(ctx),
+              BENCH_SOLUTION: JSON.stringify(task.solution),
+              BENCH_OUT: outFile,
+            }),
+            pinnedVersion: null,
+          },
+        ),
+    });
+    const outcome = await agent({ set, task, arm: CODING_ARMS[armId], rep: 0, repoDir: repo.dir, signal });
+    const seen = JSON.parse(await readFile(outFile, 'utf8')) as {
+      mcpServers: string[];
+      model: { status: number; promptChars: number; body: string; requested: string } | null;
+      mcp: { listed: string[]; listError: unknown; call: { isError?: boolean; content?: { text?: string }[] } | null } | null;
+      tools: string[];
+      error?: string;
+    };
+    const worktree = outcome.worktree ?? repo.dir;
+    const hidden = await runHiddenTest({ worktree, hiddenTest: hiddenTestOf(set, task), signal });
+    await outcome.release?.();
+    await repo.cleanup();
+    return { outcome, seen, hidden, inWorktree: worktree !== repo.dir };
+  };
+
+  await test('supervised: model call metered by the gateway, shaped tools over MCP, fix passes the hidden test', async () => {
+    const { outcome, seen, hidden, inWorktree } = await runArm('supervised');
+    assert.ok(inWorktree, 'the agent worked in a Zephyr worktree, not the prepared repo');
+    assert.equal(seen.error, undefined, seen.error);
+    assert.equal(seen.model?.status, 200, 'the gateway accepted the run token: ' + seen.model?.body);
+    assert.deepEqual(outcome.tokens, { input: 1200, output: 340, cacheRead: 5000, cacheWrite: 80 }, 'tokens come from the ledger');
+    assert.ok(outcome.costUsd > 0, 'claude-opus-5-5 is priced');
+    assert.equal(seen.model?.requested, 'claude-opus-5-5', '--model reaches Claude Code as ANTHROPIC_MODEL');
+    assert.deepEqual(seen.mcpServers, ['zephyr']);
+    assert.ok(seen.mcp?.listed.includes('zephyr_run_tests'), 'shaped tools listed: ' + JSON.stringify(seen.mcp));
+    assert.notEqual(seen.mcp?.call?.isError, true, 'zephyr_run_tests ran: ' + JSON.stringify(seen.mcp?.call));
+    assert.ok(seen.tools.includes('Edit:allowed'), 'the edit went through the bridge: ' + seen.tools.join(','));
+    assert.ok(hidden.passed, 'hidden test: ' + hidden.output?.slice(-400));
+    assert.match(outcome.detail ?? '', /1 model call\(s\) metered/);
+  });
+
+  await test('loo-L1: no MCP server, no shaped tools, still passes', async () => {
+    const { outcome, seen, hidden } = await runArm('loo-L1');
+    assert.equal(seen.error, undefined, seen.error);
+    assert.deepEqual(seen.mcpServers, []);
+    assert.equal(seen.mcp, null);
+    assert.ok(hidden.passed, 'hidden test: ' + hidden.output?.slice(-400));
+    assert.equal(upstreamCalls.length, 2, 'one model call per run reached the upstream');
+    assert.equal(typeof outcome.approvals, 'number');
+  });
+
+  await test('the supervised agent refuses the vanilla arm', async () => {
+    const agent = supervisedClaudeAgent({ decisions: new DecisionService(jev.create({ mode: 'mock', keyVar: 'AI_GATEWAY_API_KEY' })), upstream: upstream as never });
+    await assert.rejects(() => agent({ set, task, arm: CODING_ARMS.vanilla, rep: 0, repoDir: scratch, signal }), /only Zephyr arms/);
+  });
+}
 
 await rm(scratch, { recursive: true, force: true, maxRetries: 3 }).catch(() => {});
 console.log(failures ? `\n${failures} failure(s)` : '\nall coding-benchmark checks passed');

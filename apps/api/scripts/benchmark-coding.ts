@@ -5,6 +5,7 @@
  *   pnpm --filter @htn/api benchmark:coding -- --report bench.md
  *   pnpm --filter @htn/api benchmark:coding -- --report-only
  *   pnpm --filter @htn/api benchmark:coding -- --mode live --arms vanilla --reps 3 --yes-spend
+ *   pnpm --filter @htn/api benchmark:coding -- --mode live --arms vanilla,supervised  *       --tasks strkit-slug-trim --reps 3 --yes-spend
  *
  * Unattended and resumable: every finished run is appended to the journal; rerunning
  * the same command skips what is already there. A run is never retried for a better
@@ -13,7 +14,7 @@
  * Flags:
  *   --mode mock|live      mock (default) replays reference fixes offline. live spends money
  *                         and requires --yes-spend.
- *   --arms a,b,...        arm ids (default: every arm in mock; vanilla in live)
+ *   --arms a,b,...        arm ids (default: every arm in mock; vanilla,supervised in live)
  *   --reps <n>            repetitions per (task, arm); default 3, the minimum the report accepts
  *   --tasks a,b,...       only these task ids
  *   --journal <file>      default .data/bench/coding.jsonl (CODING_BENCH_JOURNAL)
@@ -23,12 +24,19 @@
  *   --json <file>         also write the report as JSON
  *   --report-only         run nothing; rebuild the report from the journal
  *   --claude <path>       live: the claude executable (default `claude` on PATH)
- *   --model <id>          live: model for claude -p
+ *   --model <id>          live: model for every arm (claude -p --model, ANTHROPIC_MODEL)
+ *   --claude-acp <path>   live, Zephyr arms: claude-agent-acp's dist/index.js or executable
+ *                         (default CLAUDECODE_BINARY, else `claude-agent-acp` on PATH)
+ *   --budget-cents <n>    live, Zephyr arms: per-run spend cap the gateway enforces (default 300)
+ *
+ * Live Zephyr arms forward the model calls to ANTHROPIC_BASE_URL (default
+ * api.anthropic.com) with ANTHROPIC_API_KEY, metered by Zephyr's gateway. Jev is live
+ * when AI_GATEWAY_API_KEY is set (JEV_MODE), the deterministic mock otherwise.
  */
 
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
-import { buildCodingReport, CODING_ARM_IDS, isCodingArmId, type CodingArmId } from '@htn/shared';
+import { buildCodingReport, CODING_ARM_IDS, CODING_ARMS, isCodingArmId, type CodingArmId } from '@htn/shared';
 import {
   codingReportMarkdown,
   loadCodingTaskSet,
@@ -36,6 +44,7 @@ import {
   runCodingBenchmark,
 } from '../src/core/benchmark/coding/index.js';
 import { DEFAULT_CODING_JOURNAL, mockCodingAgent } from '../src/services/benchmarkCoding.service.js';
+import type { CodingAgent } from '../src/core/benchmark/coding/index.js';
 import { liveArmProblems, vanillaClaudeAgent } from '../src/services/benchmarkCoding.live.js';
 
 const flag = (name: string): string | undefined => {
@@ -83,7 +92,7 @@ if (has('report-only')) {
   process.exit(0);
 }
 
-const armIds = list('arms') ?? (mode === 'live' ? ['vanilla'] : [...CODING_ARM_IDS]);
+const armIds = list('arms') ?? (mode === 'live' ? ['vanilla', 'supervised'] : [...CODING_ARM_IDS]);
 const bad = armIds.filter((a) => !isCodingArmId(a));
 if (bad.length) throw new Error('unknown arm(s): ' + bad.join(', ') + '. Known: ' + CODING_ARM_IDS.join(', '));
 const arms = armIds as CodingArmId[];
@@ -103,15 +112,37 @@ if (mode === 'live') {
     console.error('--mode live runs Claude Code against real models and costs money. Re-run with --yes-spend.');
     process.exit(2);
   }
+  if (arms.some((a) => CODING_ARMS[a].zephyr) && !process.env.ANTHROPIC_API_KEY && !process.env.ANTHROPIC_BASE_URL) {
+    console.error('Live Zephyr arms forward to Anthropic: set ANTHROPIC_API_KEY (or ANTHROPIC_BASE_URL).');
+    process.exit(2);
+  }
 }
 
-const agent =
-  mode === 'live'
-    ? vanillaClaudeAgent({
-        ...(flag('claude') ? { binary: flag('claude')! } : {}),
-        ...(flag('model') ? { model: flag('model')! } : {}),
-      })
-    : mockCodingAgent();
+async function liveAgent(): Promise<CodingAgent> {
+  const vanilla = vanillaClaudeAgent({
+    ...(flag('claude') ? { binary: flag('claude')! } : {}),
+    ...(flag('model') ? { model: flag('model')! } : {}),
+  });
+  if (!arms.some((a) => CODING_ARMS[a].zephyr)) return vanilla;
+  const { config } = await import('../src/config.js');
+  const { DecisionService } = await import('../src/core/decisions/service.js');
+  const jev = await import('../src/providers/jev/index.js');
+  const { supervisedClaudeAgent } = await import('../src/services/benchmarkCoding.supervised.js');
+  const usesSkills = arms.some((a) => CODING_ARMS[a].zephyr && CODING_ARMS[a].skills);
+  const learning = usesSkills ? (await import('../src/services/learning.runtime.js')).learningService() : undefined;
+  const binary = flag('claude-acp') ?? config.providers.claudecode.binary;
+  console.log(`zephyr arms: claude-agent-acp=${binary ?? 'claude-agent-acp (PATH)'} jev=${config.providers.jev.mode}`);
+  const supervised = supervisedClaudeAgent({
+    ...(binary ? { binary } : {}),
+    ...(flag('model') ? { model: flag('model')! } : {}),
+    decisions: new DecisionService(jev.create(config.providers.jev)),
+    ...(learning ? { knowledge: () => learning.knowledgeLoader() } : {}),
+    ...(int('budget-cents') !== undefined ? { budgetCents: int('budget-cents')! } : {}),
+  });
+  return (input) => (input.arm.zephyr ? supervised(input) : vanilla(input));
+}
+
+const agent = mode === 'live' ? await liveAgent() : mockCodingAgent();
 
 const controller = new AbortController();
 process.once('SIGINT', () => {

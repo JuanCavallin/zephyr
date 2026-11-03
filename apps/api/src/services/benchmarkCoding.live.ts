@@ -6,25 +6,21 @@
  * the prepared repo, with its own permission mode and no Zephyr in the loop. Token
  * figures come from the CLI's own `usage` block; the cost is its `total_cost_usd`.
  *
- * The Zephyr arms (supervised and the leave-one-out arms) need the model gateway,
- * the hook endpoint and the MCP server of a running Zephyr, bound to the benchmark's
- * temp repo instead of a run worktree. That wiring is not built yet, so asking for a
- * Zephyr arm in live mode fails up front (liveArmProblems) instead of producing
- * numbers that were not measured the way the protocol says.
+ * The Zephyr arms (supervised, leave-one-out, skills off) run through
+ * `supervisedClaudeAgent` (benchmarkCoding.supervised.ts): claude-agent-acp under a
+ * per-run Zephyr stack with the gateway, hooks and MCP bound to the bench repo.
  */
 
 import { spawn } from 'node:child_process';
 import { isAbsolute } from 'node:path';
-import type { CodingArmId, CodingTokens } from '@htn/shared';
+import { CODING_ARM_IDS, type CodingArmId, type CodingTokens } from '@htn/shared';
 import type { AgentOutcome, CodingAgent } from '../core/benchmark/coding/index.js';
 
-export const LIVE_ARMS: readonly CodingArmId[] = ['vanilla'];
+export const LIVE_ARMS: readonly CodingArmId[] = CODING_ARM_IDS;
 
-/** Arms that cannot run live yet, with the reason. Empty means the plan can start. */
+/** Arms that cannot run live, with the reason. Empty means the plan can start. */
 export function liveArmProblems(arms: readonly CodingArmId[]): string[] {
-  return arms
-    .filter((a) => !LIVE_ARMS.includes(a))
-    .map((a) => a + ': live Zephyr arms are not wired yet (needs the gateway, hooks and MCP bound to the bench repo)');
+  return arms.filter((a) => !LIVE_ARMS.includes(a)).map((a) => a + ': not a live arm');
 }
 
 /** The tools vanilla Claude Code may use without asking: edits plus running node/npm. */
