@@ -22,6 +22,7 @@ import { credentialsRouter } from './credentials.routes.js';
 import { browserRouter } from './browser.routes.js';
 import { tasksRouter } from './tasks.routes.js';
 import { learningRouter } from './learning.routes.js';
+import { runWorkspaceRouter } from './runWorkspace.routes.js';
 import { requireLocalControl } from '../services/localControl.js';
 import { createHarnessCallbackRouter, createObservedRouter } from './hooks.routes.js';
 import { hookTokens } from '../core/hooks/hookTokens.js';
@@ -54,6 +55,8 @@ export function mountRoutes(app: Express): void {
   api.use(browserRouter);
   api.use(graphsRouter);
   api.use(runsRouter);
+  // The run page Workspace panel: diff, checkpoints, rewind.
+  api.use(runWorkspaceRouter);
   // Graph vs baseline across stored runs; the Benchmarks page reads this.
   api.use(benchmarksRouter);
   api.use(approvalsRouter);

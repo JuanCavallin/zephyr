@@ -16,6 +16,7 @@
     "check:board": "tsx scripts/board.check.ts",
     "check:learning": "tsx scripts/learning.check.ts",
     "check:benchmark-coding": "tsx scripts/benchmark-coding.check.ts",
+    "check:workspace-view": "tsx scripts/workspace-view.check.ts",
     "learning:export": "tsx scripts/learning-profile.ts export",
     "learning:delete": "tsx scripts/learning-profile.ts delete",
     "check:hermes-live": "tsx scripts/hermes-live.check.ts",
