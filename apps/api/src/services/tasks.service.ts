@@ -22,7 +22,7 @@
 
 import {
   isTerminal,
-  applyTemplateToRequest,
+  applyTemplateToAcceptance,
   taskTemplate,
   toRepoPath,
   type Approval,
@@ -399,7 +399,6 @@ export class BoardService {
   async createBoard(input: CreateBoardInput): Promise<BoardView> {
     const at = nowIso();
     const template = input.template ? taskTemplate(input.template) : undefined;
-    const request = template ? applyTemplateToRequest(input.request, template) : input.request;
     const run = await this.deps.store.createRun({
       id: newId('run'),
       kind: BOARD_KIND,
@@ -454,7 +453,7 @@ export class BoardService {
 
     try {
       const plan = await decompose(
-        { runId: run.id, request, ...(input.repoFiles ? { repoFiles: input.repoFiles } : {}) },
+        { runId: run.id, request: input.request, ...(input.repoFiles ? { repoFiles: input.repoFiles } : {}) },
         { complete: this.deps.complete },
       );
       const ids = new Map(plan.tasks.map((t) => [t.id, newId('task')]));
@@ -463,7 +462,7 @@ export class BoardService {
           id: ids.get(d.id)!,
           boardRunId: run.id,
           title: d.title,
-          acceptance: d.acceptance,
+          acceptance: template ? applyTemplateToAcceptance(d.acceptance, template) : d.acceptance,
           writeScope: [...d.writeScope],
           dependsOn: d.deps.map((x) => ids.get(x)!).filter(Boolean),
           status: 'pending',

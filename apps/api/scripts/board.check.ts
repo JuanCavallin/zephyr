@@ -1209,7 +1209,11 @@ await test('a template presets concurrency, auto-merge, budget and policy; the u
   const v = await svc.createBoard({ request: '- tweak header\n- tweak footer', template: 'polish-ui' });
   assert.equal((v.run.input as { template?: string }).template, 'polish-ui');
   assert.equal((v.run.input as { request: string }).request, '- tweak header\n- tweak footer', 'the stored request is the user words');
-  assert.ok(v.tasks.length >= 2, 'decomposed');
+  assert.equal(v.tasks.length, 2, 'the guidance is not planned as a task of its own');
+  for (const t of v.tasks) {
+    assert.doesNotMatch(t.title, /Polish the UI/);
+    assert.match(t.acceptance, /\nPolish the UI: /, 'the guidance rides on each task');
+  }
   await svc.runReady(v.run.id);
   await svc.whenIdle(v.run.id);
   assert.ok(seen.length >= 2, 'executor ran');

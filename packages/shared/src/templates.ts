@@ -100,7 +100,10 @@ export function taskTemplate(id: TaskTemplateId): TaskTemplate {
   return TASK_TEMPLATES[id];
 }
 
-/** The request as the board receives it: the user's words, then the template's guidance. */
-export function applyTemplateToRequest(request: string, t: TaskTemplate): string {
-  return request.trim() + '\n\n' + t.label + ': ' + t.guidance;
+/**
+ * A task's acceptance with the template's guidance appended. The guidance goes on every
+ * task, not into the request: a decomposer would otherwise plan it as a task of its own.
+ */
+export function applyTemplateToAcceptance(acceptance: string, t: TaskTemplate): string {
+  return acceptance.trim() + '\n' + t.label + ': ' + t.guidance;
 }
