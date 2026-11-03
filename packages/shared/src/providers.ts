@@ -231,6 +231,33 @@ export interface RouteTaskInput {
   candidates: RouteCandidateInput[];
 }
 
+/** Step 8: one learned entry, as Jev sees it: a short statement, never code. */
+export interface LearningEntryInput {
+  id: string;
+  kind: 'pref' | 'skill';
+  scope: import('./coding.js').LearningScope;
+  text: string;
+}
+
+/** Step 8: a drafted candidate, its evidence (one line per signal) and the entries it may repeat. */
+export interface LearningCandidateInput {
+  candidate: { kind: 'pref' | 'skill'; text: string };
+  evidence: string[];
+  entries: LearningEntryInput[];
+}
+
+/** Step 8: how a candidate relates to the existing entries. */
+export interface LearningCandidateScore {
+  /** Probability the evidence supports the candidate. */
+  support: number;
+  relation: 'new' | 'duplicate' | 'contradicts';
+  /** The entry it duplicates or contradicts. */
+  entryId?: string;
+  /** Probability of the relation answer. */
+  confidence: number;
+  reasonCodes: string[];
+}
+
 export interface DecisionAdapter extends ProviderAdapter {
   /** Cheap, fast classify-or-route call. Deliberately tiny. */
   decide(
@@ -333,6 +360,26 @@ export interface DecisionAdapter extends ProviderAdapter {
   ): Promise<
     ProviderResult<{ choice: string; confidence: number; probabilities: Record<string, number>; reasonCodes: string[] }>
   >;
+
+  /**
+   * Step 8: in ONE request, a `boolean` (does the evidence support the candidate?)
+   * and a `choice` over new / duplicate of #k / contradicts #k. Optional: without it
+   * the candidate is treated as new, at low confidence, and never auto-activates.
+   */
+  scoreLearningCandidate?(
+    input: LearningCandidateInput,
+    ctx: ProviderCallContext,
+  ): Promise<ProviderResult<LearningCandidateScore>>;
+
+  /**
+   * Step 8: rate each learned entry's relevance to a task, in ONE request (one
+   * `score` question per entry), normalized to 0..1 and keyed by id. Optional:
+   * without it relevance is keyword overlap.
+   */
+  scoreKnowledge?(
+    input: { task: string; paths: string[]; entries: LearningEntryInput[] },
+    ctx: ProviderCallContext,
+  ): Promise<ProviderResult<{ scores: Record<string, number>; reasonCodes: string[] }>>;
 
   /**
    * Route a subtask BEFORE it starts: pick a model tier and filter the

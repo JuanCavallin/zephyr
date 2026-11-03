@@ -6,7 +6,12 @@
  * Offline. No harness, no model, no network.
  *
  *   1. Profile store: migrations, persistence, versions, evidence, export, delete.
- *   2. Signal capture: edit diffs (CRLF-safe), builders, the signal log.
+ *   2. Signal capture: edit diffs (CRLF-safe), builders, the signal log, the merge queue.
+ *   3. Guardrails: weakened checks, protected paths, policy and grants.
+ *   4. Draft step: a normal model, failure-safe, private signals local only.
+ *   5. Jev scoring: new / duplicate / contradicts, and the fallback.
+ *   6. Lifecycle: threshold crossing, contradiction, revert and restore.
+ *   7. Learning pass: edit -> candidate -> active.
  */
 
 process.env.PERSIST_TO_DISK = 'false';
@@ -410,6 +415,493 @@ await test('merge queue: a failing capture never fails the merge', async () => {
   await writeFile(join(worktree, 'src', 'parse.ts'), 'export const parse = (s: string) => s.trim();\n');
   assert.equal((await queue.resolveApproval('task_1', { outcome: 'approved' })).outcome, 'merged');
   assert.equal(errors.length, 1);
+});
+
+const { checkLearnedContent } = await import('../src/core/learning/guardrails.js');
+const { draftCandidates, heuristicDraft, buildDraftPrompt, LEARNING_DRAFT_POLICY_RULE } = await import('../src/core/learning/draft.js');
+const { scoreCandidate } = await import('../src/core/learning/score.js');
+const { Lifecycle, ACTIVATION_THRESHOLD, reinforce } = await import('../src/core/learning/lifecycle.js');
+const { runLearningPass } = await import('../src/core/learning/pipeline.js');
+const { DecisionService, FALLBACK_LEARNING_SUPPORT } = await import('../src/core/decisions/service.js');
+const { create: createJev } = await import('../src/providers/jev/index.js');
+const { create: createAnthropic } = await import('../src/providers/anthropic/index.js');
+type TextModelAdapter = import('@htn/shared').TextModelAdapter;
+type DecisionAdapter = import('@htn/shared').DecisionAdapter;
+type ProviderConfig = import('../src/config.js').ProviderConfig;
+type DraftCandidate = import('../src/core/learning/draft.js').DraftCandidate;
+type CandidateScore = import('../src/core/learning/score.js').CandidateScore;
+
+type Call = { input: Parameters<TextModelAdapter['complete']>[0]; ctx: Parameters<TextModelAdapter['complete']>[1] };
+function completer(replies: (string | Error)[]): TextModelAdapter['complete'] & { calls: Call[] } {
+  let i = 0;
+  const fn = (async (input: Call['input'], ctx: Call['ctx']) => {
+    fn.calls.push({ input, ctx });
+    const reply = replies[Math.min(i++, replies.length - 1)]!;
+    if (reply instanceof Error) throw reply;
+    return {
+      ok: true as const,
+      data: { text: reply, tokensIn: 10, tokensOut: 20 },
+      meta: { provider: 'anthropic' as const, op: 'complete', mode: 'mock' as const, latencyMs: 0, destination: 'mock://' },
+    };
+  }) as unknown as TextModelAdapter['complete'] & { calls: Call[] };
+  fn.calls = [];
+  return fn;
+}
+const failing = (async () => ({
+  ok: false,
+  error: { code: 'UPSTREAM', message: 'model down', retryable: true },
+  meta: { provider: 'anthropic', op: 'complete', mode: 'live', latencyMs: 0, destination: 'x' },
+})) as unknown as TextModelAdapter['complete'];
+const mockJev = () => new DecisionService(createJev({ mode: 'mock' } as ProviderConfig));
+const jevStub = (over: Partial<DecisionAdapter>, mode: 'live' | 'mock' = 'live') =>
+  new DecisionService({ id: 'jev', mode, ...over } as unknown as DecisionAdapter);
+const jevMeta = { provider: 'jev' as const, op: 'score_learning_candidate', mode: 'live' as const, latencyMs: 0, destination: 'gateway' };
+const jevOk = (data: Record<string, unknown>) => async () => ({ ok: true, data, meta: jevMeta }) as never;
+
+const NESTED_TO_EARLY = [
+  'diff --git a/src/parse.ts b/src/parse.ts',
+  '--- a/src/parse.ts',
+  '+++ b/src/parse.ts',
+  '@@ -1,8 +1,4 @@',
+  ' export function parse(s: string) {',
+  '-  if (s) {',
+  '-    if (s.length > 1) {',
+  '-      return s.trim();',
+  '-    }',
+  '-  }',
+  '-  return "";',
+  '+  if (!s) return "";',
+  '+  return s.trim();',
+  ' }',
+].join('\n');
+
+const editSig = (id: string, over: Record<string, unknown> = {}) =>
+  ({ id, kind: 'user_edit', diffHash: 'h_' + id, files: ['src/parse.ts'], scope: 'personal', private: false, at: T0, ...over }) as PreferenceSignal;
+
+async function storeWithEdit(id: string) {
+  const store = new ProfileStore(':memory:');
+  await store.recordSignal(editSig(id), { detail: NESTED_TO_EARLY });
+  return store;
+}
+
+console.log('3. guardrails');
+
+await test('guardrails: weakening a success check is rejected', () => {
+  for (const text of [
+    'Skip the tests when the change is small.',
+    'Disable lint for generated files.',
+    'Use it.skip for flaky specs.',
+    'Add @ts-ignore where types get in the way.',
+    'Typecheck is optional for scripts.',
+    'Update snapshots when they fail.',
+    'Delete failing assertions.',
+  ]) {
+    const v = checkLearnedContent(text);
+    assert.equal(v.ok, false, text);
+    assert.ok(v.reasons.includes('weakens-success-check'), text + ' -> ' + v.reasons.join(','));
+  }
+});
+
+await test('guardrails: protected paths, policy and grants are rejected', () => {
+  const cases: [string, string][] = [
+    ['Edit tests/parse.test.ts to match the new output.', 'protected-path'],
+    ['Keep secrets in .env.local.', 'protected-path'],
+    ['Bump versions directly in pnpm-lock.yaml.', 'protected-path'],
+    ['Change .github/workflows/ci.yml when builds are slow.', 'protected-path'],
+    ['Approve merges that only touch docs.', 'policy-or-approval'],
+    ['The agent has permission to push to main.', 'policy-or-approval'],
+    ['Commit with --no-verify to save time.', 'widens-grant'],
+    ['Add allowed-tools: Bash to every skill.', 'widens-grant'],
+    ['Force-push to clean up history.', 'widens-grant'],
+  ];
+  for (const [text, reason] of cases) {
+    const v = checkLearnedContent(text);
+    assert.equal(v.ok, false, text);
+    assert.ok(v.reasons.includes(reason as never), `${text} -> ${v.reasons.join(',')}`);
+  }
+  const policy = checkLearnedContent('Name helpers in src/billing/invoice.ts after the noun.', {
+    protectDefaults: true,
+    protectedGlobs: ['src/billing/**'],
+  });
+  assert.ok(policy.reasons.includes('protected-path'), 'policy globs count');
+});
+
+await test('guardrails: ordinary taste passes', () => {
+  for (const text of [
+    'Prefer early returns over nested if blocks.',
+    'Use const or let, never var.',
+    'Name React components in PascalCase and keep them in src/components.',
+    'Keep functions under forty lines.',
+    'Prefer named exports in src/lib/format.ts.',
+    'Do not leave console.log calls in committed code.',
+  ]) {
+    const v = checkLearnedContent(text);
+    assert.equal(v.ok, true, `${text} -> ${v.matches.join('; ')}`);
+  }
+});
+
+console.log('4. draft step (normal model)');
+
+await test("draft: a stubbed model's candidates are parsed, evidence filtered, malformed dropped", async () => {
+  const store = await storeWithEdit('sig_e1');
+  const model = completer([
+    JSON.stringify({
+      candidates: [
+        { kind: 'pref', scope: 'personal', text: 'Prefer early returns.', evidence: ['sig_e1', 'sig_bogus'] },
+        { kind: 'pref', scope: 'personal', text: 'No evidence here.', evidence: ['sig_bogus'] },
+        { kind: 'skill', scope: 'project', name: 'Not Kebab', description: 'x', body: 'y', evidence: ['sig_e1'] },
+        {
+          kind: 'skill',
+          scope: 'project',
+          name: 'guard-clauses',
+          description: 'Refactor nesting into guards',
+          body: '1. Find nested ifs.\n2. Invert.',
+          evidence: ['sig_e1'],
+        },
+      ],
+    }),
+  ]);
+  const r = await draftCandidates(store.signals({ unprocessed: true }), { complete: model });
+  assert.ok(r.ok);
+  assert.deepEqual(
+    r.candidates.map((c) => [c.kind, c.text, c.evidence]),
+    [
+      ['pref', 'Prefer early returns.', ['sig_e1']],
+      ['skill', 'Refactor nesting into guards', ['sig_e1']],
+    ],
+  );
+  assert.deepEqual(r.processed, ['sig_e1']);
+  assert.equal(model.calls.length, 1);
+  assert.equal(model.calls[0]!.ctx.policyRule, LEARNING_DRAFT_POLICY_RULE);
+  assert.equal(model.calls[0]!.input.json, true);
+  assert.match(model.calls[0]!.input.prompt, /if \(!s\) return/, 'the diff is the evidence');
+  store.close();
+});
+
+await test('draft: guardrail-failing drafts are rejected before scoring', async () => {
+  const store = await storeWithEdit('sig_e2');
+  const model = completer([
+    JSON.stringify({
+      candidates: [
+        { kind: 'pref', scope: 'personal', text: 'Skip the tests for small diffs.', evidence: ['sig_e2'] },
+        { kind: 'pref', scope: 'personal', text: 'Prefer early returns.', evidence: ['sig_e2'] },
+      ],
+    }),
+  ]);
+  const r = await draftCandidates(store.signals(), { complete: model });
+  assert.ok(r.ok);
+  assert.deepEqual(r.candidates.map((c) => c.text), ['Prefer early returns.']);
+  assert.equal(r.rejected.length, 1);
+  assert.deepEqual(r.rejected[0]!.verdict.reasons, ['weakens-success-check']);
+  store.close();
+});
+
+await test('draft: model failure, a throw, or garbage is { ok: false }, never an exception', async () => {
+  const store = await storeWithEdit('sig_e3');
+  const pending = store.signals();
+  for (const complete of [failing, completer([new Error('socket hang up')]), completer(['I think the user likes tidy code.'])]) {
+    const r = await draftCandidates(pending, { complete });
+    assert.equal(r.ok, false);
+    assert.deepEqual(r.processed, []);
+  }
+  store.close();
+});
+
+await test('draft failure never fails the task: the pass reports, signals stay for next time', async () => {
+  const store = await storeWithEdit('sig_e4');
+  const lifecycle = new Lifecycle({ store });
+  const r = await runLearningPass({ store, decisions: mockJev(), lifecycle, complete: failing });
+  assert.equal(r.ok, false);
+  assert.match(r.error ?? '', /model down/);
+  assert.equal(store.signals({ unprocessed: true }).length, 1, 'retried on the next pass');
+  assert.equal(store.entries().length, 0);
+  store.close();
+});
+
+await test('guardrail: private signals go only to the local model, at tier local', async () => {
+  const store = await storeWithEdit('sig_open');
+  await store.recordSignal(editSig('sig_priv', { files: ['src/secret.ts'], private: true }), {
+    detail: '-  const KEY = "sk_live_123";\n+  const KEY = process.env.KEY;',
+  });
+  const remote = completer([JSON.stringify({ candidates: [] })]);
+  const local = completer([JSON.stringify({ candidates: [] })]);
+  const r = await draftCandidates(store.signals(), { complete: remote, completeLocal: local });
+  assert.ok(r.ok);
+  assert.equal(remote.calls.length, 1);
+  assert.doesNotMatch(remote.calls[0]!.input.prompt, /sig_priv|sk_live_123|secret\.ts/, 'remote never sees a private signal');
+  assert.equal(local.calls.length, 1);
+  assert.match(local.calls[0]!.input.prompt, /sig_priv/);
+  assert.equal(local.calls[0]!.input.tier, 'local');
+  assert.notEqual(remote.calls[0]!.input.tier, 'local');
+
+  // With no local model the private signal waits; it is never sent to the remote one.
+  const remoteOnly = completer([JSON.stringify({ candidates: [] })]);
+  const r2 = await draftCandidates(store.signals(), { complete: remoteOnly });
+  assert.ok(r2.ok);
+  assert.deepEqual(r2.deferred, ['sig_priv']);
+  assert.deepEqual(r2.processed, ['sig_open']);
+  assert.doesNotMatch(remoteOnly.calls[0]!.input.prompt, /sig_priv/);
+  store.close();
+});
+
+await test('draft: the mock text model drafts deterministically from the diff', async () => {
+  const store = await storeWithEdit('sig_e5');
+  const prompt = buildDraftPrompt(store.signals());
+  assert.deepEqual(heuristicDraft(prompt).candidates, [
+    { kind: 'pref', scope: 'personal', text: 'Prefer early returns over nested if blocks.', evidence: ['sig_e5'] },
+  ]);
+  const anthropic = createAnthropic({ mode: 'mock' } as ProviderConfig);
+  const r = await draftCandidates(store.signals(), { complete: (i, c) => anthropic.complete(i, c) });
+  assert.ok(r.ok);
+  assert.deepEqual(r.candidates.map((c) => c.text), ['Prefer early returns over nested if blocks.']);
+  store.close();
+});
+
+console.log('5. Jev scoring');
+
+const cand = (text: string, evidence = ['sig_x'], over: Partial<DraftCandidate> = {}): DraftCandidate => ({
+  kind: 'pref',
+  scope: 'personal',
+  text,
+  evidence,
+  private: false,
+  ...over,
+});
+
+await test('Jev scoring (mock): new, duplicate of #k, contradicts #k', async () => {
+  const store = new ProfileStore(':memory:');
+  await store.recordSignal(sig('sig_x'));
+  store.putEntry(entry('pref_early', { evidence: ['sig_x'], text: 'Prefer early returns over nested ifs.' }), 'seed');
+  const jev = mockJev();
+  const fresh = await scoreCandidate(jev, store, cand('Use const or let, never var.'));
+  assert.equal(fresh.relation, 'new');
+  assert.equal(fresh.source, 'jev');
+  assert.equal(fresh.autoActivate, true);
+  assert.ok(fresh.support > 0.5 && fresh.support <= 1);
+  const dup = await scoreCandidate(jev, store, cand('Prefer early returns over nested if blocks.'));
+  assert.deepEqual([dup.relation, dup.entryId], ['duplicate', 'pref_early']);
+  const contra = await scoreCandidate(jev, store, cand('Never use early returns; prefer nested ifs.'));
+  assert.deepEqual([contra.relation, contra.entryId], ['contradicts', 'pref_early']);
+  store.close();
+});
+
+await test('Jev scoring: unsupported / failed / unknown entry / ineligible -> new, low, never auto-activated', async () => {
+  const store = new ProfileStore(':memory:');
+  await store.recordSignal(sig('sig_x'));
+  store.putEntry(entry('pref_a', { evidence: ['sig_x'] }), 'seed');
+  const expectFallback = (s: CandidateScore, reason: string) => {
+    assert.equal(s.relation, 'new');
+    assert.equal(s.support, FALLBACK_LEARNING_SUPPORT);
+    assert.equal(s.autoActivate, false);
+    assert.equal(s.source, 'fallback');
+    assert.ok(s.reasonCodes.includes(reason), s.reasonCodes.join(','));
+  };
+  const c = cand('Prefer tabs.');
+  expectFallback(await scoreCandidate(jevStub({}), store, c), 'jev-learning-unsupported');
+  expectFallback(
+    await scoreCandidate(
+      jevStub({
+        scoreLearningCandidate: async () => ({ ok: false, error: { code: 'UPSTREAM', message: 'x', retryable: true }, meta: jevMeta }) as never,
+      }),
+      store,
+      c,
+    ),
+    'jev-learning-failed',
+  );
+  expectFallback(
+    await scoreCandidate(
+      jevStub({ scoreLearningCandidate: jevOk({ support: 0.9, relation: 'duplicate', entryId: 'pref_nope', confidence: 0.9, reasonCodes: [] }) }),
+      store,
+      c,
+    ),
+    'jev-learning-unknown-entry',
+  );
+  let asked = 0;
+  const ok = jevOk({ support: 0.9, relation: 'new', confidence: 0.9, reasonCodes: [] });
+  const live = jevStub({
+    scoreLearningCandidate: (async () => {
+      asked++;
+      return ok();
+    }) as never,
+  });
+  expectFallback(await scoreCandidate(live, store, cand('Prefer tabs.', ['sig_x'], { private: true })), 'remote-jev-ineligible');
+  assert.equal(asked, 0, 'a private candidate never reaches a remote Jev');
+  assert.equal((await scoreCandidate(live, store, c)).source, 'jev');
+  assert.equal(asked, 1);
+  store.close();
+});
+
+await test('Jev scoring: a non-private candidate is never compared with private entries', async () => {
+  const store = new ProfileStore(':memory:');
+  await store.recordSignal(sig('sig_x'));
+  store.putEntry(entry('pref_pub', { evidence: ['sig_x'] }), 'seed');
+  store.putEntry(entry('pref_priv', { evidence: ['sig_x'], private: true, text: 'Keep the acme client key in config.' }), 'seed');
+  let offered: string[] = [];
+  const ok = jevOk({ support: 0.8, relation: 'new', confidence: 0.8, reasonCodes: [] });
+  const live = jevStub({
+    scoreLearningCandidate: (async (input: { entries: { id: string }[] }) => {
+      offered = input.entries.map((e) => e.id);
+      return ok();
+    }) as never,
+  });
+  await scoreCandidate(live, store, cand('Prefer tabs.'));
+  assert.deepEqual(offered, ['pref_pub']);
+  store.close();
+});
+
+console.log('6. lifecycle');
+
+const jevScore = (over: Partial<CandidateScore> = {}): CandidateScore => ({
+  support: 0.6,
+  relation: 'new',
+  confidence: 0.8,
+  reasonCodes: [],
+  autoActivate: true,
+  source: 'jev',
+  ...over,
+});
+
+await test('lifecycle: confidence rises with evidence and crosses the threshold once', async () => {
+  const store = new ProfileStore(':memory:');
+  for (const id of ['s1', 's2', 's3']) await store.recordSignal(sig(id));
+  const events: RunEvent[] = [];
+  const life = new Lifecycle({ store, emit: (_r, e) => events.push(e) });
+  const first = life.apply(cand('Prefer early returns.', ['s1']), jevScore({ support: 0.6 })).entry!;
+  assert.equal(first.status, 'candidate');
+  assert.ok(first.confidence < ACTIVATION_THRESHOLD);
+  const second = life.apply(cand('Prefer early returns.', ['s2']), jevScore({ relation: 'duplicate', entryId: first.id, support: 0.6 })).entry!;
+  assert.equal(second.id, first.id);
+  assert.equal(second.version, 2);
+  assert.deepEqual(second.evidence, ['s1', 's2']);
+  assert.equal(second.confidence, reinforce(0.6, 0.6));
+  assert.ok(second.confidence >= ACTIVATION_THRESHOLD, 'two supporting signals cross it');
+  assert.equal(second.status, 'active');
+  const third = life.apply(cand('Prefer early returns.', ['s3']), jevScore({ relation: 'duplicate', entryId: first.id })).entry!;
+  assert.equal(third.status, 'active');
+  assert.ok(third.confidence > second.confidence);
+  assert.deepEqual(
+    events.map((e) => e.type),
+    ['learning.candidate', 'learning.activated'],
+    'activated exactly once',
+  );
+  assert.deepEqual(store.evidenceFor(first.id).map((s) => s.signal.id).sort(), ['s1', 's2', 's3']);
+  store.close();
+});
+
+await test('lifecycle: fallback scores never auto-activate, however much evidence piles up', async () => {
+  const store = new ProfileStore(':memory:');
+  for (const id of ['s1', 's2', 's3', 's4']) await store.recordSignal(sig(id));
+  const life = new Lifecycle({ store });
+  const fb = (over: Partial<CandidateScore> = {}) =>
+    jevScore({ source: 'fallback', autoActivate: false, support: FALLBACK_LEARNING_SUPPORT, ...over });
+  const e = life.apply(cand('Prefer tabs.', ['s1']), fb()).entry!;
+  assert.ok(e.confidence < ACTIVATION_THRESHOLD);
+  for (const id of ['s2', 's3', 's4']) life.apply(cand('Prefer tabs.', [id]), fb({ relation: 'duplicate', entryId: e.id, support: 0.95 }));
+  const now = store.entry(e.id)!;
+  assert.ok(now.confidence >= ACTIVATION_THRESHOLD);
+  assert.equal(now.status, 'candidate', 'a person has to accept it');
+  assert.equal(life.accept(e.id).status, 'active');
+  store.close();
+});
+
+await test('lifecycle: a well-supported contradiction retires the old entry; a weak one weakens it', async () => {
+  const store = new ProfileStore(':memory:');
+  for (const id of ['s1', 's2', 's3']) await store.recordSignal(sig(id));
+  const life = new Lifecycle({ store });
+  const old = life.apply(cand('Prefer early returns.', ['s1']), jevScore({ support: 0.9 })).entry!;
+  assert.equal(old.status, 'active');
+  const weak = life.apply(cand('Prefer nested ifs.', ['s2']), jevScore({ relation: 'contradicts', entryId: old.id, support: 0.3 }));
+  assert.equal(store.entry(old.id)!.status, 'candidate', 'weakened below the threshold');
+  assert.ok(store.entry(old.id)!.confidence < 0.9);
+  assert.ok(weak.changes.some((c) => c.change === 'weakened'));
+  const strong = life.apply(cand('Never use early returns.', ['s3']), jevScore({ relation: 'contradicts', entryId: old.id, support: 0.9 }));
+  assert.equal(store.entry(old.id)!.status, 'retired');
+  assert.equal(store.entry(old.id)!.retiredReason, 'contradicted by newer evidence');
+  assert.equal(strong.entry!.status, 'active', 'the newer view takes over');
+  store.close();
+});
+
+await test('lifecycle: one-click revert, versioned, never re-activated by new evidence; restore brings it back', async () => {
+  const store = new ProfileStore(':memory:');
+  for (const id of ['s1', 's2']) await store.recordSignal(sig(id));
+  const events: RunEvent[] = [];
+  const life = new Lifecycle({ store, emit: (_r, e) => events.push(e) });
+  const e = life.apply(cand('Prefer early returns.', ['s1']), jevScore({ support: 0.9 })).entry!;
+  assert.equal(e.status, 'active');
+  const reverted = life.revert(e.id);
+  assert.deepEqual([reverted.status, reverted.reverted, reverted.version], ['retired', true, 2]);
+  assert.equal(events.at(-1)!.type, 'learning.retired');
+  // A stale duplicate pointing at the reverted entry does not touch it.
+  life.apply(cand('Prefer early returns.', ['s2']), jevScore({ relation: 'duplicate', entryId: e.id, support: 0.95 }));
+  assert.equal(store.entry(e.id)!.status, 'retired', 'the reverted entry stays off');
+  assert.equal(store.entry(e.id)!.version, 2);
+  const restored = life.restore(e.id, 1);
+  assert.deepEqual([restored.status, restored.version, restored.reverted], ['active', 3, undefined]);
+  assert.deepEqual(
+    store.versions(e.id).map((v) => v.reason),
+    ['drafted and activated', 'reverted by the user', 'restored version 1'],
+  );
+  store.close();
+});
+
+await test('lifecycle: guardrails hold on every write path', async () => {
+  const store = new ProfileStore(':memory:');
+  await store.recordSignal(sig('s1'));
+  const life = new Lifecycle({ store });
+  const r = life.apply(cand('Commit with --no-verify when hooks are slow.', ['s1']), jevScore({ support: 0.99 }));
+  assert.equal(r.entry, undefined);
+  assert.equal(r.changes[0]!.change, 'rejected');
+  assert.equal(store.entries().length, 0, 'no grant is widened by a learned entry');
+  store.putEntry(entry('pref_bad', { evidence: ['s1'], text: 'Skip the tests.' }), 'smuggled in');
+  assert.throws(() => life.accept('pref_bad'), /guardrail/);
+  assert.equal(store.entry('pref_bad')!.status, 'candidate');
+  store.close();
+});
+
+await test('lifecycle: private entries cannot be promoted into the project', async () => {
+  const store = new ProfileStore(':memory:');
+  await store.recordSignal(sig('s1'));
+  const life = new Lifecycle({ store });
+  const e = life.apply(cand('Prefer early returns.', ['s1'], { private: true }), jevScore()).entry!;
+  assert.equal(e.private, true);
+  assert.throws(() => life.promote(e.id), /private/);
+  const open = life.apply(cand('Use const.', ['s1']), jevScore()).entry!;
+  assert.equal(life.promote(open.id).scope, 'project');
+  store.close();
+});
+
+console.log('7. learning pass');
+
+await test('pass: edit -> mock draft -> mock Jev -> candidate, reinforced until active', async () => {
+  const store = await storeWithEdit('sig_p1');
+  const events: RunEvent[] = [];
+  const lifecycle = new Lifecycle({ store, emit: (_r, e) => events.push(e) });
+  const anthropic = createAnthropic({ mode: 'mock' } as ProviderConfig);
+  const deps = { store, decisions: mockJev(), lifecycle, complete: anthropic.complete.bind(anthropic) };
+  const r1 = await runLearningPass(deps);
+  assert.ok(r1.ok, r1.error);
+  assert.equal(r1.signals, 1);
+  assert.equal(store.signals({ unprocessed: true }).length, 0);
+  const [e1] = store.entries();
+  assert.equal(e1!.text, 'Prefer early returns over nested if blocks.');
+  assert.equal(e1!.status, 'candidate', 'one edit is not enough');
+
+  await store.recordSignal(editSig('sig_p2'), { detail: NESTED_TO_EARLY.replace(/parse/g, 'clean') });
+  const r2 = await runLearningPass(deps);
+  assert.ok(r2.ok, r2.error);
+  assert.equal(store.entries().length, 1, 'the duplicate reinforced, no second entry');
+  const e2 = store.entry(e1!.id)!;
+  assert.ok(e2.confidence > e1!.confidence, 'confidence rises with evidence');
+  assert.equal(e2.status, 'candidate', 'mock support 0.55: two edits reach ~0.67');
+
+  await store.recordSignal(editSig('sig_p3'), { detail: NESTED_TO_EARLY.replace(/parse/g, 'split') });
+  assert.ok((await runLearningPass(deps)).ok);
+  const e3 = store.entry(e1!.id)!;
+  assert.equal(e3.status, 'active', 'the third edit crosses the threshold');
+  assert.deepEqual(e3.evidence, ['sig_p1', 'sig_p2', 'sig_p3']);
+  assert.ok(events.some((e) => e.type === 'learning.activated'));
+  assert.deepEqual((await runLearningPass(deps)).signals, 0, 'nothing left to do');
+  store.close();
 });
 
 console.log(`\n${passed} passed`);

@@ -51,6 +51,30 @@ function overlapScore(state: string, candidate: string): number {
   return overlap;
 }
 
+const NEGATION = /\b(never|not|no|don't|dont|avoid|stop|without)\b/i;
+const FILLER = new Set(
+  'a an the and or of to in on for with by be is are use uses using prefer prefers over than it its this that when always never not no don dont t avoid stop without'.split(' '),
+);
+
+/** Words that carry meaning, without filler or negations. */
+function contentWords(value: string): Set<string> {
+  return new Set([...words(value)].filter((w) => !FILLER.has(w) && w.length > 1));
+}
+
+/** Overlap coefficient of content words, 0..1. */
+function contentSimilarity(a: string, b: string): number {
+  const wa = contentWords(a);
+  const wb = contentWords(b);
+  if (wa.size === 0 || wb.size === 0) return 0;
+  let shared = 0;
+  for (const w of wa) if (wb.has(w)) shared += 1;
+  return shared / Math.min(wa.size, wb.size);
+}
+
+function negates(text: string): boolean {
+  return NEGATION.test(text);
+}
+
 function mockModelChoice(task: string, candidates: ModelRoute[]): ModelRoute | undefined {
   const complex = pickIntelligence(task) === 'high';
   return [...candidates].sort((a, b) => {
@@ -300,6 +324,61 @@ function createMock(cfg: ProviderConfig): DecisionAdapter {
         ctx,
         () => ({ flakyProbability: flaky, reasonCodes: ['mock-flaky-history'] }),
         { tokensIn: estimateTokens(input.test) + input.history.length, tokensOut: 4 },
+      );
+    },
+    async scoreLearningCandidate(input, ctx) {
+      // Deterministic: support grows with the evidence; the closest entry by content
+      // words is a duplicate, or a contradiction when exactly one of them negates.
+      const support = input.evidence.length === 0 ? 0.2 : Math.min(0.95, 0.55 + 0.15 * (input.evidence.length - 1));
+      let best: { id: string; similarity: number; negated: boolean } | undefined;
+      for (const entry of input.entries) {
+        const similarity = contentSimilarity(input.candidate.text, entry.text);
+        if (!best || similarity > best.similarity) best = { id: entry.id, similarity, negated: negates(entry.text) };
+      }
+      const related = best && best.similarity >= 0.6 ? best : undefined;
+      const relation = !related ? 'new' : related.negated !== negates(input.candidate.text) ? 'contradicts' : 'duplicate';
+      return mockCall(
+        'jev',
+        'score_learning_candidate',
+        cfg.mode,
+        ctx,
+        () => ({
+          support,
+          relation,
+          ...(related ? { entryId: related.id } : {}),
+          confidence: related ? Math.max(0.6, related.similarity) : 0.8,
+          reasonCodes: ['mock-learning-candidate'],
+        }),
+        {
+          tokensIn: estimateTokens(input.candidate.text + input.evidence.join(' ') + input.entries.map((e) => e.text).join(' ')),
+          tokensOut: 8,
+        },
+      );
+    },
+    async scoreKnowledge(input, ctx) {
+      // Deterministic: share of the entry's content words that appear in the task or paths.
+      const state = input.task + ' ' + input.paths.join(' ').replace(/[/\\._-]+/g, ' ');
+      return mockCall(
+        'jev',
+        'score_knowledge',
+        cfg.mode,
+        ctx,
+        () => ({
+          scores: Object.fromEntries(
+            input.entries.map((entry) => {
+              const content = contentWords(entry.text);
+              const stateWords = contentWords(state);
+              let hits = 0;
+              for (const w of content) if (stateWords.has(w)) hits += 1;
+              return [entry.id, Math.min(1, hits / Math.max(1, Math.min(content.size, 4)))];
+            }),
+          ),
+          reasonCodes: ['mock-knowledge-relevance'],
+        }),
+        {
+          tokensIn: estimateTokens(state + input.entries.map((e) => e.text).join(' ')),
+          tokensOut: 4 * input.entries.length,
+        },
       );
     },
     async recommendActionPolicy(input, ctx) {

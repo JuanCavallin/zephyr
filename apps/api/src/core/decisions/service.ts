@@ -9,6 +9,9 @@ import type {
   DecisionAdapter,
   DecisionState,
   FlakyTestInput,
+  LearningCandidateInput,
+  LearningCandidateScore,
+  LearningEntryInput,
   ModelRoute,
   ModelSelectionDecision,
   ProviderCallContext,
@@ -53,6 +56,9 @@ export function fallbackCodingCompletion(input: CodingCompletionInput): 'done' |
   if (!failing && input.diff.files > 0) return 'done';
   return input.turns < input.maxTurns ? 'continue' : 'blocked';
 }
+
+/** Step 8: support given to a candidate when Jev did not score it. Low by design. */
+export const FALLBACK_LEARNING_SUPPORT = 0.3;
 
 /** What a coding `done` must have behind it. */
 export function codingVerificationFailures(input: CodingCompletionInput): string[] {
@@ -545,6 +551,75 @@ export class DecisionService {
       probabilities: result.data.probabilities,
       reasonCodes: result.data.reasonCodes,
     };
+  }
+
+  /**
+   * Step 8: how strongly the evidence supports a drafted candidate and how it relates
+   * to existing entries. Without Jev (unsupported, private, failed, or an entry id
+   * that was not offered) the candidate is new, at low support, and `autoActivate`
+   * is false, so the fallback can never switch learning on by itself.
+   */
+  async scoreLearningCandidate(
+    eligibility: Pick<DecisionState, 'sanitizedForRemote' | 'dataLabels'>,
+    input: LearningCandidateInput,
+    ctx: ProviderCallContext,
+  ): Promise<LearningCandidateScore & { autoActivate: boolean; source: 'jev' | 'fallback' }> {
+    const fallback = (reason: string) => ({
+      support: FALLBACK_LEARNING_SUPPORT,
+      relation: 'new' as const,
+      confidence: 0,
+      reasonCodes: [reason, 'treat-as-new-low-confidence'],
+      autoActivate: false,
+      source: 'fallback' as const,
+    });
+    if (!this.adapter.scoreLearningCandidate) return fallback('jev-learning-unsupported');
+    if (this.adapter.mode === 'live' && !canSendToRemoteDecisionModel(eligibility)) {
+      return fallback('remote-jev-ineligible');
+    }
+    const result = await this.adapter.scoreLearningCandidate(input, ctx);
+    if (!result.ok || !Number.isFinite(result.data.support)) return fallback('jev-learning-failed');
+    const { relation, entryId } = result.data;
+    if (relation !== 'new' && !input.entries.some((e) => e.id === entryId)) {
+      return fallback('jev-learning-unknown-entry');
+    }
+    return {
+      support: Math.max(0, Math.min(1, result.data.support)),
+      relation,
+      ...(relation !== 'new' ? { entryId } : {}),
+      confidence: result.data.confidence,
+      reasonCodes: result.data.reasonCodes,
+      autoActivate: true,
+      source: 'jev',
+    };
+  }
+
+  /**
+   * Step 8: Jev's relevance per learned entry, or `null` when the caller must use
+   * keyword overlap. Mirrors `scoreFiles`.
+   */
+  async scoreKnowledge(
+    eligibility: Pick<DecisionState, 'sanitizedForRemote' | 'dataLabels'>,
+    input: { task: string; paths: string[]; entries: LearningEntryInput[] },
+    ctx: ProviderCallContext,
+  ): Promise<{ scores: Record<string, number> | null; reasonCodes: string[]; source: 'jev' | 'fallback' }> {
+    const fallback = (reason: string) => ({
+      scores: null,
+      reasonCodes: [reason, 'keyword-overlap-fallback'],
+      source: 'fallback' as const,
+    });
+    if (!this.adapter.scoreKnowledge) return fallback('jev-knowledge-unsupported');
+    if (this.adapter.mode === 'live' && !canSendToRemoteDecisionModel(eligibility)) {
+      return fallback('remote-jev-ineligible');
+    }
+    if (input.entries.length === 0) return { scores: {}, reasonCodes: ['no-learned-entries'], source: 'jev' };
+    const result = await this.adapter.scoreKnowledge(input, ctx);
+    if (!result.ok) return fallback('jev-knowledge-failed');
+    const scores: Record<string, number> = {};
+    for (const entry of input.entries) {
+      const value = result.data.scores[entry.id];
+      scores[entry.id] = typeof value === 'number' && Number.isFinite(value) ? Math.max(0, Math.min(1, value)) : 0;
+    }
+    return { scores, reasonCodes: result.data.reasonCodes, source: 'jev' };
   }
 
   private fallbackCompletion(checkpoint: SessionCheckpoint): 'continue' | 'blocked' {

@@ -9,6 +9,7 @@ import {
   heuristicPlan,
   requestFromPrompt,
 } from '../../core/coordination/decompose.js';
+import { heuristicDraft, LEARNING_DRAFT_POLICY_RULE } from '../../core/learning/draft.js';
 import { credentials } from '../../services/credentials.js';
 
 const CAPABILITIES: readonly Capability[] = ['text.model'];
@@ -65,6 +66,25 @@ function createMock(cfg: ProviderConfig): TextModelAdapter {
             tokensIn: planIn,
             tokensOut: planOut,
             estimatedCostCents: estimateCostCents(input.tier ?? 'standard', planIn, planOut),
+          },
+        );
+      }
+
+      // The learning drafter parses the reply too (core/learning/draft.ts).
+      if (input.json && ctx.policyRule === LEARNING_DRAFT_POLICY_RULE) {
+        const draft = JSON.stringify(heuristicDraft(input.prompt));
+        const draftIn = Math.ceil((input.prompt.length + (input.system?.length ?? 0)) / 4);
+        const draftOut = Math.ceil(draft.length / 4);
+        return mockCall(
+          'anthropic',
+          'complete',
+          cfg.mode,
+          ctx,
+          () => ({ text: draft, tokensIn: draftIn, tokensOut: draftOut }),
+          {
+            tokensIn: draftIn,
+            tokensOut: draftOut,
+            estimatedCostCents: estimateCostCents(input.tier ?? 'standard', draftIn, draftOut),
           },
         );
       }

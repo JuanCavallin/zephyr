@@ -51,6 +51,8 @@ export interface LearnedEntry {
   autoActivate: boolean;
   /** Who decided the latest score: Jev, or the fallback. */
   source: 'jev' | 'fallback';
+  /** Learned from private-route signals: only local models may read it, and it is never emitted. */
+  private?: boolean;
   retiredReason?: string;
   /** The user reverted it: never re-activated automatically. */
   reverted?: boolean;

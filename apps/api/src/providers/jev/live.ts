@@ -40,6 +40,13 @@ const TEST_RELEVANCE_LEVELS = [
   'Related; exercises code the diff changes.',
   'Direct; tests exactly what the diff changes.',
 ] as const;
+/** Ordered scale for `score_knowledge` (step 8). */
+const KNOWLEDGE_RELEVANCE_LEVELS = [
+  'Does not apply to this task.',
+  'Tangential; might apply to a small part.',
+  'Applies; the task touches what it is about.',
+  'Central; following it shapes the change.',
+] as const;
 
 function decisionSignal(signal?: AbortSignal): AbortSignal {
   const timeout = AbortSignal.timeout(JEV_TIMEOUT_MS);
@@ -839,6 +846,116 @@ export function createLiveJev(
     }
   };
 
+  /**
+   * Step 8: support (`boolean`) and relation (`choice`) for a drafted candidate, in
+   * one request. Relation criteria are keyed `new`, `d<k>` and `c<k>` (k = 1..n), so
+   * entry ids never reach the criteria map.
+   */
+  const scoreLearningCandidate: NonNullable<DecisionAdapter['scoreLearningCandidate']> = async (input, ctx) => {
+    const startedAt = Date.now();
+    try {
+      const criteria: Record<string, string> = { new: 'A new entry: none of the existing entries says the same thing.' };
+      input.entries.forEach((entry, i) => {
+        criteria['d' + (i + 1)] = `Says the same as existing entry [${i + 1}]: ${entry.text}`;
+        criteria['c' + (i + 1)] = `Contradicts existing entry [${i + 1}]: ${entry.text}`;
+      });
+      const result = await evaluate({
+        model: await modelFor(ctx),
+        state: {
+          candidate: input.candidate,
+          evidence: input.evidence,
+          existing: input.entries.map((e, i) => ({ index: i + 1, kind: e.kind, scope: e.scope, text: e.text })),
+        },
+        questions: {
+          support: {
+            type: 'boolean',
+            instructions: "Does the evidence support the candidate as a lasting preference of this user or project?",
+          },
+          relation: {
+            type: 'choice',
+            instructions: 'How does the candidate relate to the existing entries?',
+            criteria,
+          },
+        },
+        maxRetries,
+        abortSignal: decisionSignal(ctx.signal),
+      });
+      const support = result.answers.support;
+      const relation = result.answers.relation;
+      if (!support || support.type !== 'boolean' || !Number.isFinite(support.probability)) {
+        throw new Error('Jev returned an invalid support judgment.');
+      }
+      if (!relation || relation.type !== 'choice') throw new Error('Jev returned an invalid relation choice.');
+      const match = /^([dc])(\d+)$/.exec(relation.choice);
+      const entry = match ? input.entries[Number(match[2]) - 1] : undefined;
+      if (relation.choice !== 'new' && !entry) throw new Error('Jev returned an unknown entry.');
+      return {
+        ok: true,
+        data: {
+          support: Math.max(0, Math.min(1, support.probability)),
+          relation: !match ? 'new' : match[1] === 'd' ? 'duplicate' : 'contradicts',
+          ...(entry ? { entryId: entry.id } : {}),
+          confidence: probabilityForChoice(relation.choice, relation.probabilities),
+          reasonCodes: ['jev-learning-candidate'],
+        },
+        meta: meta('score_learning_candidate', startedAt, destination, result.usage, result.providerMetadata),
+      };
+    } catch (error) {
+      return { ok: false, error: providerError(error), meta: meta('score_learning_candidate', startedAt, destination) };
+    }
+  };
+
+  /** Step 8: one `score` question per learned entry, in a single request. */
+  const scoreKnowledge: NonNullable<DecisionAdapter['scoreKnowledge']> = async (input, ctx) => {
+    const startedAt = Date.now();
+    try {
+      if (input.entries.length === 0) {
+        return {
+          ok: true,
+          data: { scores: {}, reasonCodes: ['no-learned-entries'] },
+          meta: meta('score_knowledge', startedAt, LOCAL_PRECHECK_DESTINATION),
+        };
+      }
+      const levels = KNOWLEDGE_RELEVANCE_LEVELS;
+      const questions: Record<string, Experimental_EvaluationQuestion> = Object.fromEntries(
+        input.entries.map((entry, index) => [
+          'entry_' + index,
+          {
+            type: 'score' as const,
+            instructions: `How much does learned ${entry.kind === 'skill' ? 'skill' : 'preference'} [${index}] apply to this task?`,
+            criteria: levels,
+          },
+        ]),
+      );
+      const result = await evaluate({
+        model: await modelFor(ctx),
+        state: {
+          task: input.task,
+          paths: input.paths,
+          entries: input.entries.map((e, index) => ({ index, kind: e.kind, scope: e.scope, text: e.text })),
+        },
+        questions,
+        maxRetries,
+        abortSignal: decisionSignal(ctx.signal),
+      });
+      const scores: Record<string, number> = {};
+      input.entries.forEach((entry, index) => {
+        const answer = result.answers['entry_' + index];
+        if (!answer || answer.type !== 'score' || !Number.isFinite(answer.score)) {
+          throw new Error('Jev returned an invalid knowledge score.');
+        }
+        scores[entry.id] = Math.max(0, Math.min(1, answer.score / (levels.length - 1)));
+      });
+      return {
+        ok: true,
+        data: { scores, reasonCodes: ['jev-knowledge-relevance'] },
+        meta: meta('score_knowledge', startedAt, destination, result.usage, result.providerMetadata),
+      };
+    } catch (error) {
+      return { ok: false, error: providerError(error), meta: meta('score_knowledge', startedAt, destination) };
+    }
+  };
+
   const route: DecisionAdapter['route'] = async (input, ctx) => {
     const startedAt = Date.now();
     try {
@@ -1060,6 +1177,18 @@ export function createLiveJev(
           ctx,
         )) as ProviderResult<TOut>;
       }
+      if (op === 'score_learning_candidate') {
+        return (await scoreLearningCandidate(
+          input as Parameters<NonNullable<DecisionAdapter['scoreLearningCandidate']>>[0],
+          ctx,
+        )) as ProviderResult<TOut>;
+      }
+      if (op === 'score_knowledge') {
+        return (await scoreKnowledge(
+          input as Parameters<NonNullable<DecisionAdapter['scoreKnowledge']>>[0],
+          ctx,
+        )) as ProviderResult<TOut>;
+      }
       if (op === 'judge_completion') {
         return (await judgeCompletion(
           input as Parameters<DecisionAdapter['judgeCompletion']>[0],
@@ -1083,6 +1212,8 @@ export function createLiveJev(
     judgeCodingCompletion,
     judgeFlaky,
     routeTask,
+    scoreLearningCandidate,
+    scoreKnowledge,
     route,
   };
 }
