@@ -54,6 +54,9 @@ the full demo runs end to end — deliberately, not as a placeholder. To go live
 | `pnpm test:jev:routing` | Jev's privacy × intelligence routing on sample tasks              |
 | `pnpm bench:browser`    | browser benchmark on live sites; needs Chrome (docs/metrics.md)   |
 | `pnpm format`           | prettier (respects `.prettierignore`)                             |
+| `pnpm zephyr up`        | detect Claude Code / Codex and keys, start Zephyr, open the board |
+| `pnpm zephyr run "…"`   | plan a board for a coding task and start it (`--template`, …)     |
+| `pnpm --filter @htn/api benchmark:coding` | coding benchmark, mock arms offline (`--mode live --yes-spend` costs money) |
 
 ## How a run works
 
@@ -117,6 +120,11 @@ measured on 2026-10-09 with local Chrome.
 | Exact-action broker                                               | **14** error codes, every one fails closed                          |
 | Test assertions run in CI                                         | **942** across 29 test files                                        |
 
+**Coding agents: no number yet.** The coding benchmark (22 tasks with hidden acceptance tests;
+harness alone vs harness under Zephyr, plus one arm per lever left out) has only been run
+with the scripted mock harness, which tests the measuring and says nothing about real cost.
+No coding saving is claimed here until `/compare` shows a live, comparable result.
+
 ## The app
 
 | Route          | What it is                                                                                                                                                                                 |
@@ -124,7 +132,8 @@ measured on 2026-10-09 with local Chrome.
 | `/`            | Composer, three modes: **Run as agent task** (one supervised `agent` run), **Build a workflow** (chat-to-graph: drafts a graph to review, runs nothing), **Preview** (labelled, synthetic) |
 | `/runs`        | History, live status, launch a playbook directly                                                                                                                                           |
 | `/runs/:id`    | Live trace: decisions, model calls, tool lifecycle, approvals, egress, pause/resume/cancel                                                                                                 |
-| `/compare`     | Run vs baseline: tokens, cost, latency                                                                                                                                                     |
+| `/compare`     | Two runs side by side (`?a=&b=`); with no ids, the coding benchmark: harness alone vs harness under Zephyr                                                                                 |
+| `/board`       | Coding boards: parallel tasks in leased worktrees, verified merges; the header's **Needs you** chip counts what waits on you                                                              |
 | `/graphs`      | Workflow editor: canvas, per-node tuning, a chat panel that edits the open graph, **Run graph**, **Run + compare to baseline**                                                             |
 | `/connections` | Provider mode + health, Composio, generic MCP servers, reviewed tool inventory                                                                                                             |
 

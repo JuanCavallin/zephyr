@@ -81,6 +81,40 @@ The agent proposes the exact send. The run **pauses**:
 - **Pause / resume / cancel** from the run header. When the completion judge says `blocked`,
   the run pauses for you instead of failing.
 
+## Coding-agent demo: a feature on the board
+
+The same layer in front of Claude Code or Codex. Not yet rehearsed end to end on a real
+feature or recorded; do that before demo day and note the date here.
+
+**Setup.** `pnpm zephyr up --check` lists the harnesses and keys it found (values are never
+printed). `pnpm zephyr up` starts Zephyr unless it is already running and opens the board.
+`pnpm zephyr templates` lists the presets.
+
+1. **Type a feature.** `pnpm zephyr run "<the feature>" --template add-feature`. Zephyr
+   plans a board and starts it. `--plan` creates it without starting so you can show the
+   plan first.
+2. **Board (`/board/:id`).** The tasks run in parallel, each in its own worktree and limited to
+   the files its lease covers. An edit outside the lease is denied, not merged. Protected
+   paths and CI config changes wait for approval.
+3. **Run page (`/runs/:id`).** Open any task:
+   - **Tokens per turn:** model calls, fresh and cached input, cost, and the lever applied
+     (for example "14k → 602").
+   - **Workspace:** the live diff against the base branch or any turn, a checkpoint at the end
+     of each turn with **Rewind here**, every shell command with its class and decision, and
+     the shaped results.
+4. **Needs you.** The header chip counts approvals, blocked tasks and scope requests waiting
+   on you, and clicking it opens them.
+5. **Verified merges.** A task merges only after its checks pass. `pnpm zephyr summary <runId>`
+   prints the one-screen summary from the task's evidence bundle.
+6. **Learned (`/learned`)** shows the preference picked up from your feedback, which applies
+   to the next task.
+7. **Compare (`/compare`)** shows harness alone vs harness under Zephyr from the coding
+   benchmark.
+   - It states a saving only when the pass rate is within noise of the harness alone.
+   - Mock numbers carry a note saying they are not real cost.
+   - Today the page holds no live run, so say so. Don't call the next task cheaper until it
+     does.
+
 ## Alternative opening: build the workflow first (works with mock Hermes)
 
 Composer mode **Build a workflow** → describe the job ("Check our vendor portals for overdue
