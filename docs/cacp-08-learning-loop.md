@@ -44,7 +44,7 @@ relevantKnowledge(task: string, cap: number): Promise<{ id: string; kind: 'pref'
       low confidence, never auto-activate. Test all three outcomes.
 - [ ] Lifecycle: confidence rises with evidence, activates above threshold, retires when
       contradicted; versioned with one-click revert. Test threshold crossing and revert.
-- [ ] Emitters: personal → profile only; project → proposed as a PR touching
+- [x] Emitters: personal → profile only; project → proposed as a PR touching
       `.claude/skills/<name>/SKILL.md` and `AGENTS.md` (fork-don't-modify). Test emitted
       file formats and that personal entries are never written into the repo unless promoted.
 - [ ] Relevance at task start: Jev `score` per entry, top-k under a token cap. Fallback:
