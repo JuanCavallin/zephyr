@@ -61,7 +61,8 @@ pass rate held, a one-command start, and a recorded demo on a real feature.
 ## Status (2026-11-03)
 
 Built and checked offline. The "Done when" bar is **not met**: no live run has been
-recorded, and the demo has not been recorded.
+recorded, and the demo has not been recorded. The board CLI is verified end to end
+against the real API (offline).
 
 **How the build differs from the plan**
 - **Task set.** There are 22 tasks across three small fixture repos (`apps/api/bench/coding/`:
@@ -88,12 +89,18 @@ recorded, and the demo has not been recorded.
 
 **Not done**
 - **Live runs.**
-  - `--mode live` runs the vanilla arm only (Claude Code `-p`), and needs `--yes-spend`.
-  - Live Zephyr arms are refused up front. They need the model gateway, hooks and MCP bound to
-    the bench repo, and none of that is wired into the runner.
-  - So arm (b) has no live numbers, and `/compare` can show only mock or vanilla-only data.
-  - Next step: wire a live supervised agent. Budget the spend and
-    get it approved before running.
+  - `--mode live` now runs every arm, and needs `--yes-spend`.
+    - The vanilla arm runs Claude Code `-p`.
+    - The Zephyr arms run `supervisedClaudeAgent`
+      (`services/benchmarkCoding.supervised.ts`). For each run it starts the Anthropic gateway,
+      the hook callbacks and the MCP gateway in-process. It then drives Claude Code over ACP in
+      a Zephyr worktree and reads tokens and cost from the gateway ledger.
+    - `--model` applies to both arms. The Zephyr arms also need `ANTHROPIC_API_KEY` (or
+      `ANTHROPIC_BASE_URL`).
+  - `check:benchmark-coding` covers this offline, with a fake ACP peer and a fake upstream.
+  - **No live run has been made**, so `/compare` has only mock data.
+  - Next: one priced pilot (2 arms × 1 task × 3 reps) to estimate the cost per run. Then
+    budget the full set and get the spend approved before running it.
 - **Mock harness.**
   - It replays reference fixes with synthetic token counts, derived from the bytes it moves.
   - Approvals and blocks come from the real permission bridge.
@@ -102,15 +109,25 @@ recorded, and the demo has not been recorded.
   - The script is in `docs/DEMO.md`. It has not been rehearsed on a real feature, and has not
     been recorded.
 - **Fresh-user timing.**
-  - Timing `zephyr up` to a running board has not been done.
-  - `zephyr up --check` was exercised on a dev machine, and detected `claude.exe` and the
+  - Timing a fresh clone through `pnpm install` and `zephyr up` to a running board has not
+    been done; it needs a clean machine.
+  - Measured part: `check:cli-e2e` records the API's time from boot to healthy, about 3.5s.
+  - `zephyr up --check` was run on a dev machine and detected `claude.exe` and the
     `codex.cmd` shim.
-- **Board CLI e2e.**
-  - `zephyr run` against a started board was not exercised end to end in a live run.
-  - It is covered by `check:cli` against a fake API.
 
-**Checks:** `check:benchmark-coding`, `check:cli`, `check:workspace-view`, `check:board` and
-the web tests all pass.
+**Board CLI (done).** `check:cli-e2e` starts two real API processes on mock providers, each
+against a throwaway git repo. On the `GIT_MODE=live` one, `zephyr run "<task>" --wait` plans a
+board and starts it. It stops at the merge approval with exit code 3. Approving through
+`/api/approvals/:id/decide` then finishes the board, and every task's commits end up on its
+integration branch. `main` is untouched.
+- The board needs `GIT_MODE=live`, because the merge queue rebases and fast-forwards with git.
+  - On mock workspaces, "Run ready tasks" answers `503 BOARD_UNAVAILABLE`, which names the fix.
+  - `zephyr up --check` reports the mode.
+  - `--wait` exits 0 when the work is merged, 3 when it needs you (an inbox item for this
+    board), and 1 when it failed or timed out.
+
+**Checks:** `check:benchmark-coding`, `check:cli`, `check:cli-e2e`, `check:workspace-view`,
+`check:board` and the web tests all pass.
 - `/compare` was viewed in the browser against a 396-run mock journal: 22 tasks × 6 arms × 3
   repetitions, which took about 1 minute.
 

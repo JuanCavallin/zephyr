@@ -5,7 +5,8 @@
  *   pnpm --filter @htn/api benchmark:coding -- --report bench.md
  *   pnpm --filter @htn/api benchmark:coding -- --report-only
  *   pnpm --filter @htn/api benchmark:coding -- --mode live --arms vanilla --reps 3 --yes-spend
- *   pnpm --filter @htn/api benchmark:coding -- --mode live --arms vanilla,supervised  *       --tasks strkit-slug-trim --reps 3 --yes-spend
+ *   pnpm --filter @htn/api benchmark:coding -- --mode live --arms vanilla,supervised \
+ *       --tasks strkit-slug-trim --reps 3 --yes-spend
  *
  * Unattended and resumable: every finished run is appended to the journal; rerunning
  * the same command skips what is already there. A run is never retried for a better

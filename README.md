@@ -55,7 +55,7 @@ the full demo runs end to end — deliberately, not as a placeholder. To go live
 | `pnpm bench:browser`    | browser benchmark on live sites; needs Chrome (docs/metrics.md)   |
 | `pnpm format`           | prettier (respects `.prettierignore`)                             |
 | `pnpm zephyr up`        | detect Claude Code / Codex and keys, start Zephyr, open the board |
-| `pnpm zephyr run "…"`   | plan a board for a coding task and start it (`--template`, …)     |
+| `pnpm zephyr run "…"`   | plan a board for a coding task and start it (`--template`, `--wait`); needs `GIT_MODE=live` |
 | `pnpm --filter @htn/api benchmark:coding` | coding benchmark, mock arms offline (`--mode live --yes-spend` costs money) |
 
 ## How a run works

@@ -88,11 +88,14 @@ feature or recorded; do that before demo day and note the date here.
 
 **Setup.** `pnpm zephyr up --check` lists the harnesses and keys it found (values are never
 printed). `pnpm zephyr up` starts Zephyr unless it is already running and opens the board.
+The board merges with git, so set `GIT_MODE=live` in `.env` first (task branches go to
+`GIT_REPO_ROOT`, default this repo). On mock workspaces "Run ready tasks" answers 503 and
+`--check` flags it.
 `pnpm zephyr templates` lists the presets.
 
 1. **Type a feature.** `pnpm zephyr run "<the feature>" --template add-feature`. Zephyr
    plans a board and starts it. `--plan` creates it without starting so you can show the
-   plan first.
+   plan first. `--wait` follows it to the end: exit 0 merged, 3 needs you, 1 failed.
 2. **Board (`/board/:id`).** The tasks run in parallel, each in its own worktree and limited to
    the files its lease covers. An edit outside the lease is denied, not merged. Protected
    paths and CI config changes wait for approval.
