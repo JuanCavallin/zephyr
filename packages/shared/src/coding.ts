@@ -126,6 +126,12 @@ export const taskSchema = z.object({
   assignee: assigneeSchema.optional(),
   /** Set when the user pinned the assignee; routing must then return it. */
   pinned: z.boolean().optional(),
+  /**
+   * Build this many alternatives (spec §11, "picks between variants"), each in its own
+   * worktree under the task's lease. A person picks one before it enters the merge
+   * queue; the pick is a variant_pick signal and the others are discarded.
+   */
+  variants: z.number().int().min(2).max(3).optional(),
   /** The run executing this task, once it has started. */
   runId: id.optional(),
   branch: z.string().min(1).optional(),

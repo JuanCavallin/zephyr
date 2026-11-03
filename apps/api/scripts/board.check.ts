@@ -12,6 +12,8 @@
  *   5. Routing: pin beats Jev, fallback rules, Jev down -> source fallback.
  *   6. Merge queue: real git; green tasks merge, conflicts and red tests spawn fix tasks, approvals and signals.
  *   7. Service, routes and inbox: decompose-only create, edits, run ready, merge approvals in the inbox, budget -> blocked.
+ *   8. End to end.
+ *   9. Variants: k worktrees, a pick in the inbox, the picked branch merges, one-success and all-fail paths.
  */
 
 process.env.PERSIST_TO_DISK = 'false';
@@ -1363,6 +1365,126 @@ await test('mock workspaces: runReady refuses with UNAVAILABLE naming GIT_MODE=l
   assert.equal(types(events, 'task.status').length, 0, 'no task moved');
   const v = await svc.getBoard(boardId);
   assert.equal(v.run.status, 'pending', 'the board is still runnable once git is live');
+});
+
+console.log('9. variants');
+
+const { concreteScopePath: concreteScopePathFn } = await import('../src/services/tasks.service.js');
+const { editOpSchema: editOpSchemaFn } = await import('../src/api/tasks.routes.js');
+
+/** The variant a scripted harness was told it is, from the note on its acceptance text. */
+const variantOf = (task: Task) => Number(/Variant (\d) of/.exec(task.acceptance)?.[1] ?? 0);
+/** Writes a file naming its variant; `fail` variants change nothing, so they fail. */
+const variantScript = (fail: number[] = []) => (task: Task) => {
+  const n = variantOf(task);
+  if (fail.includes(n)) return [];
+  const path = concreteScopePathFn(task.writeScope[0]!);
+  return [{ tool: 'Write' as const, path, content: '// variant ' + n + '\n' }];
+};
+
+async function variantBoard(name: string, k: number, fail: number[] = []) {
+  const signals = new InMemorySignalLog();
+  const closed: Array<{ runId: string; keepBranch: boolean | undefined }> = [];
+  const s = await svcBoard(name, '- solo', {
+    signals,
+    closeWorkspace: async (runId, _status, opts) => void closed.push({ runId, keepBranch: opts?.keepBranch }),
+    executor: mockHarnessExecutor({ authorize: allowAuth, script: variantScript(fail) }),
+  });
+  const taskId = s.view.tasks[0]!.id;
+  await s.svc.editBoard(s.boardId, [{ op: 'update', taskId, variants: k }]);
+  await s.svc.runReady(s.boardId, { autoMergeGreen: true });
+  await s.svc.whenIdle(s.boardId);
+  return { ...s, signals, closed, taskId };
+}
+
+await test('variants: two worktrees, both work -> a variant_pick in the inbox, nothing merged', async () => {
+  const { svc, store, boardId, taskId, repo, events } = await variantBoard('svc-var-two', 2);
+  const v = await svc.getBoard(boardId);
+  const t = v.tasks[0]!;
+  assert.equal(t.status, 'review', t.reason ?? '');
+  assert.equal(t.variants, 2);
+  const run = await store.getRun(t.runId!);
+  assert.equal(run?.status, 'awaiting_approval');
+  assert.match(run?.summary ?? '', /2 variants ready/);
+  const steps = (await store.listSteps(t.runId!)).filter((s) => s.kind === 'harness');
+  assert.deepEqual(
+    steps.map((s) => s.label.replace(/^Run \S+ /, '')),
+    ['(variant 1 of 2)', '(variant 2 of 2)'],
+    'one step per variant',
+  );
+  const inbox = await svc.inbox();
+  const pick = inbox.find((i) => i.kind === 'variant_pick');
+  assert.ok(pick && pick.kind === 'variant_pick', JSON.stringify(inbox));
+  assert.equal(pick.taskId, taskId);
+  assert.equal(pick.boardRunId, boardId);
+  assert.deepEqual(pick.variants.map((x) => x.id), ['v1', 'v2']);
+  assert.notEqual(pick.variants[0]!.branch, pick.variants[1]!.branch, 'each variant has its own branch');
+  assert.ok(pick.variants.every((x) => x.files.includes('src/solo/main.ts')), JSON.stringify(pick.variants));
+  assert.ok(pick.variants.every((x) => x.label.includes('variant')), 'labels name the variant');
+  assert.equal(types(events, 'merge.result').length, 0, 'nothing entered the merge queue');
+  assert.equal(await mqGit(repo, 'rev-parse', 'zephyr/' + boardId), await mqGit(repo, 'rev-parse', 'main'));
+  assert.notEqual(v.run.status, 'succeeded');
+});
+
+await test('variants: picking v2 merges v2, records the pick and deletes v1', async () => {
+  const { svc, boardId, taskId, repo, signals, closed } = await variantBoard('svc-var-pick', 2);
+  await assert.rejects(svc.pickVariant(boardId, taskId, 'v9'), (e: unknown) => e instanceof BoardError && e.code === 'INVALID');
+  await assert.rejects(svc.pickVariant(boardId, 'nope', 'v1'), (e: unknown) => e instanceof BoardError && e.code === 'NOT_FOUND');
+  const taskRunId = (await svc.getBoard(boardId)).tasks[0]!.runId!;
+  const picked = await svc.pickVariant(boardId, taskId, 'v2');
+  assert.equal(picked.branch, 'zephyr/' + taskRunId + '_v2', 'the task now points at the picked branch');
+  await svc.whenIdle(boardId);
+  const v = await svc.getBoard(boardId);
+  assert.equal(v.tasks[0]!.status, 'done', v.tasks[0]!.reason ?? '');
+  assert.equal(v.run.status, 'succeeded');
+  const merged = await mqGit(repo, 'show', 'zephyr/' + boardId + ':src/solo/main.ts');
+  assert.match(merged, /variant 2/, 'the picked variant landed');
+  const sig = signals.list().filter((s) => s.kind === 'variant_pick');
+  assert.equal(sig.length, 1);
+  const s0 = sig[0] as { chosen: string; rejected: string[]; taskId?: string; runId?: string };
+  assert.match(s0.chosen, /variant 2/);
+  assert.equal(s0.rejected.length, 1);
+  assert.match(s0.rejected[0]!, /variant 1/);
+  assert.equal(s0.taskId, taskId);
+  assert.equal(s0.runId, taskRunId);
+  assert.ok(preferenceSignalSchema.safeParse(sig[0]).success);
+  assert.ok(closed.some((c) => c.runId === taskRunId && c.keepBranch === false), 'v1 deleted: ' + JSON.stringify(closed));
+  assert.ok(closed.some((c) => c.runId === taskRunId + '_v2' && c.keepBranch === true), 'v2 kept once done');
+  assert.ok(!(await svc.inbox()).some((i) => i.kind === 'variant_pick'), 'the pick left the inbox');
+  await assert.rejects(svc.pickVariant(boardId, taskId, 'v1'), (e: unknown) => e instanceof BoardError && e.code === 'CONFLICT');
+});
+
+await test('variants: one of three works -> it merges without asking; the failed ones are deleted', async () => {
+  const { svc, boardId, repo, closed, signals } = await variantBoard('svc-var-one', 3, [1, 3]);
+  const v = await svc.getBoard(boardId);
+  const t = v.tasks[0]!;
+  assert.equal(t.status, 'done', t.reason ?? '');
+  assert.match(await mqGit(repo, 'show', 'zephyr/' + boardId + ':src/solo/main.ts'), /variant 2/);
+  assert.ok(!(await svc.inbox()).some((i) => i.kind === 'variant_pick'));
+  assert.equal(signals.list().filter((s) => s.kind === 'variant_pick').length, 0, 'no pick, no signal');
+  const deleted = closed.filter((c) => c.keepBranch === false).map((c) => c.runId).sort();
+  assert.deepEqual(deleted, [t.runId!, t.runId! + '_v3'].sort());
+});
+
+await test('variants: none works -> the task fails naming each variant', async () => {
+  const { svc, boardId } = await variantBoard('svc-var-none', 2, [1, 2]);
+  const t = (await svc.getBoard(boardId)).tasks[0]!;
+  assert.equal(t.status, 'failed');
+  assert.match(t.reason ?? '', /no variant succeeded: variant 1: .*; variant 2: /);
+});
+
+await test('variants: the update op takes 2..3 or null; the routes validate it too', async () => {
+  const { svc, boardId, view } = await svcBoard('svc-var-edit', '- solo');
+  const id = view.tasks[0]!.id;
+  let v = await svc.editBoard(boardId, [{ op: 'update', taskId: id, variants: 3 }]);
+  assert.equal(v.tasks[0]!.variants, 3);
+  v = await svc.editBoard(boardId, [{ op: 'update', taskId: id, variants: null }]);
+  assert.equal(v.tasks[0]!.variants, undefined, 'null builds one');
+  for (const bad of [1, 4, 2.5])
+    await assert.rejects(svc.editBoard(boardId, [{ op: 'update', taskId: id, variants: bad }]), BoardError);
+  assert.equal(editOpSchemaFn.safeParse({ op: 'update', taskId: id, variants: 4 }).success, false);
+  assert.equal(editOpSchemaFn.safeParse({ op: 'update', taskId: id, variants: null }).success, true);
+  await assert.rejects(svc.pickVariant(boardId, id, 'v1'), (e: unknown) => e instanceof BoardError && e.code === 'CONFLICT');
 });
 
 console.log(`\n${passed} passed`);

@@ -61,7 +61,7 @@ import {
 } from '../core/coordination/stateMachine.js';
 import type { DecisionService } from '../core/decisions/service.js';
 import { candidateKey } from '../core/decisions/routing.js';
-import { requestWordingSignal } from '../core/learning/signalLog.js';
+import { requestWordingSignal, variantPickSignal } from '../core/learning/signalLog.js';
 import { InMemorySignalLog } from '../core/learning/signals.mock.js';
 import { createPermissionBridge, type Authorizer } from '../core/tools/permissionBridge.js';
 import type { Exec } from '../core/verify/publish.js';
@@ -255,7 +255,15 @@ export type BoardEditOp =
   | { op: 'merge'; taskIds: string[]; title?: string; acceptance?: string }
   | { op: 'reorder'; order: string[] }
   | { op: 'scope'; taskId: string; writeScope: string[] }
-  | { op: 'update'; taskId: string; title?: string; acceptance?: string; dependsOn?: string[] }
+  | {
+      op: 'update';
+      taskId: string;
+      title?: string;
+      acceptance?: string;
+      dependsOn?: string[];
+      /** 2 or 3 builds that many alternatives for a person to pick from; null turns it off. */
+      variants?: number | null;
+    }
   | { op: 'pin'; taskId: string; assignee: Assignee | null };
 
 export interface BoardView {
@@ -268,7 +276,41 @@ export interface BoardView {
 export type InboxItem =
   | { kind: 'approval'; at: string; boardRunId?: string; taskId?: string; approval: Approval }
   | { kind: 'blocked_task'; at: string; boardRunId: string; taskId: string; title: string; reason: string }
-  | { kind: 'lease_extension'; at: string; boardRunId: string; taskId: string; request: ExtensionRequest };
+  | { kind: 'lease_extension'; at: string; boardRunId: string; taskId: string; request: ExtensionRequest }
+  | {
+      kind: 'variant_pick';
+      at: string;
+      boardRunId: string;
+      taskId: string;
+      title: string;
+      variants: Array<{ id: string; label: string; branch: string; filesChanged: number; files: string[] }>;
+    };
+
+/** One execution of a task: the task's own worktree (i = 1) or a variant's. */
+interface VariantRun {
+  i: number;
+  /** The workspace's run id: the task run's for variant 1, `<taskRun>_v<i>` otherwise. */
+  runId: string;
+  worktree: string;
+  branch: string;
+  status: 'done' | 'failed';
+  detail: string;
+  filesChanged: number;
+}
+
+/** A working variant waiting for a person to pick it. */
+interface PendingVariant {
+  id: string;
+  /** What the variant_pick signal records: title, variant number and the first files. */
+  label: string;
+  runId: string;
+  worktree: string;
+  branch: string;
+  filesChanged: number;
+  files: string[];
+}
+
+const clip = (s: string, n: number) => (s.length <= n ? s : s.slice(0, n - 1) + '…');
 
 interface Board {
   run: Run;
@@ -278,6 +320,8 @@ interface Board {
   order: string[];
   items: Map<string, MergeItem>;
   fixParents: Map<string, string>;
+  /** Tasks whose variants all ran and more than one worked: waiting for a pick. */
+  picks: Map<string, { at: string; variants: PendingVariant[] }>;
   leases: LeaseTable;
   integration?: { worktree: string; branch: string };
   queue?: MergeQueue;
@@ -307,6 +351,8 @@ export class BoardService {
   private readonly listeners = new Set<() => void>();
   private readonly exec: Exec;
   private readonly signals: SignalSeam;
+  /** Task run id -> the picked variant's workspace, closed with the task run. */
+  private readonly variantWorkspaces = new Map<string, string>();
 
   constructor(private readonly deps: BoardServiceDeps) {
     this.exec = deps.exec ?? execArgv;
@@ -390,6 +436,21 @@ export class BoardService {
           taskId: r.taskId,
           request: { ...r, globs: [...r.globs], blockedBy: [...r.blockedBy] },
         });
+      for (const [taskId, pick] of b.picks)
+        items.push({
+          kind: 'variant_pick',
+          at: pick.at,
+          boardRunId: b.run.id,
+          taskId,
+          title: b.tasks.get(taskId)?.title ?? taskId,
+          variants: pick.variants.map((v) => ({
+            id: v.id,
+            label: v.label,
+            branch: v.branch,
+            filesChanged: v.filesChanged,
+            files: [...v.files],
+          })),
+        });
     }
     return items.sort((a, b) => (a.at < b.at ? -1 : a.at > b.at ? 1 : 0));
   }
@@ -425,6 +486,7 @@ export class BoardService {
       tasks: new Map(),
       order: [],
       items: new Map(),
+      picks: new Map(),
       fixParents: new Map(),
       leases: undefined as unknown as LeaseTable,
       started: false,
@@ -595,6 +657,12 @@ export class BoardService {
           if (op.dependsOn !== undefined) {
             for (const d of op.dependsOn) if (!tasks.has(d) || d === t.id) throw new BoardError('INVALID', 'unknown dependency ' + d);
             t.dependsOn = [...new Set(op.dependsOn)];
+          }
+          if (op.variants === null) delete t.variants;
+          else if (op.variants !== undefined) {
+            if (!Number.isInteger(op.variants) || op.variants < 2 || op.variants > 3)
+              throw new BoardError('INVALID', 'variants must be 2 or 3 (or null to build one)');
+            t.variants = op.variants;
           }
           touched.add(t.id);
           break;
@@ -832,28 +900,133 @@ export class BoardService {
     }
     await this.move(b, taskId, 'running', { assignee: route.assignee });
 
-    // 4. Execute.
+    // 4. Execute: once, or k times when the task asks for variants. A fix task never
+    //    fans out; it repairs the variant that was already picked.
+    const k = task.variants && !b.fixParents.has(taskId) ? task.variants : 1;
+    const runs: VariantRun[] = [];
+    for (let i = 1; i <= k; i++) {
+      if (i > 1 && b.abort.signal.aborted) break;
+      let ws = { runId: taskRun.id, worktree: item.worktree, branch: item.branch };
+      if (i > 1) {
+        const runId = taskRun.id + '_v' + i;
+        const opened = await this.deps.openWorkspace(runId, b.integration!.branch);
+        ws = { runId, worktree: opened.path, branch: opened.branch };
+      }
+      const r = await this.attempt(b, taskId, taskRun.id, ws.worktree, route.assignee, k > 1 ? { i, k } : undefined);
+      if (r.status === 'blocked') {
+        b.leases.release(taskId);
+        await this.move(b, taskId, 'blocked', { reason: r.detail });
+        await this.finishTaskRun(taskRun.id, 'paused', r.detail);
+        this.changed();
+        return;
+      }
+      runs.push({ i, ...ws, status: r.status, detail: r.detail, filesChanged: r.filesChanged });
+    }
+    b.leases.release(taskId);
+
+    const good = runs.filter((r) => r.status === 'done');
+    if (!good.length) {
+      const reason =
+        k > 1
+          ? 'no variant succeeded: ' + runs.map((r) => 'variant ' + r.i + ': ' + (r.detail || 'failed')).join('; ')
+          : runs[0]?.detail || 'executor failed';
+      await this.discardVariants(runs.filter((r) => r.runId !== taskRun.id));
+      await this.move(b, taskId, 'failed', { reason });
+      await this.finishTaskRun(taskRun.id, 'failed', reason);
+      this.taskFinished(b.tasks.get(taskId)!, 'failed');
+      return;
+    }
+
+    // 5. More than one variant worked: a person picks before anything merges.
+    if (good.length > 1) {
+      const variants: PendingVariant[] = [];
+      for (const r of good) {
+        const files = await this.changedFiles(r.worktree);
+        variants.push({
+          id: 'v' + r.i,
+          label: clip(task.title + ' — variant ' + r.i + (files.length ? ' (' + files.slice(0, 3).join(', ') + ')' : ''), 200),
+          runId: r.runId,
+          worktree: r.worktree,
+          branch: r.branch,
+          filesChanged: r.filesChanged,
+          files,
+        });
+      }
+      await this.discardVariants(runs.filter((r) => r.status !== 'done' && r.runId !== taskRun.id));
+      b.picks.set(taskId, { at: nowIso(), variants });
+      await this.move(b, taskId, 'review');
+      const run = await store.patchRun(taskRun.id, {
+        status: 'awaiting_approval',
+        summary: good.length + ' variants ready: pick one',
+        updatedAt: nowIso(),
+      });
+      await this.emit(b, { type: 'run.updated', run }, run.id);
+      await this.log(b, 'info', taskId + ': ' + good.length + ' of ' + k + ' variants worked; waiting for a pick');
+      this.changed();
+      return;
+    }
+
+    const only = good[0]!;
+    if (k > 1) await this.adoptVariant(b, taskId, only, runs.filter((r) => r !== only));
+
+    // 6. Merge.
+    await this.move(b, taskId, 'review');
+    await this.mergeTask(b, taskId);
+  }
+
+  /**
+   * One execution of a task in a worktree, with its own step, tracker and budget. A
+   * budget breach blocks a plain task; for a variant it only fails that variant.
+   */
+  private async attempt(
+    b: Board,
+    taskId: string,
+    taskRunId: string,
+    worktree: string,
+    assignee: Assignee,
+    variant?: { i: number; k: number },
+  ): Promise<{ status: 'done' | 'failed' | 'blocked'; detail: string; filesChanged: number }> {
+    const { store } = this.deps;
+    const task = b.tasks.get(taskId)!;
+    const suffix = variant ? ' (variant ' + variant.i + ' of ' + variant.k + ')' : '';
     const step = await store.appendStep({
       id: newId('step'),
-      runId: taskRun.id,
+      runId: taskRunId,
       parentStepId: null,
       kind: 'harness',
-      label: 'Run ' + candidateKey(route.assignee),
+      label: 'Run ' + candidateKey(assignee) + suffix,
       status: 'running',
-      input: { taskId, writeScope: task.writeScope, assignee: candidateKey(route.assignee) } as Json,
+      input: {
+        taskId,
+        writeScope: task.writeScope,
+        assignee: candidateKey(assignee),
+        ...(variant ? { variant: variant.i, of: variant.k } : {}),
+      } as Json,
       startedAt: nowIso(),
     });
-    await this.emit(b, { type: 'step.upserted', step }, taskRun.id);
-    const tracker = new ProgressTracker(taskId, taskRun.id);
+    await this.emit(b, { type: 'step.upserted', step }, taskRunId);
+    const tracker = new ProgressTracker(taskId, taskRunId);
     const budget = { ...DEFAULT_TASK_BUDGET, ...this.deps.budget, ...b.budget };
     const executor = this.deps.executor ?? mockHarnessExecutor();
+    const seen: Task = variant
+      ? {
+          ...task,
+          acceptance:
+            task.acceptance +
+            ' (Variant ' +
+            variant.i +
+            ' of ' +
+            variant.k +
+            ': take a different approach from the other variants; a person picks one.)',
+        }
+      : { ...task };
     let outcome: { status: 'done' | 'failed'; detail?: string };
     try {
       outcome = await executor({
-        task: { ...task },
-        taskRunId: taskRun.id,
+        task: seen,
+        taskRunId,
         stepId: step.id,
-        worktree: item.worktree,
+        worktree,
         leases: b.leases,
         tracker,
         signal: b.abort.signal,
@@ -866,36 +1039,112 @@ export class BoardService {
           const breach = budgetBreach(tracker, budget);
           if (breach) throw new BudgetBreachError(breach);
         },
-        submitIntent: (sub) => this.submitIntent(b, { ...sub, taskId }),
+        // The integrator applies a hot-file intent to the integration branch at once, so a
+        // variant nobody has picked yet must not submit one.
+        submitIntent: variant
+          ? async () => ({ status: 'rejected' as const, error: 'a variant cannot change hot files before it is picked' })
+          : (sub) => this.submitIntent(b, { ...sub, taskId }),
       });
     } catch (err) {
       if (!(err instanceof BudgetBreachError)) throw err;
-      b.leases.release(taskId);
-      await this.endStep(taskRun.id, step.id, 'blocked', err.message);
-      await this.move(b, taskId, 'blocked', { reason: err.message });
-      await this.finishTaskRun(taskRun.id, 'paused', err.message);
-      this.changed();
-      return;
+      const filesChanged = tracker.snapshot().filesChanged;
+      if (variant) {
+        await this.endStep(taskRunId, step.id, 'failed', err.message);
+        return { status: 'failed', detail: err.message, filesChanged };
+      }
+      await this.endStep(taskRunId, step.id, 'blocked', err.message);
+      return { status: 'blocked', detail: err.message, filesChanged };
     }
-    b.leases.release(taskId);
+    const filesChanged = tracker.snapshot().filesChanged;
     // A harness that "finished" without changing a file (every write denied, say) has
     // nothing to merge: an empty fast-forward is not a landed task.
-    if (outcome.status === 'done' && tracker.snapshot().filesChanged === 0)
+    if (outcome.status === 'done' && filesChanged === 0)
       outcome = { status: 'failed', detail: 'finished without changing any file' };
     if (outcome.status === 'failed') {
-      const reason = outcome.detail ?? 'executor failed';
-      await this.endStep(taskRun.id, step.id, 'failed', reason);
-      await this.move(b, taskId, 'failed', { reason });
-      await this.finishTaskRun(taskRun.id, 'failed', reason);
-      this.taskFinished(b.tasks.get(taskId)!, 'failed');
-      return;
+      const detail = outcome.detail ?? 'executor failed';
+      await this.endStep(taskRunId, step.id, 'failed', detail);
+      return { status: 'failed', detail, filesChanged };
     }
-    await this.endStep(taskRun.id, step.id, 'succeeded');
+    await this.endStep(taskRunId, step.id, 'succeeded');
+    return { status: 'done', detail: '', filesChanged };
+  }
 
-    // 5. Merge.
-    await this.move(b, taskId, 'review');
+  private async mergeTask(b: Board, taskId: string): Promise<void> {
+    const item = b.items.get(taskId)!;
     const result = await b.queue!.enqueue({ ...item, task: { ...b.tasks.get(taskId)! } }, b.abort.signal);
     await this.afterMerge(b, taskId, result);
+  }
+
+  /** The picked (or only working) variant becomes the task's item; the rest are deleted. */
+  private async adoptVariant(
+    b: Board,
+    taskId: string,
+    chosen: { runId: string; worktree: string; branch: string },
+    others: Array<{ runId: string }>,
+  ): Promise<void> {
+    const item = b.items.get(taskId)!;
+    const taskRunId = b.tasks.get(taskId)!.runId!;
+    if (chosen.runId !== taskRunId) {
+      item.worktree = chosen.worktree;
+      item.branch = chosen.branch;
+      this.set(b, { ...b.tasks.get(taskId)!, branch: chosen.branch });
+      this.variantWorkspaces.set(taskRunId, chosen.runId);
+    }
+    await this.discardVariants(others);
+  }
+
+  private async discardVariants(runs: Array<{ runId: string }>): Promise<void> {
+    for (const r of runs) await this.deps.closeWorkspace?.(r.runId, 'cancelled', { keepBranch: false })?.catch(() => undefined);
+  }
+
+  /** Paths a worktree changed, for the picker's preview. Empty when git cannot say. */
+  private async changedFiles(worktree: string): Promise<string[]> {
+    const r = await this.exec('git', ['status', '--porcelain', '-uall'], { cwd: worktree }).catch(() => undefined);
+    if (!r || r.code !== 0) return [];
+    return r.stdout
+      .split('\n')
+      .map((l) => l.slice(3).trim())
+      .filter(Boolean)
+      .slice(0, 50);
+  }
+
+  /**
+   * A person picks one of a task's variants (spec §11). The pick is a variant_pick
+   * signal; the chosen worktree enters the merge queue and the others are deleted.
+   */
+  async pickVariant(boardId: string, taskId: string, variantId: string): Promise<Task> {
+    const b = this.must(boardId);
+    const task = b.tasks.get(taskId);
+    if (!task) throw new BoardError('NOT_FOUND', 'Task ' + taskId + ' not found');
+    const pick = b.picks.get(taskId);
+    if (!pick) throw new BoardError('CONFLICT', 'Task ' + taskId + ' has no variants waiting for a pick');
+    const chosen = pick.variants.find((v) => v.id === variantId);
+    if (!chosen)
+      throw new BoardError('INVALID', 'unknown variant ' + variantId + '; one of ' + pick.variants.map((v) => v.id).join(', '));
+    b.picks.delete(taskId);
+    const rejected = pick.variants.filter((v) => v !== chosen);
+    try {
+      await this.signals.recordSignal(
+        variantPickSignal(
+          chosen.label,
+          rejected.map((v) => v.label),
+          { taskId, ...(task.runId ? { runId: task.runId } : {}), private: b.private },
+        ),
+      );
+    } catch (err) {
+      await this.log(b, 'warn', 'variant pick signal: ' + (err as Error).message);
+    }
+    await this.adoptVariant(b, taskId, chosen, rejected);
+    const run = await this.deps.store.patchRun(task.runId!, {
+      status: 'running',
+      summary: 'picked ' + chosen.id,
+      updatedAt: nowIso(),
+    });
+    await this.emit(b, { type: 'run.updated', run }, run.id);
+    await this.log(b, 'info', taskId + ': picked ' + chosen.id);
+    this.changed();
+    this.track(b, this.mergeTask(b, taskId));
+    return { ...b.tasks.get(taskId)! };
   }
 
   private async afterMerge(b: Board, taskId: string, result: MergeResult): Promise<void> {
@@ -1186,7 +1435,14 @@ export class BoardService {
   private async finishTaskRun(runId: string, status: RunStatus, summary: string): Promise<void> {
     const run = await this.deps.store.patchRun(runId, { status, summary, updatedAt: nowIso() });
     await this.deps.emit(runId, { type: 'run.updated', run });
-    if (isTerminal(status)) await this.deps.closeWorkspace?.(runId, status, { keepBranch: true });
+    if (isTerminal(status)) {
+      await this.deps.closeWorkspace?.(runId, status, { keepBranch: true });
+      const variant = this.variantWorkspaces.get(runId);
+      if (variant) {
+        this.variantWorkspaces.delete(runId);
+        await this.deps.closeWorkspace?.(variant, status, { keepBranch: true });
+      }
+    }
   }
 
   private async persist(b: Board): Promise<void> {

@@ -67,6 +67,7 @@ export const editOpSchema = z.discriminatedUnion('op', [
     title: z.string().min(1).max(300).optional(),
     acceptance: z.string().max(2_000).optional(),
     dependsOn: z.array(z.string()).max(50).optional(),
+    variants: z.number().int().min(2).max(3).nullable().optional(),
   }),
   z.object({ op: z.literal('pin'), taskId: z.string(), assignee: assigneeSchema.nullable() }),
 ]);
@@ -77,6 +78,7 @@ const runBody = z.object({
   autoMergeGreen: z.boolean().optional(),
 });
 const resumeBody = z.object({ assignee: assigneeSchema.optional() });
+const pickBody = z.object({ variantId: z.string().min(1).max(20) });
 const extensionBody = z.object({ globs: scope });
 const decideBody = z.object({ outcome: z.enum(['approve', 'reject']) });
 const demoBody = z.object({
@@ -175,6 +177,12 @@ export function boardRoutes(service: () => BoardService): Router {
   r.post('/tasks/:boardId/tasks/:taskId/resume', validate(resumeBody), async (req, res) => {
     const { assignee } = valid<z.infer<typeof resumeBody>>(req, 'body');
     const task = await call(() => service().resumeTask(param(req, 'boardId'), param(req, 'taskId'), assignee));
+    res.json({ task });
+  });
+
+  r.post('/tasks/:boardId/tasks/:taskId/variants/pick', validate(pickBody), async (req, res) => {
+    const { variantId } = valid<z.infer<typeof pickBody>>(req, 'body');
+    const task = await call(() => service().pickVariant(param(req, 'boardId'), param(req, 'taskId'), variantId));
     res.json({ task });
   });
 
