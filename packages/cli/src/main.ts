@@ -21,6 +21,7 @@ Usage
   zephyr run "<task>" [options]            plan a board for the task and start it
       --template <id>                      preset policy, budget and concurrency (see: zephyr templates)
       --concurrency <1-8>                  override the template's concurrency
+      --variants <2-3>                     build that many versions of each task; you pick one
       --plan                               create the board but do not start it
       --private                            keep the task on local models
       --base <ref>                         branch or commit to start from
@@ -76,6 +77,7 @@ export async function main(argv: string[], io: MainIo = defaultIo): Promise<numb
         web: { type: 'string' },
         template: { type: 'string' },
         concurrency: { type: 'string' },
+        variants: { type: 'string' },
         plan: { type: 'boolean' },
         private: { type: 'boolean' },
         base: { type: 'string' },
@@ -118,6 +120,14 @@ export async function main(argv: string[], io: MainIo = defaultIo): Promise<numb
             return 2;
           }
         }
+        let variants: number | undefined;
+        if (values.variants !== undefined) {
+          variants = Number(values.variants);
+          if (variants !== 2 && variants !== 3) {
+            io.err('--variants must be 2 or 3');
+            return 2;
+          }
+        }
         if (!(await api.healthy())) {
           io.err(`Zephyr is not running at ${apiBase}. Start it with: zephyr up`);
           return 1;
@@ -126,6 +136,7 @@ export async function main(argv: string[], io: MainIo = defaultIo): Promise<numb
           request,
           ...(template ? { template: template as TaskTemplateId } : {}),
           ...(concurrency !== undefined ? { concurrency } : {}),
+          ...(variants !== undefined ? { variants } : {}),
           plan: Boolean(values.plan),
           private: Boolean(values.private),
           ...(values.base ? { base: values.base as string } : {}),
@@ -144,7 +155,7 @@ export async function main(argv: string[], io: MainIo = defaultIo): Promise<numb
           succeeded: 'Board finished: every task merged.',
           failed: 'Board finished with failed tasks.',
           cancelled: 'Board cancelled.',
-          'needs-you': 'Board is waiting on you: approve merges or unblock tasks under "Needs you".',
+          'needs-you': 'Board is waiting on you: approve merges, pick variants or unblock tasks under "Needs you".',
           timeout: 'Stopped waiting; the board is still running.',
         };
         io.out(said[outcome]);

@@ -76,6 +76,11 @@ export class ApiClient {
     return this.call<T>('POST', path, body);
   }
 
+  async patch<T>(path: string, body: unknown): Promise<T> {
+    await this.session();
+    return this.call<T>('PATCH', path, body);
+  }
+
   private async call<T>(method: string, path: string, body?: unknown): Promise<T> {
     const headers: Record<string, string> = { Origin: this.origin };
     if (this.cookie) headers.Cookie = this.cookie;

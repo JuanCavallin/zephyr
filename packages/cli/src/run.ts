@@ -20,6 +20,8 @@ export interface RunOptions {
   private?: boolean;
   base?: string;
   autoMergeGreen?: boolean;
+  /** Build 2 or 3 variants of every task; a person picks one before it merges. */
+  variants?: number;
 }
 
 export interface RunResult {
@@ -28,12 +30,17 @@ export interface RunResult {
 }
 
 export async function runTask(api: ApiClient, o: RunOptions): Promise<RunResult> {
-  const board = await api.post<BoardViewLite>('/api/tasks', {
+  let board = await api.post<BoardViewLite>('/api/tasks', {
     request: o.request,
     ...(o.template ? { template: o.template } : {}),
     ...(o.private ? { private: true } : {}),
     ...(o.base ? { base: o.base } : {}),
   });
+  // One atomic edit before anything runs, the same op the board's "Build" selector sends.
+  if (o.variants && o.variants > 1 && board.tasks.length)
+    board = await api.patch<BoardViewLite>(`/api/tasks/${encodeURIComponent(board.run.id)}`, {
+      ops: board.tasks.map((t) => ({ op: 'update', taskId: t.id, variants: o.variants })),
+    });
   if (o.plan) return { board, started: false };
   // Only send what the user set: the template's own concurrency and auto-merge stand otherwise.
   const started = await api.post<BoardViewLite>(`/api/tasks/${encodeURIComponent(board.run.id)}/run`, {
@@ -64,7 +71,7 @@ interface InboxItemLite {
 /**
  * Follow a board until it ends, or until nothing can move without a person: no task is
  * ready or running and the inbox holds something for this board (a merge approval, a
- * blocked task, a lease extension). A task in review alone is not enough: review also
+ * variant pick, a blocked task, a lease extension). A task in review alone is not enough: review also
  * covers a merge still running its tests and a task waiting on its fix task.
  */
 export async function waitForBoard(

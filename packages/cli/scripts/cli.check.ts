@@ -226,6 +226,18 @@ const server = createServer(async (req, res) => {
       waves: [['t1'], ['t2']],
     });
   }
+  if (req.method === 'PATCH' && req.url === '/api/tasks/run_board1') {
+    const ops = (b as { ops: Array<{ taskId: string; variants?: number }> }).ops;
+    const v = (id: string) => ops.find((o) => o.taskId === id)?.variants;
+    return json(res, 200, {
+      run: { id: 'run_board1', status: 'pending' },
+      tasks: [
+        { ...task('t1', 'Add the toggle'), variants: v('t1') },
+        { ...task('t2', 'Persist the choice'), variants: v('t2') },
+      ],
+      waves: [['t1'], ['t2']],
+    });
+  }
   if (req.method === 'POST' && req.url === '/api/tasks/run_board1/run')
     return json(res, 202, {
       run: { id: 'run_board1', status: 'running' },
@@ -302,6 +314,37 @@ await test('zephyr run --plan --concurrency --private --base: creates only, send
   assert.deepEqual(seen.find((s) => s.url.endsWith('/run'))!.body, { concurrency: 2 });
 });
 
+await test('zephyr run --variants: one atomic edit sets every task, before the board starts', async () => {
+  seen.length = 0;
+  const io = capture({ ZEPHYR_API: apiBase });
+  assert.equal(await main(['run', 'add a toggle', '--variants', '2'], io), 0, io.errors.join('\n'));
+  const urls = seen.filter((s) => s.method !== 'GET').map((s) => `${s.method} ${s.url}`);
+  assert.deepEqual(urls.slice(-3), ['POST /api/tasks', 'PATCH /api/tasks/run_board1', 'POST /api/tasks/run_board1/run']);
+  assert.deepEqual(seen.find((s) => s.method === 'PATCH')!.body, {
+    ops: [
+      { op: 'update', taskId: 't1', variants: 2 },
+      { op: 'update', taskId: 't2', variants: 2 },
+    ],
+  });
+
+  seen.length = 0;
+  assert.equal(await main(['run', 'x', '--variants', '3', '--plan'], capture({ ZEPHYR_API: apiBase })), 0);
+  assert.equal((seen.find((s) => s.method === 'PATCH')!.body as { ops: { variants: number }[] }).ops[0]!.variants, 3);
+  assert.equal(seen.some((s) => s.url.endsWith('/run')), false, '--plan still does not start');
+
+  seen.length = 0;
+  assert.equal(await main(['run', 'x'], capture({ ZEPHYR_API: apiBase })), 0);
+  assert.equal(seen.some((s) => s.method === 'PATCH'), false, 'no --variants, no edit');
+
+  for (const bad of ['1', '4', '2.5', 'two']) {
+    seen.length = 0;
+    const io2 = capture({ ZEPHYR_API: apiBase });
+    assert.equal(await main(['run', 'x', '--variants', bad], io2), 2, bad);
+    assert.match(io2.errors[0]!, /--variants must be 2 or 3/);
+    assert.equal(seen.length, 0, 'rejected before talking to the API');
+  }
+});
+
 await test('zephyr run: usage errors exit 2, server down exits 1, API errors are printed', async () => {
   const bad = capture({ ZEPHYR_API: apiBase });
   assert.equal(await main(['run', 'x', '--template', 'nope'], bad), 2);
@@ -361,6 +404,11 @@ await test('zephyr run --wait: a merge waiting for approval exits 3, failures ex
   polls.push(view('running', 'blocked', 'done'));
   inbox = [{ kind: 'blocked_task', boardRunId: 'run_board1' }];
   assert.equal(await main(['run', 'x', '--wait'], capture(WAIT)), 3, 'blocked needs a person too');
+
+  polls.length = 0;
+  polls.push(view('running', 'review', 'done'));
+  inbox = [{ kind: 'variant_pick', boardRunId: 'run_board1' }];
+  assert.equal(await main(['run', 'x', '--variants', '2', '--wait'], capture(WAIT)), 3, 'a variant pick needs a person');
 
   polls.length = 0;
   polls.push(view('failed', 'failed', 'done'));
