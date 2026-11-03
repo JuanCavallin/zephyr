@@ -199,6 +199,7 @@ const task = (id: string, title: string, status = 'pending') => ({
 
 type View = { run: { id: string; status: string }; tasks: ReturnType<typeof task>[]; waves: string[][] };
 const polls: View[] = [];
+let inbox: Array<{ kind: string; boardRunId?: string }> = [];
 const view = (run: string, ...statuses: string[]): View => ({
   run: { id: 'run_board1', status: run },
   tasks: [task('t1', 'Add the toggle', statuses[0]), task('t2', 'Persist the choice', statuses[1])],
@@ -231,6 +232,7 @@ const server = createServer(async (req, res) => {
       tasks: [task('t1', 'Add the toggle', 'running'), task('t2', 'Persist the choice')],
       waves: [['t1'], ['t2']],
     });
+  if (req.method === 'GET' && req.url === '/api/tasks/inbox') return json(res, 200, { items: inbox });
   if (req.method === 'GET' && req.url === '/api/tasks/run_board1') {
     // `--wait` polls: serve the scripted views in order, then repeat the last.
     const v = polls.length > 1 ? polls.shift()! : polls[0];
@@ -337,13 +339,27 @@ await test('zephyr run --wait: follows status changes, all merged exits 0', asyn
 
 await test('zephyr run --wait: a merge waiting for approval exits 3, failures exit 1', async () => {
   polls.length = 0;
+  // In review while the merge runs its tests: nothing in the inbox, keep following.
+  polls.push(
+    view('running', 'running', 'pending'),
+    view('running', 'review', 'pending'),
+    view('running', 'review', 'pending'),
+  );
+  inbox = [{ kind: 'approval', boardRunId: 'run_other' }];
+  const early = capture({ ...WAIT, ZEPHYR_WAIT_TIMEOUT_MS: '60' });
+  assert.equal(await main(['run', 'x', '--wait'], early), 1, "another board's approval is not ours");
+  assert.match(early.lines.join('\n'), /still running/);
+
+  polls.length = 0;
   polls.push(view('running', 'running', 'pending'), view('running', 'review', 'pending'));
+  inbox = [{ kind: 'approval', boardRunId: 'run_board1' }];
   const io = capture(WAIT);
   assert.equal(await main(['run', 'x', '--wait'], io), 3);
   assert.match(io.lines.join('\n'), /review\s+Add the toggle[\s\S]*waiting on you.*Needs you/);
 
   polls.length = 0;
   polls.push(view('running', 'blocked', 'done'));
+  inbox = [{ kind: 'blocked_task', boardRunId: 'run_board1' }];
   assert.equal(await main(['run', 'x', '--wait'], capture(WAIT)), 3, 'blocked needs a person too');
 
   polls.length = 0;

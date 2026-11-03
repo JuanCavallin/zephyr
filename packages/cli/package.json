@@ -10,6 +10,7 @@
   "scripts": {
     "zephyr": "node bin/zephyr.mjs",
     "check:cli": "tsx scripts/cli.check.ts",
+    "check:cli-e2e": "tsx scripts/cli-e2e.check.ts",
     "typecheck": "tsc --noEmit -p ."
   },
   "dependencies": {

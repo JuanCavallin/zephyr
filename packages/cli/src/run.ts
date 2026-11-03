@@ -55,9 +55,17 @@ export interface WaitOptions {
 
 const TERMINAL_RUN = new Set(['succeeded', 'failed', 'cancelled']);
 
+/** One "Needs you" entry; only the board it belongs to matters here. */
+interface InboxItemLite {
+  kind: string;
+  boardRunId?: string;
+}
+
 /**
  * Follow a board until it ends, or until nothing can move without a person: no task is
- * ready or running and at least one waits in review (merge approval) or is blocked.
+ * ready or running and the inbox holds something for this board (a merge approval, a
+ * blocked task, a lease extension). A task in review alone is not enough: review also
+ * covers a merge still running its tests and a task waiting on its fix task.
  */
 export async function waitForBoard(
   api: ApiClient,
@@ -77,8 +85,10 @@ export async function waitForBoard(
     }
     if (TERMINAL_RUN.has(board.run.status)) return { outcome: board.run.status as BoardOutcome, board };
     const moving = board.tasks.some((t) => t.status === 'ready' || t.status === 'running');
-    const waiting = board.tasks.some((t) => t.status === 'review' || t.status === 'blocked');
-    if (!moving && waiting) return { outcome: 'needs-you', board };
+    if (!moving) {
+      const { items } = await api.get<{ items: InboxItemLite[] }>('/api/tasks/inbox');
+      if (items.some((i) => i.boardRunId === boardId)) return { outcome: 'needs-you', board };
+    }
     if (Date.now() >= deadline) return { outcome: 'timeout', board };
     if (o.signal?.aborted) return { outcome: 'timeout', board };
     await new Promise((r) => setTimeout(r, pollMs));
