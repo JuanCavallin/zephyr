@@ -21,6 +21,7 @@ import { actionEvidenceRouter } from './actionEvidence.routes.js';
 import { credentialsRouter } from './credentials.routes.js';
 import { browserRouter } from './browser.routes.js';
 import { tasksRouter } from './tasks.routes.js';
+import { learningRouter } from './learning.routes.js';
 import { requireLocalControl } from '../services/localControl.js';
 import { createHarnessCallbackRouter, createObservedRouter } from './hooks.routes.js';
 import { hookTokens } from '../core/hooks/hookTokens.js';
@@ -58,6 +59,8 @@ export function mountRoutes(app: Express): void {
   api.use(approvalsRouter);
   // Coding-agent task board (dev-only seeded demo for now).
   api.use(tasksRouter);
+  // Learning loop: the "What Zephyr learned" feed, signals, export and delete.
+  api.use(learningRouter);
   // The chat that AUTHORS a graph. This is the workspace composer's endpoint --
   // without it the app's front door returns 404 and nothing can be created.
   api.use(conversationsRouter);

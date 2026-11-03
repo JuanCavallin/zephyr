@@ -14,6 +14,7 @@
  *   7. Learning pass: edit -> candidate -> active.
  *   8. Relevance: Jev or keyword overlap, the token cap, the learned pack section.
  *   9. Emitters: SKILL.md and AGENTS.md formats, fork-don't-modify, never pushed.
+ *  10. Measurement, the learning service and its routes, end to end on stubs.
  */
 
 process.env.PERSIST_TO_DISK = 'false';
@@ -1206,6 +1207,301 @@ await test('emit: project knowledge proposed as a local branch, never pushed; pe
 
   const again = await proposeProjectKnowledge(repo, entries, { id: 'demo' });
   assert.equal(again.branch, 'zephyr/learned-demo-2', 'an existing proposal branch is never overwritten');
+  store.close();
+});
+
+console.log('10. measurement, the service and its routes');
+
+const { skillArms, skillRegressions } = await import('../src/core/learning/measure.js');
+const { LearningService, LearningError } = await import('../src/services/learning.service.js');
+type SkillRunTag = import('../src/core/learning/profileStore.js').SkillRunTag;
+
+const runTag = (skillId: string, skillVersion: number, outcome?: 'passed' | 'failed', n = 1): SkillRunTag[] =>
+  Array.from({ length: n }, (_, i) => ({ runId: `r_${skillId}_${skillVersion}_${outcome}_${i}`, skillId, skillVersion, at: T0, ...(outcome ? { outcome } : {}) }));
+
+const parserSkill = (over: Partial<LearnedEntry> = {}) =>
+  entry('skill_parse', {
+    status: 'active',
+    kind: 'skill',
+    version: 2,
+    text: 'Write a parser',
+    skill: { name: 'parser-style', description: 'How parser functions are written here', body: 'Return early.' },
+    ...over,
+  });
+
+function serviceOver(store: InstanceType<typeof ProfileStore>, over: Record<string, unknown> = {}) {
+  const anthropic = createAnthropic({ mode: 'mock' } as ProviderConfig);
+  const complete = anthropic.complete.bind(anthropic);
+  const errors: unknown[] = [];
+  const events: RunEvent[] = [];
+  const svc = new LearningService({
+    store,
+    decisions: mockJev(),
+    complete,
+    completeLocal: complete,
+    emit: (_r, e) => events.push(e),
+    onError: (e) => errors.push(e),
+    ...over,
+  });
+  return { svc, errors, events };
+}
+
+const editOf = (name: string) => ({
+  files: [`src/${name}.ts`],
+  diff: NESTED_TO_EARLY.replace(/parse/g, name),
+  diffHash: 'h_' + name,
+});
+
+await test('measure: arms per version count finished runs only', () => {
+  const arms = skillArms([
+    ...runTag('skill_b', 1, 'passed', 2),
+    ...runTag('skill_a', 2, 'failed'),
+    ...runTag('skill_a', 1, 'passed', 3),
+    ...runTag('skill_a', 1, 'failed'),
+    ...runTag('skill_a', 2),
+  ]);
+  assert.deepEqual(
+    arms.map((a) => [a.skillId, a.version, a.passed, a.failed, a.passRate]),
+    [
+      ['skill_a', 1, 3, 1, 0.75],
+      ['skill_a', 2, 0, 1, 0],
+      ['skill_b', 1, 2, 0, 1],
+    ],
+  );
+  assert.equal(skillArms(runTag('skill_c', 1))[0]!.passRate, null, 'an unfinished run is no evidence');
+});
+
+await test('measure: a regression needs enough runs on both arms and a clear drop', () => {
+  const runs = [...runTag('s', 1, 'passed', 5), ...runTag('s', 2, 'passed', 1), ...runTag('s', 2, 'failed', 4)];
+  const [r] = skillRegressions(runs, [{ id: 's', version: 2 }]);
+  assert.equal(r!.baseline.version, 1);
+  assert.equal(r!.current.passRate, 0.2);
+  assert.deepEqual(skillRegressions(runs.slice(0, 8), [{ id: 's', version: 2 }]), [], 'four runs on v2: not enough yet');
+  assert.deepEqual(skillRegressions(runs, [{ id: 's', version: 2 }], { drop: 0.9 }), [], 'a small drop is noise');
+  assert.deepEqual(skillRegressions(runs, [{ id: 's', version: 1 }]), [], 'nothing before v1');
+  const skipThin = [...runTag('t', 1, 'passed', 5), ...runTag('t', 2, 'failed', 2), ...runTag('t', 3, 'failed', 5)];
+  assert.equal(skillRegressions(skipThin, [{ id: 't', version: 3 }])[0]!.baseline.version, 1, 'thin versions are skipped as a baseline');
+  assert.deepEqual(skillRegressions(runs, [{ id: 'other', version: 2 }]), []);
+});
+
+await test('service: a regressing skill goes back to candidate when a task finishes', async () => {
+  const store = activeStore([parserSkill()]);
+  const { svc } = serviceOver(store);
+  for (let i = 0; i < 5; i++) {
+    store.tagRun('run_v1_' + i, [{ id: 'skill_parse', version: 1 }]);
+    store.recordRunOutcome('run_v1_' + i, 'passed');
+  }
+  for (let i = 0; i < 4; i++) {
+    store.tagRun('run_v2_' + i, [{ id: 'skill_parse', version: 2 }]);
+    store.recordRunOutcome('run_v2_' + i, 'failed');
+  }
+  svc.onTaskFinished({ taskId: 't1', runId: 'run_untagged', outcome: 'passed' });
+  await svc.idle();
+  assert.equal(store.entry('skill_parse')!.status, 'active', 'four runs: not enough to judge');
+
+  store.tagRun('run_v2_4', [{ id: 'skill_parse', version: 2 }], 't2');
+  svc.onTaskFinished({ taskId: 't2', runId: 'run_v2_4', outcome: 'failed' });
+  await svc.idle();
+  const demoted = store.entry('skill_parse')!;
+  assert.equal(demoted.status, 'candidate');
+  assert.equal(demoted.autoActivate, false, 'evidence alone does not bring it back');
+  assert.match(store.versions('skill_parse').at(-1)!.reason, /^demoted: v2 passes 0% of runs, v1 passed 100%/);
+  const [item] = svc.feed({ kind: 'skill' });
+  assert.deepEqual(item!.arms!.map((a) => [a.version, a.passed, a.failed]), [[1, 5, 0], [2, 0, 5]]);
+  assert.deepEqual(svc.demoteRegressions(), [], 'no active skill left to demote');
+  store.close();
+});
+
+await test('service: one pass at a time, signals recorded meanwhile get a follow-up pass', async () => {
+  const store = new ProfileStore(':memory:');
+  let calls = 0;
+  let release!: () => void;
+  const gate = new Promise<void>((r) => (release = r));
+  const anthropic = createAnthropic({ mode: 'mock' } as ProviderConfig);
+  const slow = (async (req: Call['input'], ctx: Call['ctx']) => {
+    calls++;
+    if (calls === 1) await gate;
+    return anthropic.complete(req, ctx);
+  }) as TextModelAdapter['complete'];
+  const { svc } = serviceOver(store, { complete: slow, completeLocal: slow });
+  await svc.recordEdit(editOf('parse'), { taskId: 't1' });
+  const first = svc.runPass();
+  const second = svc.runPass();
+  assert.equal(first, second, 'a call while a pass runs joins it');
+  await tick();
+  await svc.recordEdit(editOf('clean'), { taskId: 't2' });
+  svc.runPass();
+  release();
+  const result = await first;
+  await svc.idle();
+  assert.ok(result.ok, result.error);
+  assert.equal(calls, 2, 'the second signal was drafted by the follow-up pass');
+  assert.equal(store.signals({ unprocessed: true }).length, 0);
+  assert.equal(svc.lastPass(), result);
+  store.close();
+});
+
+await test('service: a finished task never throws, whatever the profile does', async () => {
+  const store = new ProfileStore(':memory:');
+  const { svc, errors } = serviceOver(store);
+  store.close();
+  assert.doesNotThrow(() => svc.onTaskFinished({ taskId: 't', runId: 'r', outcome: 'passed' }));
+  await svc.idle();
+  assert.ok(errors.length >= 1, 'reported, not thrown');
+  assert.equal(svc.lastPass()!.ok, false);
+});
+
+await test('service: feed carries evidence and versions; actions map errors to 404 / 409', async () => {
+  const store = new ProfileStore(':memory:');
+  const { svc } = serviceOver(store);
+  const s = await svc.recordEdit(editOf('parse'), { taskId: 't1' });
+  assert.equal(await svc.requestWording('   '), null, 'a blank request is no signal');
+  await svc.runPass();
+  const [item] = svc.feed();
+  assert.ok(item, 'one candidate');
+  assert.deepEqual(item.entry.evidence, [s.id]);
+  assert.equal(item.evidence[0]!.taskId, 't1');
+  assert.equal(item.evidence[0]!.summary, describeSignal(s));
+  assert.equal(item.versions[0]!.version, 1);
+  assert.equal(item.arms, undefined, 'arms are for skills');
+  assert.deepEqual(svc.feed({ status: ['active'] }), []);
+
+  const id = item.entry.id;
+  assert.equal(svc.accept(id).status, 'active');
+  assert.equal(svc.revert(id).status, 'retired');
+  assert.equal(svc.restore(id, 1).status, 'candidate');
+  const code = (fn: () => unknown) => {
+    try {
+      fn();
+    } catch (e) {
+      assert.ok(e instanceof LearningError, String(e));
+      return [e.status, e.code];
+    }
+    assert.fail('expected a LearningError');
+  };
+  assert.deepEqual(code(() => svc.revert('pref_none')), [404, 'NOT_FOUND']);
+  assert.deepEqual(code(() => svc.restore(id, 99)), [404, 'NOT_FOUND']);
+  store.putEntry(entry('pref_secret', { private: true }), 'fixture');
+  assert.deepEqual(code(() => svc.promote('pref_secret')), [409, 'REFUSED']);
+
+  await assert.rejects(svc.propose(), (e: unknown) => e instanceof LearningError && e.status === 400, 'no repository configured');
+  const { repo } = await editRepo('svc-propose');
+  await assert.rejects(svc.propose({ repo }), (e: unknown) => e instanceof LearningError && e.code === 'NOTHING_TO_PROPOSE');
+  await assert.rejects(svc.propose({ repo, ids: ['pref_none'] }), (e: unknown) => e instanceof LearningError && e.status === 404);
+
+  assert.deepEqual(svc.deleteAll(), { signals: 1, entries: 2 });
+  assert.deepEqual(svc.export().entries, []);
+  store.close();
+});
+
+await test('routes: feed, actions, signals and delete; export needs local control', async () => {
+  const express = (await import('express')).default;
+  const { learningRoutes } = await import('../src/api/learning.routes.js');
+  const { errorHandler } = await import('../src/api/middleware/error.js');
+  const { establishLocalControl } = await import('../src/services/localControl.js');
+  const store = new ProfileStore(':memory:');
+  const { svc } = serviceOver(store);
+  const app = express();
+  app.use(express.json());
+  app.post('/api/control', (req, res) => {
+    establishLocalControl(req, res);
+    res.json({});
+  });
+  app.use('/api', learningRoutes(() => svc));
+  app.use(errorHandler);
+  const server = app.listen(0, '127.0.0.1');
+  await new Promise((r) => server.once('listening', r));
+  try {
+    const base = 'http://127.0.0.1:' + (server.address() as { port: number }).port;
+    const call = (method: string, path: string, body?: unknown, headers: Record<string, string> = {}) =>
+      fetch(base + '/api' + path, {
+        method,
+        headers: { 'content-type': 'application/json', ...headers },
+        ...(body ? { body: JSON.stringify(body) } : {}),
+      });
+    const json = async (r: Response) => (await r.json()) as Record<string, any>;
+
+    const picked = await call('POST', '/learning/signals/variant-pick', { chosen: 'v_b', rejected: ['v_a'], taskId: 't1' });
+    assert.equal(picked.status, 201);
+    assert.equal((await json(picked)).signal.kind, 'variant_pick');
+    const fb = await call('POST', '/learning/signals/feedback', { rating: 'down', comment: 'too verbose', private: true });
+    assert.equal(fb.status, 201);
+    assert.equal((await json(fb)).signal.private, true);
+    assert.equal((await call('POST', '/learning/signals/feedback', { rating: 'meh' })).status, 400);
+    assert.equal((await call('POST', '/learning/signals/variant-pick', { chosen: 'v_b', rejected: [] })).status, 400);
+
+    await svc.recordEdit(editOf('parse'));
+    const pass = await call('POST', '/learning/pass');
+    assert.equal(pass.status, 200);
+    assert.equal((await json(pass)).ok, true);
+
+    const feed = await json(await call('GET', '/learning?status=candidate,active'));
+    assert.ok(feed.items.length >= 1);
+    const id = feed.items[0].entry.id as string;
+    assert.deepEqual((await json(await call('GET', '/learning?status=retired'))).items, []);
+    assert.equal((await call('GET', '/learning?status=bogus')).status, 400);
+
+    const accepted = await call('POST', `/learning/${id}/accept`);
+    assert.equal((await json(accepted)).entry.status, 'active');
+    assert.equal((await json(await call('POST', `/learning/${id}/revert`))).entry.status, 'retired');
+    assert.equal((await json(await call('POST', `/learning/${id}/restore`, { version: 2 }))).entry.status, 'active');
+    const missing = await call('POST', '/learning/pref_none/revert');
+    assert.equal(missing.status, 404);
+    assert.equal((await json(missing)).error.code, 'LEARNING_NOT_FOUND');
+    assert.equal((await call('POST', `/learning/${id}/restore`, { version: 0 })).status, 400);
+    assert.equal((await call('POST', `/learning/${id}/restore`, { version: 99 })).status, 404);
+
+    const denied = await call('GET', '/learning/export');
+    assert.equal(denied.status, 401, 'the profile, private evidence included, is not readable by any page');
+    const session = await call('POST', '/control', undefined, { origin: base });
+    assert.equal(session.status, 200);
+    const cookie = session.headers.get('set-cookie')!.split(';')[0]!;
+    const exported = await call('GET', '/learning/export', undefined, { cookie });
+    assert.equal(exported.status, 200);
+    assert.match(exported.headers.get('content-disposition')!, /attachment/);
+    const dump = await json(exported);
+    assert.equal(dump.format, 'zephyr-profile');
+    assert.equal(dump.signals.length, 3);
+
+    const wiped = await call('DELETE', '/learning');
+    assert.deepEqual(await json(wiped), { signals: 3, entries: feed.items.length });
+    assert.deepEqual((await json(await call('GET', '/learning'))).items, []);
+  } finally {
+    server.close();
+    store.close();
+  }
+});
+
+await test('end to end: three edits -> active preference -> loaded into the next context pack', async () => {
+  const { worktree } = await editRepo('e2e');
+  const store = new ProfileStore(':memory:');
+  const { svc, events } = serviceOver(store);
+  const decisions = mockJev();
+  const build = createContextPackBuilder({ decisions, knowledge: svc.knowledgeLoader({ shared: () => false }) });
+  const task = 'make the parser return early on empty input';
+
+  const before = await build({ task, worktree }, { runId: 'run_e2e_0', policyRule: 'test' });
+  assert.ok(!before.prompt.includes(KNOWLEDGE_HEADER), 'nothing learned yet');
+
+  for (const [i, name] of ['parse', 'clean', 'split'].entries()) {
+    await svc.recordEdit(editOf(name), { taskId: 'task_' + i, runId: 'run_' + i });
+    svc.onTaskFinished({ taskId: 'task_' + i, runId: 'run_' + i, outcome: 'passed' });
+    await svc.idle();
+  }
+  const [learned] = store.entries({ status: ['active'] });
+  assert.ok(learned, JSON.stringify(store.entries()));
+  assert.equal(learned.text, 'Prefer early returns over nested if blocks.');
+  assert.equal(learned.evidence.length, 3);
+  assert.ok(events.some((e) => e.type === 'learning.activated'));
+
+  const after = await build({ task, worktree }, { runId: 'run_e2e_1', policyRule: 'test' });
+  assert.ok(after.prompt.includes(KNOWLEDGE_HEADER), after.prompt);
+  assert.ok(after.prompt.includes('Prefer early returns over nested if blocks.'));
+  assert.deepEqual(after.knowledge!.map((k) => k.id), [learned.id]);
+
+  svc.revert(learned.id);
+  const reverted = await build({ task, worktree }, { runId: 'run_e2e_2', policyRule: 'test' });
+  assert.ok(!reverted.prompt.includes(KNOWLEDGE_HEADER), 'one click and it stops loading');
   store.close();
 });
 

@@ -25,7 +25,12 @@ export interface LearningPassResult {
 }
 
 export async function runLearningPass(deps: LearningPassDeps): Promise<LearningPassResult> {
-  const pending = deps.store.signals({ unprocessed: true });
+  let pending: ReturnType<LearningPassDeps['store']['signals']>;
+  try {
+    pending = deps.store.signals({ unprocessed: true });
+  } catch (error) {
+    return { ok: false, signals: 0, outcomes: [], rejected: [], deferred: [], error: (error as Error).message };
+  }
   const empty = { signals: pending.length, outcomes: [], rejected: [], deferred: [] };
   if (pending.length === 0) return { ok: true, ...empty };
   try {

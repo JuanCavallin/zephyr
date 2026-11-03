@@ -48,7 +48,7 @@ export const bus = new RunBus((runId, event) => store.appendEvent(runId, event))
  * Every provider call lands here. Writes the ledger row, then streams it to the
  * UI so the egress table fills in live rather than only at the end.
  */
-const recordEgress: RecordEgress = async (input) => {
+export const recordEgress: RecordEgress = async (input) => {
   const event = buildEgressEvent(input, nowIso());
   await store.appendEgress(event);
   await bus.emit(event.runId, { type: 'egress.logged', egress: event });
