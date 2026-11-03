@@ -1267,5 +1267,21 @@ await test('three tasks at once, an out-of-lease edit denied, two package.json i
   }
 });
 
+await test('isPrivate: a private board, its tasks and its task runs are private; a public board is not', async () => {
+  const { svc, boardId, view } = await svcBoard('svc-private', '- one\n- two');
+  const priv = await svc.createBoard({ request: '- secret one\n- secret two', private: true });
+  assert.equal(await svc.isPrivate({ runId: priv.run.id }), true);
+  assert.equal(await svc.isPrivate({ taskId: priv.tasks[1]!.id }), true);
+  assert.equal(await svc.isPrivate({ runId: boardId }), false);
+  assert.equal(await svc.isPrivate({ taskId: view.tasks[0]!.id }), false);
+  assert.equal(await svc.isPrivate({ runId: 'run_unknown' }), false);
+  assert.equal(await svc.isPrivate({}), false);
+  await svc.runReady(priv.run.id, { concurrency: 2, autoMergeGreen: true });
+  await svc.whenIdle(priv.run.id);
+  const ran = (await svc.getBoard(priv.run.id)).tasks.find((t) => t.runId);
+  assert.ok(ran, 'a task ran');
+  assert.equal(await svc.isPrivate({ runId: ran.runId! }), true, 'a task run of a private board');
+});
+
 console.log(`\n${passed} passed`);
 await rm(scratch, { recursive: true, force: true }).catch(() => undefined);

@@ -1549,5 +1549,31 @@ await test('pnpm learning:export / learning:delete: one command each, never crea
   }
 });
 
+await test('UI signals: the server marks feedback and picks private when the origin is a private board', async () => {
+  const store = new ProfileStore(':memory:');
+  const asked: unknown[] = [];
+  const { svc, errors } = serviceOver(store, {
+    isPrivate: (o: { runId?: string; taskId?: string }) => {
+      asked.push(o);
+      if (o.runId === 'run_boom') throw new Error('lookup down');
+      return o.runId === 'run_priv' || o.taskId === 'task_priv';
+    },
+  });
+  const a = await svc.feedback('up', 'nice', { runId: 'run_priv', private: false });
+  const b = await svc.variantPick('A', ['B'], { taskId: 'task_priv' });
+  const c = await svc.feedback('down', undefined, { runId: 'run_open' });
+  const d = await svc.feedback('down', undefined, {});
+  const e = await svc.feedback('up', undefined, { runId: 'run_boom' });
+  assert.equal(a.private, true, 'a client saying private:false does not win');
+  assert.equal(b.private, true);
+  assert.equal(c.private ?? false, false);
+  assert.equal(d.private ?? false, false, 'no origin: nothing to look up');
+  assert.equal(e.private, true, 'a failed lookup fails closed');
+  assert.equal(errors.length, 1);
+  assert.equal(asked.length, 4, 'an origin-less signal is not looked up');
+  const stored = store.signals().map((s) => s.signal.private ?? false);
+  assert.equal(stored.filter(Boolean).length, 3, 'three private signals stored');
+});
+
 console.log(`\n${passed} passed`);
 await rm(scratch, { recursive: true, force: true }).catch(() => undefined);

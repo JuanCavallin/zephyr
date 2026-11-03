@@ -75,6 +75,7 @@ export function learningService(): LearningService {
     emit: (runId, event) => bus.emit(runId, event),
     onError: (error) => console.error('[learning]', error instanceof Error ? error.message : error),
     repoRoot: config.providers.git.repoRoot ?? process.cwd(),
+    isPrivate: async (origin) => (await import('./board.runtime.js')).boardService().isPrivate(origin),
   });
   return instance;
 }

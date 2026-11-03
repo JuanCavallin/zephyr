@@ -300,6 +300,26 @@ export class BoardService {
     return { run, tasks: stored, waves: this.waves(stored) };
   }
 
+  /**
+   * Whether a run or task belongs to a private board: the board's own run, a task's run, or a
+   * task id. Signals from the UI use this so a client cannot launder a private board's
+   * feedback into a remote model by leaving out the private flag.
+   */
+  async isPrivate(origin: { runId?: string; taskId?: string }): Promise<boolean> {
+    const { runId, taskId } = origin;
+    if (!runId && !taskId) return false;
+    for (const b of this.boards.values()) {
+      if (!b.private) continue;
+      if (runId && b.run.id === runId) return true;
+      for (const t of b.tasks.values()) if ((taskId && t.id === taskId) || (runId && t.runId === runId)) return true;
+    }
+    if (runId && !this.boards.has(runId)) {
+      const run = await this.deps.store.getRun(runId).catch(() => undefined);
+      if (run?.kind === BOARD_KIND && (run.input as { private?: boolean } | undefined)?.private === true) return true;
+    }
+    return false;
+  }
+
   /** Resolves once nothing on the board is executing or merging. For tests and shutdown. */
   async whenIdle(boardId: string): Promise<void> {
     const b = this.must(boardId);

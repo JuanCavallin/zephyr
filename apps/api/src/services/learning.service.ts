@@ -58,6 +58,11 @@ export interface LearningServiceDeps {
   /** Repository project proposals are made in, unless one is given per call. */
   repoRoot?: string;
   regression?: RegressionOptions;
+  /**
+   * Whether a signal's origin (a run or task) is private. Feedback and variant picks arrive
+   * from the UI, so the server decides privacy here rather than trusting the client's flag.
+   */
+  isPrivate?(origin: { runId?: string; taskId?: string }): boolean | Promise<boolean>;
 }
 
 export interface FeedEvidence {
@@ -110,13 +115,13 @@ export class LearningService {
   }
 
   async variantPick(chosen: string, rejected: string[], origin: SignalOrigin = {}): Promise<PreferenceSignal> {
-    const s = variantPickSignal(chosen, rejected, origin);
+    const s = variantPickSignal(chosen, rejected, await this.withPrivacy(origin));
     await this.signals.recordSignal(s);
     return s;
   }
 
   async feedback(rating: 'up' | 'down', comment: string | undefined, origin: SignalOrigin = {}): Promise<PreferenceSignal> {
-    const s = feedbackSignal(rating, comment, origin);
+    const s = feedbackSignal(rating, comment, await this.withPrivacy(origin));
     await this.signals.recordSignal(s);
     return s;
   }
@@ -272,6 +277,22 @@ export class LearningService {
   /** The context pack's knowledge source, over this profile. */
   knowledgeLoader(opts: Omit<KnowledgeLoaderDeps, 'store' | 'decisions'> = {}): KnowledgeLoader {
     return createKnowledgeLoader({ store: this.store, decisions: this.deps.decisions, ...opts });
+  }
+
+  /** A private origin stays private; a lookup that fails counts as private (fail closed). */
+  private async withPrivacy(origin: SignalOrigin): Promise<SignalOrigin> {
+    if (origin.private || !this.deps.isPrivate || (!origin.runId && !origin.taskId)) return origin;
+    let priv: boolean;
+    try {
+      priv = await this.deps.isPrivate({
+        ...(origin.runId ? { runId: origin.runId } : {}),
+        ...(origin.taskId ? { taskId: origin.taskId } : {}),
+      });
+    } catch (error) {
+      this.deps.onError?.(error);
+      priv = true;
+    }
+    return priv ? { ...origin, private: true } : origin;
   }
 
   private act(id: string, fn: () => LearnedEntry): LearnedEntry {
