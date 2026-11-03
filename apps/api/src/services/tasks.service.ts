@@ -22,6 +22,8 @@
 
 import {
   isTerminal,
+  applyTemplateToRequest,
+  taskTemplate,
   toRepoPath,
   type Approval,
   type Assignee,
@@ -33,7 +35,10 @@ import {
   type SignalSeam,
   type Task,
   type TaskStatus,
+  type TaskTemplateId,
   type TextModelAdapter,
+  type Levers,
+  type VerifyPolicy,
 } from '@htn/shared';
 import { waitForApproval, type ApprovalOutcome } from '../core/approvalGate.js';
 import { findCycle, planWaves, scopesOverlap } from '../core/coordination/conflictGraph.js';
@@ -95,6 +100,11 @@ export interface TaskExecutionContext {
   emit(event: RunEvent): Promise<void>;
   /** Publish progress; throws BudgetBreachError when the task is over budget or stuck. */
   step(): Promise<void>;
+  /**
+   * The board's template policy, when it was created from one. Executors that drive a
+   * real harness apply it; the scripted harness ignores it.
+   */
+  policy?: BoardPolicy;
   /** A hot-file change (package.json, barrels): applied and committed by the integrator. */
   submitIntent(sub: Omit<IntentSubmission, 'taskId'>): Promise<{ status: 'applied' | 'rejected'; error?: string }>;
 }
@@ -217,8 +227,16 @@ export interface BoardServiceDeps {
   leaseTtlMs?: number;
 }
 
+/** What a template sets on a board's runs (docs/cacp-09, templates). */
+export interface BoardPolicy {
+  levers: Levers;
+  verify: Pick<VerifyPolicy, 'protectDefaults' | 'fullSuiteBeforePublish'> & { protectedGlobs: string[] };
+}
+
 export interface CreateBoardInput {
   request: string;
+  /** Preset policy, budget and concurrency (packages/shared/src/templates.ts). */
+  template?: TaskTemplateId;
   repoFiles?: string[];
   /** A private-route board: routing never sends it to a remote decision model. */
   private?: boolean;
@@ -261,6 +279,9 @@ interface Board {
   started: boolean;
   concurrency: number;
   autoMergeGreen: boolean;
+  /** Per-task budget from the board's template; overrides the service default. */
+  budget?: TaskBudget;
+  policy?: BoardPolicy;
   inFlight: Set<string>;
   active: Set<Promise<unknown>>;
   pumping: Promise<void>;
@@ -377,12 +398,18 @@ export class BoardService {
 
   async createBoard(input: CreateBoardInput): Promise<BoardView> {
     const at = nowIso();
+    const template = input.template ? taskTemplate(input.template) : undefined;
+    const request = template ? applyTemplateToRequest(input.request, template) : input.request;
     const run = await this.deps.store.createRun({
       id: newId('run'),
       kind: BOARD_KIND,
       title: 'Board: ' + input.request.split(/\r?\n/)[0]!.slice(0, 80),
       status: 'pending',
-      input: { request: input.request, private: input.private ?? false } as Json,
+      input: {
+        request: input.request,
+        private: input.private ?? false,
+        ...(template ? { template: template.id } : {}),
+      } as Json,
       createdAt: at,
       updatedAt: at,
     });
@@ -396,8 +423,14 @@ export class BoardService {
       fixParents: new Map(),
       leases: undefined as unknown as LeaseTable,
       started: false,
-      concurrency: DEFAULT_CONCURRENCY,
-      autoMergeGreen: false,
+      concurrency: template?.concurrency ?? DEFAULT_CONCURRENCY,
+      autoMergeGreen: template?.autoMergeGreen ?? false,
+      ...(template
+        ? {
+            budget: { ...template.budget },
+            policy: { levers: { ...template.levers }, verify: { ...template.verify, protectedGlobs: [...template.verify.protectedGlobs] } },
+          }
+        : {}),
       inFlight: new Set(),
       active: new Set(),
       pumping: Promise.resolve(),
@@ -421,7 +454,7 @@ export class BoardService {
 
     try {
       const plan = await decompose(
-        { runId: run.id, request: input.request, ...(input.repoFiles ? { repoFiles: input.repoFiles } : {}) },
+        { runId: run.id, request, ...(input.repoFiles ? { repoFiles: input.repoFiles } : {}) },
         { complete: this.deps.complete },
       );
       const ids = new Map(plan.tasks.map((t) => [t.id, newId('task')]));
@@ -801,7 +834,7 @@ export class BoardService {
     });
     await this.emit(b, { type: 'step.upserted', step }, taskRun.id);
     const tracker = new ProgressTracker(taskId, taskRun.id);
-    const budget = { ...DEFAULT_TASK_BUDGET, ...this.deps.budget };
+    const budget = { ...DEFAULT_TASK_BUDGET, ...this.deps.budget, ...b.budget };
     const executor = this.deps.executor ?? mockHarnessExecutor();
     let outcome: { status: 'done' | 'failed'; detail?: string };
     try {
@@ -813,6 +846,7 @@ export class BoardService {
         leases: b.leases,
         tracker,
         signal: b.abort.signal,
+        ...(b.policy ? { policy: b.policy } : {}),
         emit: async (e) => void (await this.emit(b, e)),
         step: async () => {
           const progress = tracker.snapshot();

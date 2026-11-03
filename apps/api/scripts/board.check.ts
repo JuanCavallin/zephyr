@@ -1197,6 +1197,65 @@ await test('learning hooks: request wording recorded; outcomes reported per task
   assert.ok(failedCalls[0]!.runId, 'the failed task run is named');
 });
 
+await test('a template presets concurrency, auto-merge, budget and policy; the user words stay the signal', async () => {
+  const seen: Array<{ policy: unknown }> = [];
+  const inner = mockHarnessExecutor({ authorize: allowAuth });
+  const { svc } = await svcBoard('svc-template', '- unused', {
+    executor: async (ctx) => {
+      seen.push({ policy: ctx.policy });
+      return inner(ctx);
+    },
+  });
+  const v = await svc.createBoard({ request: '- tweak header\n- tweak footer', template: 'polish-ui' });
+  assert.equal((v.run.input as { template?: string }).template, 'polish-ui');
+  assert.equal((v.run.input as { request: string }).request, '- tweak header\n- tweak footer', 'the stored request is the user words');
+  assert.ok(v.tasks.length >= 2, 'decomposed');
+  await svc.runReady(v.run.id);
+  await svc.whenIdle(v.run.id);
+  assert.ok(seen.length >= 2, 'executor ran');
+  for (const s of seen)
+    assert.deepEqual(s.policy, {
+      levers: { shapedTools: true, contextPack: true, schemaMin: true },
+      verify: { protectDefaults: true, fullSuiteBeforePublish: false, protectedGlobs: [] },
+    });
+  const done = await svc.getBoard(v.run.id);
+  assert.ok(done.tasks.filter((t) => t.status === 'done').length >= 2, 'polish-ui auto-merges green tasks');
+
+  // fix-ci: a tight budget. An executor that loops past 25 turns is blocked as over budget.
+  const loop = await svcBoard('svc-template-budget', '- unused', {
+    executor: async (ctx) => {
+      for (let i = 0; i < 30; i++) {
+        ctx.tracker.observe({
+          type: 'harness.turn.ended',
+          runId: ctx.taskRunId,
+          sessionId: 'sess_budget',
+          turnId: 'turn_' + i,
+          harness: 'mockharness',
+          stopReason: 'end_turn',
+          taskId: ctx.task.id,
+          at: new Date().toISOString(),
+        } as RunEvent);
+        await ctx.step();
+      }
+      return { status: 'done' };
+    },
+  });
+  const ci = await loop.svc.createBoard({ request: '- fix the build', template: 'fix-ci' });
+  await loop.svc.runReady(ci.run.id);
+  await loop.svc.whenIdle(ci.run.id);
+  const blocked = (await loop.svc.getBoard(ci.run.id)).tasks.find((t) => t.status === 'blocked');
+  assert.ok(blocked, 'blocked by the template budget');
+  assert.match(JSON.stringify(blocked), /25/);
+
+  // Without a template nothing changes: the service default budget and no policy.
+  seen.length = 0;
+  const plain = await svc.createBoard({ request: '- plain one' });
+  assert.equal((plain.run.input as { template?: string }).template, undefined);
+  await svc.runReady(plain.run.id, { autoMergeGreen: true });
+  await svc.whenIdle(plain.run.id);
+  assert.equal(seen[0]?.policy, undefined);
+});
+
 console.log('8. end to end (the done condition)');
 
 await test('three tasks at once, an out-of-lease edit denied, two package.json intents land, all green merged', async () => {

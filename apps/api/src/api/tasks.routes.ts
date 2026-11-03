@@ -22,7 +22,7 @@
 
 import { Router, type RequestHandler } from 'express';
 import { z } from 'zod';
-import { assigneeSchema } from '@htn/shared';
+import { assigneeSchema, taskTemplateIdSchema } from '@htn/shared';
 import { config } from '../config.js';
 import { bus, store } from '../services/runtime.js';
 import { boardService } from '../services/board.runtime.js';
@@ -41,6 +41,7 @@ export const createBoardBody = z.object({
   repoFiles: z.array(z.string().max(500)).max(5_000).optional(),
   private: z.boolean().optional(),
   base: z.string().min(1).max(200).optional(),
+  template: taskTemplateIdSchema.optional(),
 });
 
 export const editOpSchema = z.discriminatedUnion('op', [
