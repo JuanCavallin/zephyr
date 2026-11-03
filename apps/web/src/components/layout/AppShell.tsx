@@ -5,6 +5,8 @@ import { api } from '../../lib/api';
 import { Icon, Mark } from '../ui/Icon';
 import { Nav } from './Nav';
 import { applyTheme, readStoredTheme, type ThemeId } from '../../lib/theme';
+import { useInbox } from '../../hooks/useBoard';
+import { needsYou } from '../../lib/board';
 
 const HarnessContext = createContext<{ providers: ProviderStatus[]; openConnection: () => void }>({
   providers: [],
@@ -123,6 +125,7 @@ export function AppShell({ children }: { children: ReactNode }) {
                               : 'Conversation'}
               </strong>
             </div>
+            <NeedsYou />
             <button
               className={`harness-button ${connected ? 'connected' : ''}`}
               onClick={() => setConnectionOpen(true)}
@@ -223,5 +226,17 @@ export function AppShell({ children }: { children: ReactNode }) {
         </dialog>
       </div>
     </HarnessContext.Provider>
+  );
+}
+
+/** Approvals, blocked tasks and scope requests waiting on a person, on every page. */
+function NeedsYou() {
+  const { items } = useInbox();
+  const summary = needsYou(items);
+  if (!summary) return null;
+  return (
+    <Link to={summary.to} className="needs-you-chip" title={summary.label} aria-label={'Needs you: ' + summary.label}>
+      Needs you <span>{summary.count}</span>
+    </Link>
   );
 }

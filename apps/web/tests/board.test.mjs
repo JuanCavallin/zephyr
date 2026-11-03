@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { boardReducer, emptyBoard, moved, orderedTasks, parseScope, editable, assigneeId } from '../src/lib/board.ts';
+import { boardReducer, emptyBoard, moved, orderedTasks, parseScope, editable, assigneeId, needsYou } from '../src/lib/board.ts';
 
 const at = '2026-11-02T00:00:00.000Z';
 const task = (id, over = {}) => ({
@@ -65,4 +65,18 @@ test('review helpers', () => {
   assert.equal(editable(task('a', { status: 'running' })), false);
   assert.equal(assigneeId({ kind: 'agent', harness: 'codex', tier: 'standard' }), 'codex-standard');
   assert.equal(assigneeId(undefined), 'auto');
+});
+
+test('needsYou counts what waits on a person and links to it', () => {
+  assert.equal(needsYou([]), null);
+  const approval = { kind: 'approval', at, approval: { id: 'ap1', runId: 'r9' } };
+  assert.deepEqual(needsYou([approval]), { count: 1, label: '1 approval', to: '/runs/r9' });
+  const blocked = { kind: 'blocked_task', at, boardRunId: 'b1', taskId: 't1', title: 'x', reason: 'y' };
+  assert.equal(needsYou([blocked]).to, '/board/b1');
+  const ext = { kind: 'lease_extension', at, boardRunId: 'b1', taskId: 't2', request: { id: 'e1' } };
+  assert.deepEqual(needsYou([approval, approval, blocked, ext]), {
+    count: 4,
+    label: '2 approvals · 1 blocked · 1 scope request',
+    to: '/board',
+  });
 });

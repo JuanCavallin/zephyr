@@ -198,3 +198,27 @@ export function inboxKey(item: InboxItem): string {
   if (item.kind === 'blocked_task') return 'blocked:' + item.taskId;
   return 'extension:' + item.request.id;
 }
+
+/**
+ * The header's "Needs you" chip: how many things wait on a person, what they are, and
+ * where to go. A single item links straight to it; several go to the board's inbox.
+ */
+export function needsYou(items: InboxItem[]): { count: number; label: string; to: string } | null {
+  if (items.length === 0) return null;
+  const counts = { approval: 0, blocked_task: 0, lease_extension: 0 };
+  for (const item of items) counts[item.kind]++;
+  const parts = [
+    counts.approval && `${counts.approval} approval${counts.approval === 1 ? '' : 's'}`,
+    counts.blocked_task && `${counts.blocked_task} blocked`,
+    counts.lease_extension && `${counts.lease_extension} scope request${counts.lease_extension === 1 ? '' : 's'}`,
+  ].filter(Boolean);
+  const only = items.length === 1 ? items[0]! : undefined;
+  const to = !only
+    ? '/board'
+    : only.boardRunId
+      ? '/board/' + only.boardRunId
+      : only.kind === 'approval'
+        ? '/runs/' + only.approval.runId
+        : '/board';
+  return { count: items.length, label: parts.join(' · '), to };
+}
