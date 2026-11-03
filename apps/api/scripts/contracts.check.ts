@@ -224,6 +224,8 @@ console.log('events');
 await test('coding events parse; unknown type rejected', () => {
   const events: RunEvent[] = [
     { type: 'task.created', task },
+    { type: 'task.updated', task },
+    { type: 'task.removed', taskId: 'task_2', at: AT },
     { type: 'task.status', taskId: 'task_1', from: 'pending', to: 'ready', at: AT },
     {
       type: 'task.progress',
@@ -235,6 +237,20 @@ await test('coding events parse; unknown type rejected', () => {
     { type: 'lease.denied', taskId: 'task_2', path: 'src/middleware/x.ts', mode: 'write', reason: 'held_by_other', heldBy: 'task_1', at: AT },
     { type: 'lease.extended', lease: leaseSchema.parse(lease), addedGlobs: ['src/routes.ts'] },
     { type: 'lease.expired', leaseId: 'lease_1', taskId: 'task_1', at: AT },
+    {
+      type: 'intent.updated',
+      intent: {
+        id: 'int_1',
+        taskId: 'task_1',
+        path: 'package.json',
+        kind: 'add_dependency',
+        description: 'add dependency zod@4',
+        payload: { name: 'zod', version: '^4.0.0' },
+        status: 'applied',
+        createdAt: AT,
+      },
+    },
+    { type: 'merge.result', taskId: 'task_1', outcome: 'merged', commit: 'abc123', detail: '3 tests passed', at: AT },
     { type: 'learning.signal', signal },
     { type: 'learning.candidate', candidate: { kind: 'preference', preference: preferenceSchema.parse(preference) } },
     { type: 'learning.activated', entry: 'preference', id: 'pref_1', version: 1, at: AT },

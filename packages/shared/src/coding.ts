@@ -595,7 +595,11 @@ export interface RoutingSeam {
  * Fire and forget from the caller's side: learning is off the critical path.
  */
 export interface SignalSeam {
-  recordSignal(s: PreferenceSignal): Promise<void>;
+  /**
+   * `evidence.detail` is local-only supporting text (e.g. the edit diff behind a
+   * `user_edit`); it stays in the profile and is never part of the signal contract.
+   */
+  recordSignal(s: PreferenceSignal, evidence?: { detail?: string }): Promise<void>;
 }
 
 /* -------------------------------------------------------------------------- */
