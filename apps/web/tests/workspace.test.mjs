@@ -20,6 +20,7 @@ const empty = {
   scheduleDecisions: [],
   piiSpans: [],
   logs: [],
+  codingWork: [],
   lastSeq: 0,
 };
 const step = (id, parentStepId = null) => ({

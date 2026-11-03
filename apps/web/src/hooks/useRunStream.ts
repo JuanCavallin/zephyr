@@ -9,7 +9,7 @@
  */
 
 import { useEffect, useReducer, useRef, useState } from 'react';
-import { emptyRunView, isTerminal, type RunEvent, type RunView } from '@htn/shared';
+import { emptyRunView, isRunWorkEvent, isTerminal, type RunEvent, type RunView } from '@htn/shared';
 import { api } from '../lib/api';
 
 function upsert<T extends { id: string }>(list: T[], item: T): T[] {
@@ -112,6 +112,9 @@ export function runReducer(state: RunView, event: RunEvent | { type: 'reset' }):
       };
 
     default:
+      // Gateway calls, checkpoints, turn ends and test selections feed the Workspace
+      // and token panels; they arrive in order and are never revised, so append.
+      if (isRunWorkEvent(event)) return { ...state, codingWork: [...state.codingWork, event] };
       // An older tab must not break when the server learns a new event type.
       return state;
   }

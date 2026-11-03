@@ -16,6 +16,7 @@ const base = {
   toolLifecycle: [],
   agentSessions: [],
   logs: [],
+  codingWork: [],
   lastSeq: 0,
 };
 

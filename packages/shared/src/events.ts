@@ -103,6 +103,19 @@ export interface StoredEvent {
   at: Iso;
 }
 
+export const RUN_WORK_EVENT_TYPES = [
+  'gateway.call',
+  'gateway.blocked',
+  'harness.turn.ended',
+  'workspace.checkpoint',
+  'verify.tests',
+] as const satisfies readonly CodingEvent['type'][];
+export type RunWorkEvent = Extract<CodingEvent, { type: (typeof RUN_WORK_EVENT_TYPES)[number] }>;
+
+export function isRunWorkEvent(event: { type: string }): event is RunWorkEvent {
+  return (RUN_WORK_EVENT_TYPES as readonly string[]).includes(event.type);
+}
+
 /**
  * Everything the RunDetail page renders, rebuilt from the event stream alone.
  * The reducer that produces this lives in apps/web/src/hooks/useRunStream.ts.
@@ -129,6 +142,12 @@ export interface RunView {
    */
   toolLifecycle: ToolLifecycleEvent[];
   agentSessions: AgentSessionState[];
+  /**
+   * The coding-run events the Workspace and token panels read: model calls through the
+   * gateway (usage per call), budget blocks, turn ends, per-turn checkpoints and test
+   * selections. Appended in arrival order.
+   */
+  codingWork: RunWorkEvent[];
   logs: { level: 'info' | 'warn' | 'error'; message: string; at: Iso }[];
   /** Highest `seq` applied. Used as the replay cursor on reconnect. */
   lastSeq: number;
@@ -147,6 +166,7 @@ export const emptyRunView: RunView = {
   harnessTurns: [],
   toolLifecycle: [],
   agentSessions: [],
+  codingWork: [],
   logs: [],
   lastSeq: 0,
 };

@@ -16,6 +16,7 @@ const empty = {
   scheduleDecisions: [],
   piiSpans: [],
   logs: [],
+  codingWork: [],
   lastSeq: 0,
 };
 
