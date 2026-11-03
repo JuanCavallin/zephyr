@@ -125,6 +125,10 @@ integration branch. `main` is untouched.
   - `zephyr up --check` reports the mode.
   - `--wait` exits 0 when the work is merged, 3 when it needs you (an inbox item for this
     board), and 1 when it failed or timed out.
+  - `--variants 2|3` builds that many versions of every task, through the same board edit
+    as the card's "Build" selector. When more than one works, "Needs you" shows a picker
+    (cacp-08's `VariantPicker`), and `--wait` exits 3. Checked in `check:cli`,
+    `board.check.ts` section 9 and the web tests. It has not been run on a real harness.
 
 **Checks:** `check:benchmark-coding`, `check:cli`, `check:cli-e2e`, `check:workspace-view`,
 `check:board` and the web tests all pass.
