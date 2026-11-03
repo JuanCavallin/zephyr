@@ -68,5 +68,11 @@ and see it in the context pack; revert removes it.
 All tasks have checks in `apps/api/scripts/learning.check.ts` (`pnpm check:learning`), with the
 privacy lookup for UI signals in `board.check.ts`. Web: `/learned` (feed, revert, accept,
 restore, promote, propose, export, forget everything), thumbs on finished board tasks, and
-`components/learning/Feedback.tsx` `VariantPicker`. **Gap:** no surface produces variants yet,
-so the picker is wired to `POST /api/learning/signals/variant-pick` but not mounted anywhere.
+`components/learning/Feedback.tsx` `VariantPicker`.
+
+Boards now produce variants. Set "Build: 2/3 variants" on a card, or run
+`zephyr run --variants 2|3`. More than one working variant puts a `variant_pick` item in "Needs
+you", and the picker is mounted there. The pick goes to
+`POST /api/tasks/:boardId/tasks/:taskId/variants/pick`, which records the signal, with chosen
+and rejected set, and merges the chosen branch. Covered by `board.check.ts` section 9 and the
+web tests. **Gap:** a variant shows its changed files but no screenshot yet.

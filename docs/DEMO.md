@@ -96,6 +96,8 @@ The board merges with git, so set `GIT_MODE=live` in `.env` first (task branches
 1. **Type a feature.** `pnpm zephyr run "<the feature>" --template add-feature`. Zephyr
    plans a board and starts it. `--plan` creates it without starting so you can show the
    plan first. `--wait` follows it to the end: exit 0 merged, 3 needs you, 1 failed.
+   `--variants 2` builds two versions of each task. When both work, "Needs you" asks you to
+   pick one, and the pick is recorded as a learning signal.
 2. **Board (`/board/:id`).** The tasks run in parallel, each in its own worktree and limited to
    the files its lease covers. An edit outside the lease is denied, not merged. Protected
    paths and CI config changes wait for approval.

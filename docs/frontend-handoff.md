@@ -165,6 +165,26 @@ All routes below are under `/api` unless shown otherwise.
 | Reviewed tool catalog | `GET /tools`                     | registered tools and availability                                                                                                      |
 | Task tool discovery   | `POST /tools/discover`           | body: `{ query, toolkits?, limit? }`                                                                                                   |
 
+### Boards (coding tasks)
+
+The board UI (`apps/web/src/pages/Board.tsx`) and `zephyr run` both use these. Boards need
+`GIT_MODE=live`; on mock git "Run ready tasks" answers `503 BOARD_UNAVAILABLE`.
+
+| Purpose        | Method and path                                    | Notes                                                                                                   |
+| -------------- | -------------------------------------------------- | ------------------------------------------------------------------------------------------------------- |
+| Create board   | `POST /tasks`                                      | body: `{ request, template?, private?, base? }`; returns the planned board, nothing runs                |
+| Board          | `GET /tasks/:boardId`                              | run, tasks, waves                                                                                       |
+| Edit plan      | `PATCH /tasks/:boardId`                            | body: `{ ops }`, applied atomically; an `update` op may set `variants: 2 \| 3 \| null`                  |
+| Run            | `POST /tasks/:boardId/run`                         | body: `{ concurrency?, autoMergeGreen? }`                                                               |
+| Needs you      | `GET /tasks/inbox`, `GET /tasks/inbox/stream`      | items by `kind`: approvals, blocked tasks, lease extensions, and `variant_pick`                         |
+| Pick a variant | `POST /tasks/:boardId/tasks/:taskId/variants/pick` | body: `{ variantId }`; records the `variant_pick` signal itself, so do not also post it to `/learning` |
+
+A task with `variants` set builds 2 or 3 versions, each in its own worktree. If more than one
+works, the task waits in review and the inbox carries
+`{ kind: 'variant_pick', boardRunId, taskId, title, variants: [{ id, label, branch, filesChanged, files }] }`.
+The pick merges the chosen one and discards the rest. If exactly one works, it merges without
+asking. If none does, the task fails. Fix tasks never fan out.
+
 Error bodies are consistently shaped as:
 
 ```json
