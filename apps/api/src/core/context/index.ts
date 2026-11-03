@@ -13,6 +13,7 @@ import type { DecisionService } from '../decisions/service.js';
 import { decisionStateFromSession } from '../sessions/decisionState.js';
 import { buildContextPack, type ContextPack, type ContextPackOptions } from './pack.js';
 import { buildRepoIndex } from './repoIndex.js';
+import { withKnowledge, type KnowledgeLoader } from '../learning/relevance.js';
 
 export { buildContextPack, type ContextPack, type ContextPackOptions } from './pack.js';
 export { buildRepoIndex, type RepoIndex } from './repoIndex.js';
@@ -28,6 +29,8 @@ export interface ContextPackBuilderDeps {
   sessions?: { get(id: string): Promise<AgentSessionState | null> };
   emit?: (runId: string, event: RunEvent) => Promise<unknown> | unknown;
   options?: Omit<ContextPackOptions, 'scorer' | 'run' | 'emit'>;
+  /** Step 8: learned preferences and skills relevant to the task, appended to the pack. */
+  knowledge?: KnowledgeLoader;
 }
 
 const UNSANITIZED: Pick<DecisionState, 'sanitizedForRemote' | 'dataLabels'> = {
@@ -48,12 +51,23 @@ export function createContextPackBuilder(deps: ContextPackBuilderDeps): ContextP
         remoteTask = state.taskSummary;
       }
     }
-    return buildContextPack(task, repo, {
+    const pack = await buildContextPack(task, repo, {
       ...deps.options,
       scorer: (input) => deps.decisions.scoreFiles(eligibility, { ...input, task: remoteTask }, ctx),
       run: { runId: ctx.runId, ...(ctx.stepId ? { stepId: ctx.stepId } : {}) },
       ...(deps.emit ? { emit: deps.emit } : {}),
     });
+    if (!deps.knowledge) return pack;
+    // Learned knowledge is extra: failing to load it costs the section, never the pack.
+    try {
+      const items = await deps.knowledge(
+        { task: remoteTask, paths: pack.files.map((f) => f.path), worktree, eligibility },
+        ctx,
+      );
+      return withKnowledge(pack, items);
+    } catch {
+      return { ...pack, reasonCodes: [...pack.reasonCodes, 'learned-knowledge-failed'] };
+    }
   };
 }
 

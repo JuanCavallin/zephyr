@@ -12,6 +12,7 @@
  *   5. Jev scoring: new / duplicate / contradicts, and the fallback.
  *   6. Lifecycle: threshold crossing, contradiction, revert and restore.
  *   7. Learning pass: edit -> candidate -> active.
+ *   8. Relevance: Jev or keyword overlap, the token cap, the learned pack section.
  */
 
 process.env.PERSIST_TO_DISK = 'false';
@@ -901,6 +902,174 @@ await test('pass: edit -> mock draft -> mock Jev -> candidate, reinforced until 
   assert.deepEqual(e3.evidence, ['sig_p1', 'sig_p2', 'sig_p3']);
   assert.ok(events.some((e) => e.type === 'learning.activated'));
   assert.deepEqual((await runLearningPass(deps)).signals, 0, 'nothing left to do');
+  store.close();
+});
+
+console.log('8. relevance and the context pack');
+
+const {
+  relevantKnowledge,
+  renderKnowledge,
+  withKnowledge,
+  createKnowledgeLoader,
+  keywordOverlap,
+  KNOWLEDGE_HEADER,
+  PROJECT_BOOST,
+} = await import('../src/core/learning/relevance.js');
+const { estimateTokens } = await import('../src/core/context/pack.js');
+const { createContextPackBuilder, goalWithContextPack } = await import('../src/core/context/index.js');
+type KnowledgeEntriesCall = { task: string; paths: string[]; entries: { id: string; text: string }[] };
+
+function activeStore(entries: LearnedEntry[]) {
+  const store = new ProfileStore(':memory:');
+  for (const e of entries) for (let v = 1; v <= e.version; v++) store.putEntry({ ...e, version: v }, 'fixture');
+  return store;
+}
+
+await test('relevance: top-k under the token cap, skipped not truncated', async () => {
+  const long = 'Parser helpers return early on empty input. '.repeat(20);
+  const store = activeStore([
+    entry('pref_a', { status: 'active', text: long, confidence: 0.9 }),
+    entry('pref_b', { status: 'active', text: 'Parser tests cover empty input.', confidence: 0.8 }),
+    entry('pref_c', { status: 'active', text: 'Parser errors name the offending token.', confidence: 0.7 }),
+    entry('pref_d', { status: 'active', text: 'Parser exports are named, not default.', confidence: 0.6 }),
+  ]);
+  const deps = { store, decisions: mockJev() };
+  const task = 'fix the parser on empty input';
+  const all = await relevantKnowledge(deps, task, 10_000);
+  assert.ok(all.length >= 3, 'related entries load when the cap allows');
+  for (const cap of [40, 60, 120, 200]) {
+    const items = await relevantKnowledge(deps, task, cap);
+    assert.ok(estimateTokens(renderKnowledge(items)) <= cap, `cap ${cap} respected`);
+    assert.ok(!items.some((i) => i.id === 'pref_a'), 'the long entry does not fit, and is not cut');
+  }
+  assert.ok((await relevantKnowledge(deps, task, 120)).length >= 1, 'smaller entries still fill the cap');
+  assert.equal((await relevantKnowledge(deps, task, 10_000, { topK: 2 })).length, 2, 'top-k');
+  assert.deepEqual(await relevantKnowledge(deps, task, 0), []);
+  store.close();
+});
+
+await test('relevance: project knowledge outranks personal taste in shared code', async () => {
+  const store = activeStore([
+    entry('pref_me', { status: 'active', scope: 'personal', confidence: 0.95, text: 'Parser functions return early.' }),
+    entry('pref_team', { status: 'active', scope: 'project', confidence: 0.75, text: 'Parser functions return a Result.' }),
+  ]);
+  const deps = { store, decisions: mockJev() };
+  const task = 'refactor the parser functions';
+  const mine = await relevantKnowledge(deps, task, 1000, { shared: false });
+  assert.deepEqual(mine.map((i) => i.id), ['pref_me', 'pref_team'], 'own repo: equal relevance, confidence decides');
+  const team = await relevantKnowledge(deps, task, 1000, { shared: true });
+  assert.deepEqual(team.map((i) => i.id), ['pref_team', 'pref_me'], 'shared code: project first');
+  assert.equal(team[0]!.score, mine[1]!.score, 'the boost reorders, it does not rewrite the score');
+  assert.ok(PROJECT_BOOST > 0);
+  const unrelated = activeStore([entry('pref_x', { status: 'active', scope: 'project', text: 'Release notes use past tense.' })]);
+  assert.deepEqual(
+    await relevantKnowledge({ store: unrelated, decisions: mockJev() }, task, 1000, { shared: true }),
+    [],
+    'the boost never pulls in an unrelated entry',
+  );
+  store.close();
+  unrelated.close();
+});
+
+await test('relevance: Jev scores, and keyword overlap when Jev cannot', async () => {
+  const store = activeStore([
+    entry('pref_a', { status: 'active', text: 'Parser functions return early.' }),
+    entry('pref_b', { status: 'active', text: 'Release notes use past tense.' }),
+  ]);
+  const calls: KnowledgeEntriesCall[] = [];
+  const jev = jevStub({
+    scoreKnowledge: async (input: KnowledgeEntriesCall) => {
+      calls.push(input);
+      return { ok: true, data: { scores: { pref_a: 0.1, pref_b: 0.9 }, reasonCodes: ['stub'] }, meta: jevMeta };
+    },
+  } as never);
+  const viaJev = await relevantKnowledge({ store, decisions: jev }, 'parser cleanup', 1000);
+  assert.deepEqual(viaJev.map((i) => [i.id, i.source]), [['pref_b', 'jev']], 'Jev decides, overlap ignored');
+  assert.equal(calls.length, 1, 'one request for all entries');
+
+  const down = jevStub({ scoreKnowledge: async () => ({ ok: false, error: { code: 'UPSTREAM', message: 'x', retryable: true }, meta: jevMeta }) } as never);
+  const viaFallback = await relevantKnowledge({ store, decisions: down }, 'parser cleanup', 1000);
+  assert.deepEqual(viaFallback.map((i) => [i.id, i.source]), [['pref_a', 'fallback']]);
+  const unsupported = await relevantKnowledge({ store, decisions: jevStub({}) }, 'parser cleanup', 1000);
+  assert.deepEqual(unsupported.map((i) => i.id), ['pref_a']);
+  const ineligible = await relevantKnowledge({ store, decisions: jev }, 'parser cleanup', 1000, {
+    eligibility: { sanitizedForRemote: false, dataLabels: ['private'] },
+  });
+  assert.equal(calls.length, 1, 'an unsanitized task never reaches a live Jev');
+  assert.deepEqual(ineligible.map((i) => i.source), ['fallback']);
+  assert.equal(keywordOverlap('fix parse', ['src/parse.ts'], 'parse early'), 0.5);
+  store.close();
+});
+
+await test('relevance: private entries stay local and load only into private runs', async () => {
+  const store = activeStore([
+    entry('pref_open', { status: 'active', text: 'Parser functions return early.' }),
+    entry('pref_secret', { status: 'active', private: true, text: 'Parser functions log to the audit sink.' }),
+  ]);
+  const calls: KnowledgeEntriesCall[] = [];
+  const jev = jevStub({
+    scoreKnowledge: async (input: KnowledgeEntriesCall) => {
+      calls.push(input);
+      return { ok: true, data: { scores: Object.fromEntries(input.entries.map((e) => [e.id, 0.9])), reasonCodes: [] }, meta: jevMeta };
+    },
+  } as never);
+  const remote = await relevantKnowledge({ store, decisions: jev }, 'parser functions', 1000);
+  assert.deepEqual(remote.map((i) => i.id), ['pref_open'], 'a remote agent never reads a private entry');
+  const local = await relevantKnowledge({ store, decisions: jev }, 'parser functions', 1000, { includePrivate: true });
+  assert.deepEqual(local.map((i) => i.id).sort(), ['pref_open', 'pref_secret']);
+  assert.equal(local.find((i) => i.id === 'pref_secret')!.source, 'fallback', 'scored by keyword overlap, here');
+  for (const call of calls) assert.ok(!call.entries.some((e) => e.id === 'pref_secret'), 'private text never sent to Jev');
+  store.close();
+});
+
+await test('pack: learned section after the files, labelled guidance, run tagged with skills', async () => {
+  const { worktree } = await editRepo('pack');
+  const store = activeStore([
+    entry('pref_early', { status: 'active', version: 3, text: 'Parser functions return early on empty input.' }),
+    entry('skill_parse', {
+      status: 'active',
+      kind: 'skill',
+      version: 2,
+      text: 'Write a parser',
+      skill: { name: 'parser-style', description: 'How parser functions are written here', body: 'Return early; trim input.' },
+    }),
+    entry('pref_cand', { status: 'candidate', text: 'Parser functions are pure.' }),
+    entry('pref_gone', { status: 'retired', text: 'Parser functions use classes.' }),
+  ]);
+  const decisions = mockJev();
+  const build = createContextPackBuilder({
+    decisions,
+    knowledge: createKnowledgeLoader({ store, decisions, shared: () => false }),
+  });
+  const pack = await build({ task: 'make the parser handle empty input', worktree }, { runId: 'run_pack', policyRule: 'test' });
+  const at = pack.prompt.indexOf(KNOWLEDGE_HEADER);
+  assert.ok(at >= 0, pack.prompt);
+  assert.match(KNOWLEDGE_HEADER, /guidance, not permissions/);
+  assert.ok(pack.prompt.includes('[pref_early v3]'));
+  assert.ok(pack.prompt.includes('Return early; trim input.'), 'a skill loads with its body');
+  assert.ok(!pack.prompt.includes('pref_cand') && !pack.prompt.includes('pref_gone'), 'only active entries load');
+  if (pack.files.length > 0) assert.ok(pack.prompt.indexOf('Repository context') < at, 'files first');
+  assert.deepEqual(pack.knowledge!.map((k) => [k.id, k.version]).sort(), [['pref_early', 3], ['skill_parse', 2]]);
+  assert.equal(pack.tokens, estimateTokens(pack.prompt));
+  assert.deepEqual(
+    store.skillRuns().map((t) => [t.runId, t.skillId, t.skillVersion]),
+    [['run_pack', 'skill_parse', 2]],
+    'step 9 can compare runs with and without the skill',
+  );
+  const goal = goalWithContextPack('make the parser handle empty input', pack);
+  assert.ok(goal.indexOf(KNOWLEDGE_HEADER) < goal.indexOf('Task:\n'));
+
+  const broken = createContextPackBuilder({
+    decisions,
+    knowledge: async () => {
+      throw new Error('profile locked');
+    },
+  });
+  const bare = await broken({ task: 'make the parser handle empty input', worktree }, { runId: 'run_pack2', policyRule: 'test' });
+  assert.ok(!bare.prompt.includes(KNOWLEDGE_HEADER));
+  assert.ok(bare.reasonCodes.includes('learned-knowledge-failed'), 'a profile failure costs the section, not the pack');
+  assert.equal(withKnowledge(bare, []), bare);
   store.close();
 });
 

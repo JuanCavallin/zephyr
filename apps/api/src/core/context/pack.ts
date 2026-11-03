@@ -40,6 +40,8 @@ export interface ContextPack {
   tokens: number;
   cached: boolean;
   reasonCodes: string[];
+  /** Step 8: learned entries loaded into the prompt (ids and versions, for run tagging and the UI). */
+  knowledge?: { id: string; version: number; kind: 'pref' | 'skill'; score: number; source: PackSource }[];
 }
 
 /** Scores candidate files; null scores mean "use the deterministic rank". */
