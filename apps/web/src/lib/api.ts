@@ -28,6 +28,7 @@ import type {
   ActionPreview,
   BrowserViewer,
   BenchmarkReport,
+  CodingBenchmarkReport,
   GraphReuseReport,
   ToolLifecycleEvent,
   Assignee,
@@ -60,6 +61,28 @@ export interface RunDetail {
   egress: EgressEvent[];
   piiSpans: PiiSpan[];
   toolLifecycle?: ToolLifecycleEvent[];
+}
+
+/** GET /runs/:id/workspace (apps/api/src/services/runWorkspace.service.ts). */
+export interface RunWorkspaceCheckpoint {
+  turn: number;
+  turnId: string;
+  ref: string;
+  treeHash?: string;
+  at: string;
+}
+export interface RunWorkspaceCheckpoints {
+  checkpoints: RunWorkspaceCheckpoint[];
+  /** False once the worktree is gone (run finished or reaped): no diff, no rewind. */
+  live: boolean;
+}
+export interface RunWorkspaceDiff {
+  stat: string;
+  hash: string;
+  patch: string;
+  /** The patch was cut at the server's limit; the stat is whole. */
+  truncated: boolean;
+  since?: string;
 }
 
 export class ApiError extends Error {
@@ -258,6 +281,25 @@ export const api = {
           ...(warmth !== 'all' ? { warmth } : {}),
         }).toString(),
     ),
+
+  /** The coding benchmark: harness alone vs harness under Zephyr, plus leave-one-out arms. */
+  codingBenchmark: () => request<CodingBenchmarkReport>('/benchmarks/coding'),
+
+  /** Checkpoints of a coding run's worktree, and whether the worktree is still on disk. */
+  runWorkspace: (id: string) => request<RunWorkspaceCheckpoints>('/runs/' + id + '/workspace'),
+
+  /** The run's diff against its base, or against one of its own checkpoints. */
+  runWorkspaceDiff: (id: string, since?: string) =>
+    request<RunWorkspaceDiff>(
+      '/runs/' + id + '/workspace/diff' + (since ? '?' + new URLSearchParams({ since }) : ''),
+    ),
+
+  /** Restore the worktree to a checkpoint. Refused unless the run is paused or awaiting approval. */
+  rewindWorkspace: (id: string, ref: string) =>
+    request<{ checkpoint: RunWorkspaceCheckpoint }>('/runs/' + id + '/workspace/rewind', {
+      method: 'POST',
+      body: JSON.stringify({ ref }),
+    }),
 
   listRuns: (filter: { graphId?: string; kind?: string; status?: string; limit?: number } = {}) => {
     const params = new URLSearchParams();

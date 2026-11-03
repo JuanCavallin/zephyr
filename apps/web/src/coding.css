@@ -1,0 +1,133 @@
+/* Coding-run panels on the run page (components/coding/CodingWorkPanel.tsx). */
+
+.coding-turns,
+.coding-rows {
+  list-style: none;
+  margin: 12px 0 0;
+  padding: 0;
+}
+.coding-turns li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 12px;
+  padding: 7px 0;
+  border-bottom: 1px solid var(--line);
+  font-size: 11px;
+  color: var(--secondary);
+}
+.coding-turns strong {
+  min-width: 64px;
+  color: var(--text-2);
+  font-weight: 500;
+}
+.coding-turns em {
+  color: var(--quiet);
+  font-style: normal;
+}
+.coding-lever {
+  padding: 1px 7px;
+  border: 1px solid var(--accent-line);
+  border-radius: 999px;
+  color: var(--accent-text);
+  font-variant-numeric: tabular-nums;
+}
+.coding-note {
+  color: var(--quiet);
+}
+.coding-warn {
+  color: var(--amber-text);
+}
+.coding-section {
+  margin-top: 16px;
+}
+.coding-section > header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+.coding-section h4 {
+  margin: 0;
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--text-2);
+}
+.coding-section small,
+.coding-section label {
+  color: var(--quiet);
+  font-size: 10px;
+}
+.coding-section select {
+  background: var(--panel);
+  color: var(--text-2);
+  border: 1px solid var(--line-2);
+  border-radius: 6px;
+  font-size: 10px;
+  padding: 2px 4px;
+}
+.coding-rows li {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 12px;
+  padding: 6px 0;
+  border-bottom: 1px solid var(--line);
+  font-size: 11px;
+  color: var(--secondary);
+}
+.coding-rows time {
+  margin-left: 6px;
+  color: var(--quiet);
+}
+.coding-command {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-2);
+}
+.coding-class {
+  padding: 1px 7px;
+  border-radius: 999px;
+  border: 1px solid var(--line-3);
+  color: var(--quiet);
+  font-size: 10px;
+}
+.coding-class-verify,
+.coding-class-inspect {
+  border-color: var(--accent-line);
+  color: var(--accent-text);
+}
+.coding-class-mutate_env,
+.coding-class-network {
+  border-color: var(--amber-line);
+  color: var(--amber-text);
+}
+.coding-stat,
+.coding-patch {
+  margin: 10px 0 0;
+  padding: 10px 12px;
+  background: var(--panel-sunken);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  font-size: 10px;
+  line-height: 1.5;
+  color: var(--secondary);
+  overflow-x: auto;
+  white-space: pre;
+}
+.coding-patch {
+  max-height: 420px;
+  overflow-y: auto;
+}
+.coding-section details summary {
+  margin-top: 8px;
+  font-size: 10px;
+  color: var(--quiet);
+  cursor: pointer;
+}
+.coding-empty {
+  margin: 8px 0 0;
+  font-size: 11px;
+  color: var(--quiet);
+}

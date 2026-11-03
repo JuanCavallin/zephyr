@@ -179,3 +179,24 @@ test('budget blocks show on the turn they stopped', () => {
   });
   assert.deepEqual(w.turns[0].blocked, ['Token budget reached']);
 });
+
+test('rewind is offered only where the API would accept it', async () => {
+  const { rewindGate } = await import('../src/lib/runWork.ts');
+  assert.deepEqual(rewindGate('paused', true), { allowed: true });
+  assert.deepEqual(rewindGate('awaiting_approval', true), { allowed: true });
+  assert.equal(rewindGate('running', true).allowed, false);
+  assert.equal(rewindGate('pending', true).allowed, false);
+  assert.match(rewindGate('succeeded', true).reason, /finished/);
+  assert.match(rewindGate('paused', false).reason, /no longer on disk/);
+  assert.equal(rewindGate(undefined, true).allowed, false);
+});
+
+test('shell outcomes read as what happened', async () => {
+  const { shellOutcome } = await import('../src/lib/runWork.ts');
+  const row = (phase, policy, allowed) => ({ actionId: 'a', toolId: 'shell.exec', command: 'x', phase, policy, allowed, reasons: [], at: 't' });
+  assert.equal(shellOutcome(row('succeeded', 'auto', true)), 'Ran automatically');
+  assert.equal(shellOutcome(row('succeeded', 'ask_user', true)), 'Ran after approval');
+  assert.equal(shellOutcome(row('blocked', 'block', false)), 'Blocked');
+  assert.equal(shellOutcome(row('awaiting_approval', 'ask_user', false)), 'Waiting for you');
+  assert.equal(shellOutcome(row('policy_decided', 'block', false)), 'Not allowed');
+});

@@ -3,6 +3,7 @@
 @import './actions.css';
 @import './board.css';
 @import './learned.css';
+@import './coding.css';
 
 /*
  * Tailwind v4 — theme tokens are declared here, not in a JS config file.

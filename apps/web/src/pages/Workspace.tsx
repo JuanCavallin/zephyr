@@ -32,6 +32,8 @@ import { EgressLedger } from '../components/egress/EgressLedger';
 import { Icon, Mark } from '../components/ui/Icon';
 import { ActionWorkspace } from '../components/actions/ActionWorkspace';
 import { actionStatus, groupActions } from '../lib/actions';
+import { hasRunWork, runWork } from '../lib/runWork';
+import { TokenPanel, WorkspacePanel } from '../components/coding/CodingWorkPanel';
 
 function WorkingStatus({ children, active = true }: { children: ReactNode; active?: boolean }) {
   return (
@@ -648,6 +650,8 @@ export function LiveRunWorkspace() {
   const { tools } = useTools();
   const catalog = useMemo(() => new Map(tools.map((tool) => [tool.name, tool])), [tools]);
   const trace = useMemo(() => buildTrace(view, graph, now, catalog), [view, graph, now, catalog]);
+  // Coding runs: usage per turn, checkpoints, shell decisions and shaped results.
+  const work = useMemo(() => runWork(view), [view.codingWork, view.toolLifecycle]);
   const terminal = !!view.run && isTerminal(view.run.status);
   // Read from the run, never from a local click -- pause lands at the next step
   // boundary, so the server is the only thing that knows when it took effect.
@@ -915,6 +919,12 @@ export function LiveRunWorkspace() {
                   ))}
                 </ul>
               </section>
+            )}
+            {hasRunWork(work) && (
+              <>
+                <TokenPanel work={work} />
+                <WorkspacePanel run={view.run} work={work} />
+              </>
             )}
             {/* A failed run's summary is usually the error message itself. */}
             {view.run?.error && view.run.error.message !== view.run.summary && (

@@ -237,3 +237,45 @@ export function runWork(view: Pick<RunView, 'codingWork' | 'toolLifecycle'>): Ru
 export function hasRunWork(w: RunWork): boolean {
   return w.totals.calls > 0 || w.checkpoints.length > 0 || w.shell.length > 0 || w.levers.length > 0;
 }
+
+/** Whether the Workspace panel may offer rewind; mirrors the API's own refusals. */
+export function rewindGate(
+  status: string | undefined,
+  live: boolean,
+): { allowed: true } | { allowed: false; reason: string } {
+  if (!status) return { allowed: false, reason: 'Waiting for the run to load.' };
+  if (status === 'succeeded' || status === 'failed' || status === 'cancelled')
+    return { allowed: false, reason: 'The run has finished; its worktree is gone.' };
+  if (!live) return { allowed: false, reason: 'The worktree is no longer on disk.' };
+  if (status === 'running' || status === 'pending')
+    return { allowed: false, reason: 'Pause the run to rewind: the agent is still editing.' };
+  return { allowed: true };
+}
+
+/** Plain words for Zephyr's shell classes. */
+export const SHELL_CLASS_LABEL: Record<string, string> = {
+  inspect: 'Read-only',
+  verify: 'Runs checks',
+  mutate_env: 'Changes the environment',
+  network: 'Network',
+  unknown: 'Unclassified',
+};
+
+/** What the person sees for a shell row's outcome. */
+export function shellOutcome(row: ShellRow): string {
+  switch (row.phase) {
+    case 'succeeded':
+      return row.policy === 'auto' ? 'Ran automatically' : 'Ran after approval';
+    case 'failed':
+      return 'Ran, exited with an error';
+    case 'blocked':
+      return 'Blocked';
+    case 'approved':
+    case 'executing':
+      return 'Running';
+    case 'awaiting_approval':
+      return 'Waiting for you';
+    default:
+      return row.allowed === false ? 'Not allowed' : 'Proposed';
+  }
+}
