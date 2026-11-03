@@ -79,6 +79,9 @@ export function Benchmarks() {
           </p>
         </div>
         <div className="flex items-center gap-3 text-sm">
+          <Link to="/compare" className="text-sky-300 hover:underline">
+            Coding: harness vs Zephyr →
+          </Link>
           <button
             className="rounded-md border border-slate-700 px-2.5 py-1.5 text-slate-200"
             disabled={!report}

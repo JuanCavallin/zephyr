@@ -36,6 +36,7 @@ import { humanStatus, msLabel, relativeTime, RUN_STATUS_TONE } from '../lib/form
 import { Badge } from '../components/ui/Badge';
 import { Card } from '../components/ui/Card';
 import { Spinner } from '../components/ui/Spinner';
+import { CodingCompare } from '../components/coding/CodingCompare';
 
 interface Side {
   run: Run;
@@ -115,11 +116,8 @@ export function Compare() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [idsKey]);
 
-  if (ids.length < 2) {
-    return (
-      <p className="text-sm text-rose-400">Compare needs at least two run ids: ?a=...&b=...</p>
-    );
-  }
+  // No run ids: the coding benchmark's harness-vs-harness-under-Zephyr view.
+  if (ids.length < 2) return <CodingCompare />;
   if (error) return <p className="text-sm text-rose-400">{error}</p>;
   if (!sides) {
     return (

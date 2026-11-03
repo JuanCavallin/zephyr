@@ -128,13 +128,14 @@ export function WorkspacePanel({ run, work }: { run: Run | null; work: RunWork }
     }
   };
 
-  const changed = diff ? diff.stat.trim().split('\n').filter(Boolean).length : 0;
+  // git's own summary line: " 3 files changed, 40 insertions(+), 2 deletions(-)".
+  const changed = diff ? Number(/(\d+) files? changed/.exec(diff.stat)?.[1] ?? 0) : 0;
   return (
     <details className="run-details coding-panel" open>
       <summary>
         Workspace{' '}
         <span>
-          {live ? (diff ? `${Math.max(changed - 1, 0)} files changed` : 'reading the worktree') : 'worktree closed'} ·{' '}
+          {live ? (diff ? `${changed} file${changed === 1 ? '' : 's'} changed` : 'reading the worktree') : 'worktree closed'} ·{' '}
           {work.checkpoints.length} checkpoint{work.checkpoints.length === 1 ? '' : 's'} · {work.shell.length} shell
         </span>
       </summary>
