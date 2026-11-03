@@ -116,6 +116,7 @@ export interface OrchestratorDeps {
 const DEFAULT_AGENT_NETWORK_RETRIES = 2;
 
 import { KeyedLock } from './locks.js';
+import { isNetworkFailure } from '../lib/networkFailure.js';
 
 export class Orchestrator {
   private readonly inFlight = new Map<string, AbortController>();
@@ -1591,18 +1592,6 @@ type FinishedAgentRun = {
 
 /** How one launch ended. Only `unreachable` ever leads to a second run. */
 type AgentRunOutcome = FinishedAgentRun | { kind: 'unreachable'; reason: string };
-
-/**
- * Transport-level failures: the network, a provider that is down or
- * overloaded, a connection that closed. These mean the agent never got to
- * work. A refused request, a bad route or a policy error is NOT one of these,
- * and retrying it would only repeat it.
- */
-function isNetworkFailure(message: string): boolean {
-  return /\b(?:ECONN\w+|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|EPIPE|UND_ERR_\w+)\b|socket hang up|fetch failed|network|connection (?:error|closed|reset|refused|lost)|timed out|timeout|overloaded|rate.?limit|too many requests|service unavailable|bad gateway|\b(?:429|500|502|503|504|529)\b/i.test(
-    message,
-  );
-}
 
 function requiresExternalAction(goal: string): boolean {
   return /^(?:please\s+)?(?:send|email|message|reply|forward|post|publish|submit|create|update|delete|remove|invite|schedule|book|purchase|pay|transfer)\b/i.test(

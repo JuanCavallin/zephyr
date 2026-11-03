@@ -314,7 +314,7 @@ export function benchmarkSample(input: RollupInput): BenchmarkSample | null {
 /* Statistics                                                                 */
 /* -------------------------------------------------------------------------- */
 
-function quantile(values: number[], q: number): number {
+export function quantile(values: number[], q: number): number {
   if (values.length === 0) return 0;
   const sorted = [...values].sort((a, b) => a - b);
   const index = (sorted.length - 1) * q;

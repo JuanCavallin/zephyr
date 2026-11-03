@@ -1,0 +1,562 @@
+{
+  "version": 1,
+  "note": "Coding benchmark task set (docs/cacp-09-benchmark-cli-demo.md). Each fixture repo mirrors a small module of this repo. Hidden tests live outside every worktree and are copied in only after the agent stops. solution is the reference fix the mock harness replays; it is never shown to an agent.",
+  "repos": {
+    "strkit": {
+      "dir": "repos/strkit",
+      "test": "npm test"
+    },
+    "statkit": {
+      "dir": "repos/statkit",
+      "test": "npm test"
+    },
+    "taskq": {
+      "dir": "repos/taskq",
+      "test": "npm test"
+    }
+  },
+  "tasks": [
+    {
+      "id": "strkit-slug-trim",
+      "repo": "strkit",
+      "kind": "bugfix",
+      "origin": "slug helper in apps/api/src/providers/mockharness (defaultScript)",
+      "prompt": "slugify() leaves leading and trailing dashes: '  Hello, World!  ' becomes '-hello-world-'. Strip them.",
+      "hiddenTest": "hidden/strkit-slug-trim.test.mjs",
+      "solution": [
+        {
+          "tool": "Read",
+          "path": "src/slug.mjs"
+        },
+        {
+          "tool": "Edit",
+          "path": "src/slug.mjs",
+          "find": "    .replace(/[^a-z0-9]+/g, '-')\n",
+          "replace": "    .replace(/[^a-z0-9]+/g, '-')\n    .replace(/^-|-$/g, '')\n"
+        },
+        {
+          "tool": "Bash",
+          "command": "npm test"
+        }
+      ]
+    },
+    {
+      "id": "strkit-paths-backslash",
+      "repo": "strkit",
+      "kind": "bugfix",
+      "origin": "toRepoPath in packages/shared",
+      "prompt": "toRepoPath() does not understand Windows separators: \"src\\\\a\\\\b.ts\" should become \"src/a/b.ts\". Fix it.",
+      "hiddenTest": "hidden/strkit-paths-backslash.test.mjs",
+      "solution": [
+        {
+          "tool": "Read",
+          "path": "src/paths.mjs"
+        },
+        {
+          "tool": "Edit",
+          "path": "src/paths.mjs",
+          "find": "input.split('/')",
+          "replace": "input.replace(/\\\\/g, '/').split('/')"
+        },
+        {
+          "tool": "Bash",
+          "command": "npm test"
+        }
+      ]
+    },
+    {
+      "id": "strkit-paths-drive",
+      "repo": "strkit",
+      "kind": "bugfix",
+      "origin": "toRepoPath in packages/shared",
+      "prompt": "toRepoPath() accepts drive-letter paths like \"C:/Windows/x\" as repo-relative. They are absolute: return null.",
+      "hiddenTest": "hidden/strkit-paths-drive.test.mjs",
+      "solution": [
+        {
+          "tool": "Read",
+          "path": "src/paths.mjs"
+        },
+        {
+          "tool": "Edit",
+          "path": "src/paths.mjs",
+          "find": "if (input.startsWith('/')) return null;",
+          "replace": "if (input.startsWith('/') || /^[A-Za-z]:/.test(input)) return null;"
+        },
+        {
+          "tool": "Bash",
+          "command": "npm test"
+        }
+      ]
+    },
+    {
+      "id": "strkit-truncate-length",
+      "repo": "strkit",
+      "kind": "bugfix",
+      "origin": "label truncation in apps/web",
+      "prompt": "test/truncate.test.mjs fails: truncate() returns one character more than max when it cuts. Fix truncate so the result, ellipsis included, fits in max.",
+      "hiddenTest": "hidden/strkit-truncate-length.test.mjs",
+      "solution": [
+        {
+          "tool": "Read",
+          "path": "src/truncate.mjs"
+        },
+        {
+          "tool": "Edit",
+          "path": "src/truncate.mjs",
+          "find": "return text.slice(0, max) + '…';",
+          "replace": "return text.slice(0, Math.max(0, max - 1)) + '…';"
+        },
+        {
+          "tool": "Bash",
+          "command": "npm test"
+        }
+      ]
+    },
+    {
+      "id": "strkit-case-camel",
+      "repo": "strkit",
+      "kind": "feature",
+      "origin": "case helpers in apps/web",
+      "prompt": "Add camelCase(text) to src/case.mjs, next to kebabCase: 'hello world-foo' -> 'helloWorldFoo', '  Add USER id ' -> 'addUserId'.",
+      "hiddenTest": "hidden/strkit-case-camel.test.mjs",
+      "solution": [
+        {
+          "tool": "Read",
+          "path": "src/case.mjs"
+        },
+        {
+          "tool": "Edit",
+          "path": "src/case.mjs",
+          "find": ".join('-');\n}\n",
+          "replace": ".join('-');\n}\n\n/** \"hello world-foo\" -> \"helloWorldFoo\". */\nexport function camelCase(text) {\n  return text\n    .trim()\n    .split(/[^A-Za-z0-9]+/)\n    .filter(Boolean)\n    .map((w, i) => (i === 0 ? w.toLowerCase() : w[0].toUpperCase() + w.slice(1).toLowerCase()))\n    .join('');\n}\n"
+        },
+        {
+          "tool": "Bash",
+          "command": "npm test"
+        }
+      ]
+    },
+    {
+      "id": "strkit-table-pad",
+      "repo": "strkit",
+      "kind": "feature",
+      "origin": "benchmark report table in apps/api/scripts/benchmark.ts",
+      "prompt": "Add src/table.mjs exporting padTable(rows): align rows of cells into columns, each column as wide as its widest cell, columns two spaces apart, no trailing spaces. Returns an array of lines.",
+      "hiddenTest": "hidden/strkit-table-pad.test.mjs",
+      "solution": [
+        {
+          "tool": "Write",
+          "path": "src/table.mjs",
+          "content": "/** Align rows of cells into columns, two spaces apart, no trailing spaces. */\nexport function padTable(rows) {\n  const widths = [];\n  for (const row of rows) row.forEach((cell, i) => (widths[i] = Math.max(widths[i] ?? 0, String(cell).length)));\n  return rows.map((row) => row.map((cell, i) => String(cell).padEnd(widths[i])).join('  ').trimEnd());\n}\n"
+        },
+        {
+          "tool": "Bash",
+          "command": "npm test"
+        }
+      ]
+    },
+    {
+      "id": "strkit-rename-slug",
+      "repo": "strkit",
+      "kind": "refactor",
+      "origin": "slug helper in apps/api/src/providers/mockharness",
+      "prompt": "Rename slugify to toSlug. Keep slugify exported as a deprecated alias so existing callers keep working.",
+      "hiddenTest": "hidden/strkit-rename-slug.test.mjs",
+      "solution": [
+        {
+          "tool": "Read",
+          "path": "src/slug.mjs"
+        },
+        {
+          "tool": "Edit",
+          "path": "src/slug.mjs",
+          "find": "export function slugify(text, max = 40) {",
+          "replace": "export function toSlug(text, max = 40) {"
+        },
+        {
+          "tool": "Edit",
+          "path": "src/slug.mjs",
+          "find": "    .slice(0, max);\n}\n",
+          "replace": "    .slice(0, max);\n}\n\n/** @deprecated Use toSlug. */\nexport const slugify = toSlug;\n"
+        },
+        {
+          "tool": "Bash",
+          "command": "npm test"
+        }
+      ]
+    },
+    {
+      "id": "statkit-quantile-interp",
+      "repo": "statkit",
+      "kind": "bugfix",
+      "origin": "quantile in packages/shared/src/benchmark.ts",
+      "prompt": "quantile() returns the lower order statistic instead of interpolating: quantile([1,2,3,4], 0.5) should be 2.5. Fix it.",
+      "hiddenTest": "hidden/statkit-quantile-interp.test.mjs",
+      "solution": [
+        {
+          "tool": "Read",
+          "path": "src/stats.mjs"
+        },
+        {
+          "tool": "Edit",
+          "path": "src/stats.mjs",
+          "find": "  return sorted[Math.floor(index)];",
+          "replace": "  const low = Math.floor(index);\n  const high = Math.ceil(index);\n  return sorted[low] + (sorted[high] - sorted[low]) * (index - low);"
+        },
+        {
+          "tool": "Bash",
+          "command": "npm test"
+        }
+      ]
+    },
+    {
+      "id": "statkit-median-mutation",
+      "repo": "statkit",
+      "kind": "bugfix",
+      "origin": "median in packages/shared/src/benchmark.ts",
+      "prompt": "median() sorts the caller's array in place. It must not change its input.",
+      "hiddenTest": "hidden/statkit-median-mutation.test.mjs",
+      "solution": [
+        {
+          "tool": "Read",
+          "path": "src/stats.mjs"
+        },
+        {
+          "tool": "Edit",
+          "path": "src/stats.mjs",
+          "find": "  values.sort((a, b) => a - b);\n  const mid",
+          "replace": "  const sorted = [...values].sort((a, b) => a - b);\n  const mid"
+        },
+        {
+          "tool": "Edit",
+          "path": "src/stats.mjs",
+          "find": "  return values.length % 2 ? values[mid] : (values[mid - 1] + values[mid]) / 2;",
+          "replace": "  return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;"
+        },
+        {
+          "tool": "Bash",
+          "command": "npm test"
+        }
+      ]
+    },
+    {
+      "id": "statkit-mean-empty",
+      "repo": "statkit",
+      "kind": "bugfix",
+      "origin": "analytics rollups in packages/shared",
+      "prompt": "mean([]) returns NaN, which shows up as \"NaN\" on reports. Return 0 for an empty list.",
+      "hiddenTest": "hidden/statkit-mean-empty.test.mjs",
+      "solution": [
+        {
+          "tool": "Read",
+          "path": "src/stats.mjs"
+        },
+        {
+          "tool": "Edit",
+          "path": "src/stats.mjs",
+          "find": "export function mean(values) {\n",
+          "replace": "export function mean(values) {\n  if (values.length === 0) return 0;\n"
+        },
+        {
+          "tool": "Bash",
+          "command": "npm test"
+        }
+      ]
+    },
+    {
+      "id": "statkit-stddev",
+      "repo": "statkit",
+      "kind": "feature",
+      "origin": "benchmark spread in packages/shared",
+      "prompt": "Add stddev(values) to src/stats.mjs: the sample standard deviation (n - 1), 0 for fewer than two values.",
+      "hiddenTest": "hidden/statkit-stddev.test.mjs",
+      "solution": [
+        {
+          "tool": "Read",
+          "path": "src/stats.mjs"
+        },
+        {
+          "tool": "Edit",
+          "path": "src/stats.mjs",
+          "find": "/** The q-quantile",
+          "replace": "/** Sample standard deviation (n - 1), 0 for fewer than two values. */\nexport function stddev(values) {\n  return values.length < 2 ? 0 : Math.sqrt(variance(values));\n}\n\n/** The q-quantile"
+        },
+        {
+          "tool": "Bash",
+          "command": "npm test"
+        }
+      ]
+    },
+    {
+      "id": "statkit-format-pct",
+      "repo": "statkit",
+      "kind": "feature",
+      "origin": "report formatting in apps/web",
+      "prompt": "Add formatPercent(x, digits = 0) to src/format.mjs: 0.256 -> '26%', formatPercent(0.256, 1) -> '25.6%'.",
+      "hiddenTest": "hidden/statkit-format-pct.test.mjs",
+      "solution": [
+        {
+          "tool": "Read",
+          "path": "src/format.mjs"
+        },
+        {
+          "tool": "Edit",
+          "path": "src/format.mjs",
+          "find": "/** 1234567 ->",
+          "replace": "/** 0.256 -> \"26%\", with `digits` decimals. */\nexport function formatPercent(x, digits = 0) {\n  return (x * 100).toFixed(digits) + '%';\n}\n\n/** 1234567 ->"
+        },
+        {
+          "tool": "Bash",
+          "command": "npm test"
+        }
+      ]
+    },
+    {
+      "id": "statkit-format-cents",
+      "repo": "statkit",
+      "kind": "bugfix",
+      "origin": "cost formatting in apps/web",
+      "prompt": "formatCents(1234) returns '$12.3'. It should be '$12.34': always two decimals.",
+      "hiddenTest": "hidden/statkit-format-cents.test.mjs",
+      "solution": [
+        {
+          "tool": "Read",
+          "path": "src/format.mjs"
+        },
+        {
+          "tool": "Edit",
+          "path": "src/format.mjs",
+          "find": "(cents / 100).toFixed(1)",
+          "replace": "(cents / 100).toFixed(2)"
+        },
+        {
+          "tool": "Bash",
+          "command": "npm test"
+        }
+      ]
+    },
+    {
+      "id": "statkit-refactor-sum",
+      "repo": "statkit",
+      "kind": "refactor",
+      "origin": "analytics rollups in packages/shared",
+      "prompt": "mean and variance each accumulate a total by hand. Extract an exported sum(values) helper and use it in both, without changing behaviour.",
+      "hiddenTest": "hidden/statkit-refactor-sum.test.mjs",
+      "solution": [
+        {
+          "tool": "Read",
+          "path": "src/stats.mjs"
+        },
+        {
+          "tool": "Edit",
+          "path": "src/stats.mjs",
+          "find": "export function mean(values) {\n  let total = 0;\n  for (const v of values) total += v;\n  return total / values.length;\n}",
+          "replace": "/** Sum of values. */\nexport function sum(values) {\n  let total = 0;\n  for (const v of values) total += v;\n  return total;\n}\n\nexport function mean(values) {\n  return sum(values) / values.length;\n}"
+        },
+        {
+          "tool": "Edit",
+          "path": "src/stats.mjs",
+          "find": "  let total = 0;\n  for (const v of values) total += (v - m) ** 2;\n  return total / (values.length - 1);",
+          "replace": "  return sum(values.map((v) => (v - m) ** 2)) / (values.length - 1);"
+        },
+        {
+          "tool": "Bash",
+          "command": "npm test"
+        }
+      ]
+    },
+    {
+      "id": "taskq-waves-cycle",
+      "repo": "taskq",
+      "kind": "bugfix",
+      "origin": "board waves in apps/api/src/services/tasks.service.ts",
+      "prompt": "waves() loops forever on a dependency cycle or a dependency on an unknown task. Throw an Error whose message contains 'cycle' and names the stuck task ids.",
+      "hiddenTest": "hidden/taskq-waves-cycle.test.mjs",
+      "solution": [
+        {
+          "tool": "Read",
+          "path": "src/waves.mjs"
+        },
+        {
+          "tool": "Edit",
+          "path": "src/waves.mjs",
+          "find": "    const ready = remaining.filter((t) => t.dependsOn.every((d) => done.has(d)));\n",
+          "replace": "    const ready = remaining.filter((t) => t.dependsOn.every((d) => done.has(d)));\n    if (ready.length === 0) throw new Error('dependency cycle among: ' + remaining.map((t) => t.id).join(', '));\n"
+        },
+        {
+          "tool": "Bash",
+          "command": "npm test"
+        }
+      ]
+    },
+    {
+      "id": "taskq-queue-priority",
+      "repo": "taskq",
+      "kind": "bugfix",
+      "origin": "merge queue ordering in apps/api/src/core/coordination",
+      "prompt": "PriorityQueue.pop() returns the lowest priority first; it must return the highest.",
+      "hiddenTest": "hidden/taskq-queue-priority.test.mjs",
+      "solution": [
+        {
+          "tool": "Read",
+          "path": "src/queue.mjs"
+        },
+        {
+          "tool": "Edit",
+          "path": "src/queue.mjs",
+          "find": "if (this.items[i].priority < this.items[best].priority) best = i;",
+          "replace": "if (this.items[i].priority > this.items[best].priority) best = i;"
+        },
+        {
+          "tool": "Bash",
+          "command": "npm test"
+        }
+      ]
+    },
+    {
+      "id": "taskq-queue-peek",
+      "repo": "taskq",
+      "kind": "feature",
+      "origin": "merge queue in apps/api/src/core/coordination",
+      "prompt": "Add peek() to PriorityQueue: return the highest-priority value without removing it, undefined when empty.",
+      "hiddenTest": "hidden/taskq-queue-peek.test.mjs",
+      "solution": [
+        {
+          "tool": "Read",
+          "path": "src/queue.mjs"
+        },
+        {
+          "tool": "Edit",
+          "path": "src/queue.mjs",
+          "find": "  get size() {",
+          "replace": "  peek() {\n    if (this.items.length === 0) return undefined;\n    let best = 0;\n    for (let i = 1; i < this.items.length; i++) {\n      if (this.items[i].priority > this.items[best].priority) best = i;\n    }\n    return this.items[best].value;\n  }\n\n  get size() {"
+        },
+        {
+          "tool": "Bash",
+          "command": "npm test"
+        }
+      ]
+    },
+    {
+      "id": "taskq-retry-backoff",
+      "repo": "taskq",
+      "kind": "feature",
+      "origin": "network retries in scripts/benchmark.ts",
+      "prompt": "Add src/retry.mjs exporting backoffMs(attempt, base = 100, cap = 5000): exponential backoff base * 2^attempt, never above cap.",
+      "hiddenTest": "hidden/taskq-retry-backoff.test.mjs",
+      "solution": [
+        {
+          "tool": "Write",
+          "path": "src/retry.mjs",
+          "content": "/** Exponential backoff: base * 2^attempt, capped. */\nexport function backoffMs(attempt, base = 100, cap = 5000) {\n  return Math.min(cap, base * 2 ** attempt);\n}\n"
+        },
+        {
+          "tool": "Bash",
+          "command": "npm test"
+        }
+      ]
+    },
+    {
+      "id": "taskq-ci-script",
+      "repo": "taskq",
+      "kind": "ci",
+      "origin": "root package.json check scripts",
+      "prompt": "npm run ci fails immediately: the ci script runs scripts/check.mjs, which does not exist. The lint script is scripts/lint.mjs. Fix the ci script.",
+      "hiddenTest": "hidden/taskq-ci-script.test.mjs",
+      "solution": [
+        {
+          "tool": "Read",
+          "path": "package.json"
+        },
+        {
+          "tool": "Edit",
+          "path": "package.json",
+          "find": "node scripts/check.mjs",
+          "replace": "node scripts/lint.mjs"
+        },
+        {
+          "tool": "Bash",
+          "command": "npm test"
+        }
+      ]
+    },
+    {
+      "id": "taskq-ci-lint",
+      "repo": "taskq",
+      "kind": "ci",
+      "origin": "lint gate in the merge queue",
+      "prompt": "CI fails in the lint step (node scripts/lint.mjs) on src/queue.mjs. Make lint pass without weakening the lint rule.",
+      "hiddenTest": "hidden/taskq-ci-lint.test.mjs",
+      "solution": [
+        {
+          "tool": "Read",
+          "path": "scripts/lint.mjs"
+        },
+        {
+          "tool": "Edit",
+          "path": "src/queue.mjs",
+          "find": "    console.log('pop', this.items[best].value);\n",
+          "replace": ""
+        },
+        {
+          "tool": "Bash",
+          "command": "npm test"
+        }
+      ]
+    },
+    {
+      "id": "taskq-ci-node-version",
+      "repo": "taskq",
+      "kind": "ci",
+      "origin": "CI workflow",
+      "prompt": "The CI workflow (.github/workflows/ci.yml) pins Node 14, but package.json requires Node >=20. Align the workflow.",
+      "hiddenTest": "hidden/taskq-ci-node-version.test.mjs",
+      "solution": [
+        {
+          "tool": "Read",
+          "path": ".github/workflows/ci.yml"
+        },
+        {
+          "tool": "Edit",
+          "path": ".github/workflows/ci.yml",
+          "find": "node-version: 14",
+          "replace": "node-version: 20"
+        },
+        {
+          "tool": "Bash",
+          "command": "npm test"
+        }
+      ]
+    },
+    {
+      "id": "taskq-refactor-const",
+      "repo": "taskq",
+      "kind": "refactor",
+      "origin": "merge queue retry limit",
+      "prompt": "The retry limit 3 is a magic number inside PriorityQueue.retry. Export it as MAX_ATTEMPTS from src/queue.mjs and use it there.",
+      "hiddenTest": "hidden/taskq-refactor-const.test.mjs",
+      "solution": [
+        {
+          "tool": "Read",
+          "path": "src/queue.mjs"
+        },
+        {
+          "tool": "Edit",
+          "path": "src/queue.mjs",
+          "find": "/** A priority queue",
+          "replace": "/** Attempts an item gets before retry() gives up. */\nexport const MAX_ATTEMPTS = 3;\n\n/** A priority queue"
+        },
+        {
+          "tool": "Edit",
+          "path": "src/queue.mjs",
+          "find": "if (attempts >= 3) return false;",
+          "replace": "if (attempts >= MAX_ATTEMPTS) return false;"
+        },
+        {
+          "tool": "Bash",
+          "command": "npm test"
+        }
+      ]
+    }
+  ]
+}

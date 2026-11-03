@@ -1,0 +1,10 @@
+{
+  "name": "taskq",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "test": "node --test test/",
+    "ci": "node scripts/check.mjs && npm test"
+  }
+}

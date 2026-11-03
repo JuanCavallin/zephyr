@@ -13,6 +13,7 @@ export * from './analytics.js';
 export * from './benchmark.js';
 export * from './browser.js';
 export * from './coding.js';
+export * from './codingBenchmark.js';
 export * from './control.js';
 export * from './delegation.js';
 export * from './domain.js';
