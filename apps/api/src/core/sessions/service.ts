@@ -21,6 +21,11 @@ export interface GatewayTurnBinding {
 
 const MAX_CONTEXT_ENTRIES = 80;
 const ACTIVE_STATUSES = new Set<AgentSessionStatus>(['created', 'running']);
+/**
+ * Harnesses that may hold gateway credentials: Hermes (model + MCP gateway) and the
+ * coding harnesses, which reach Zephyr's shaped tools over the MCP gateway (L1).
+ */
+export const GATEWAY_HARNESSES: ReadonlySet<string> = new Set(['hermes', 'claudecode', 'codex']);
 
 export interface CreateSessionStateInput {
   runId: string;
@@ -88,7 +93,7 @@ export class SessionStateService {
   async requireGatewayTurn(binding: GatewayTurnBinding): Promise<AgentSessionState> {
     const state = await this.require(binding.sessionStateId);
     if (
-      state.harness !== 'hermes' ||
+      !GATEWAY_HARNESSES.has(state.harness) ||
       !ACTIVE_STATUSES.has(state.status) ||
       state.turn !== binding.turn
     ) {
