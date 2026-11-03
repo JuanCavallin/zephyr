@@ -192,7 +192,7 @@ export function mockHarnessExecutor(
 
 export class BoardError extends Error {
   constructor(
-    readonly code: 'NOT_FOUND' | 'CONFLICT' | 'INVALID',
+    readonly code: 'NOT_FOUND' | 'CONFLICT' | 'INVALID' | 'UNAVAILABLE',
     message: string,
   ) {
     super(message);
@@ -202,6 +202,12 @@ export class BoardError extends Error {
 
 export interface BoardServiceDeps {
   store: Store;
+  /**
+   * Whether task worktrees are real git worktrees. The merge queue commits, rebases and
+   * fast-forwards with git, so a board cannot run on mock workspaces (plain temp
+   * directories). Default 'live'.
+   */
+  workspaceMode?: 'mock' | 'live';
   emit(runId: string, event: RunEvent): Promise<unknown>;
   /** The planner's text model, for decomposition. */
   complete: TextModelAdapter['complete'];
@@ -639,6 +645,12 @@ export class BoardService {
     const b = this.must(boardId);
     if (isTerminal(b.run.status)) throw new BoardError('CONFLICT', 'Board ' + boardId + ' is finished');
     if (b.tasks.size === 0) throw new BoardError('CONFLICT', 'Board ' + boardId + ' has no tasks');
+    if (this.deps.workspaceMode === 'mock')
+      throw new BoardError(
+        'UNAVAILABLE',
+        'Boards merge with git, and workspaces are mock (plain directories). Set GIT_MODE=live ' +
+          '(task branches go to GIT_REPO_ROOT, default this repo) and restart Zephyr.',
+      );
     b.concurrency = Math.max(1, opts.concurrency ?? b.concurrency);
     b.autoMergeGreen = opts.autoMergeGreen ?? b.autoMergeGreen;
     if (!b.integration) {

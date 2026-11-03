@@ -1346,5 +1346,24 @@ await test('isPrivate: a private board, its tasks and its task runs are private;
   assert.equal(await svc.isPrivate({ runId: ran.runId! }), true, 'a task run of a private board');
 });
 
+await test('mock workspaces: runReady refuses with UNAVAILABLE naming GIT_MODE=live; nothing runs', async () => {
+  let opened = 0;
+  const { svc, boardId, events } = await svcBoard('svc-mockgit', '- one\n- two', {
+    workspaceMode: 'mock',
+    openWorkspace: async () => {
+      opened += 1;
+      throw new Error('should not open a workspace');
+    },
+  });
+  await assert.rejects(
+    () => svc.runReady(boardId, { concurrency: 2 }),
+    (e: unknown) => e instanceof BoardError && e.code === 'UNAVAILABLE' && /GIT_MODE=live/.test(e.message),
+  );
+  assert.equal(opened, 0);
+  assert.equal(types(events, 'task.status').length, 0, 'no task moved');
+  const v = await svc.getBoard(boardId);
+  assert.equal(v.run.status, 'pending', 'the board is still runnable once git is live');
+});
+
 console.log(`\n${passed} passed`);
 await rm(scratch, { recursive: true, force: true }).catch(() => undefined);

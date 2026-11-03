@@ -10,7 +10,7 @@ import { TASK_TEMPLATE_IDS, isTaskTemplateId, taskTemplate, type TaskTemplateId 
 const TEMPLATES = TASK_TEMPLATE_IDS.map(taskTemplate);
 import { ApiClient, ApiError, DEFAULT_API } from './api.js';
 import { installHook, uninstallHook } from './hook.js';
-import { formatBoard, runTask } from './run.js';
+import { formatBoard, runTask, waitForBoard } from './run.js';
 import { evidencePath, formatSummary, summaryFromFile } from './summary.js';
 import { DEFAULT_WEB, repoRoot, up } from './up.js';
 
@@ -24,6 +24,8 @@ Usage
       --plan                               create the board but do not start it
       --private                            keep the task on local models
       --base <ref>                         branch or commit to start from
+      --wait                               follow the board until it ends or needs you
+                                           (exit 0 merged, 1 failed or timed out, 3 needs you)
   zephyr templates                         list task templates
   zephyr hook install [--cwd <dir>]        point Claude Code in <dir> at Zephyr (observed mode)
   zephyr hook uninstall [--cwd <dir>]      remove Zephyr's hooks from <dir>
@@ -81,6 +83,7 @@ export async function main(argv: string[], io: MainIo = defaultIo): Promise<numb
         title: { type: 'string' },
         'no-open': { type: 'boolean' },
         check: { type: 'boolean' },
+        wait: { type: 'boolean' },
       },
     }));
   } catch (err) {
@@ -128,7 +131,24 @@ export async function main(argv: string[], io: MainIo = defaultIo): Promise<numb
           ...(values.base ? { base: values.base as string } : {}),
         });
         io.out(formatBoard(result, web));
-        return 0;
+        if (!values.wait || !result.started) return 0;
+        io.out('Waiting for the board…');
+        const pollMs = Number(io.env.ZEPHYR_WAIT_POLL_MS) || undefined;
+        const timeoutMs = Number(io.env.ZEPHYR_WAIT_TIMEOUT_MS) || undefined;
+        const { outcome } = await waitForBoard(api, result.board.run.id, {
+          onChange: io.out,
+          ...(pollMs ? { pollMs } : {}),
+          ...(timeoutMs ? { timeoutMs } : {}),
+        });
+        const said: Record<typeof outcome, string> = {
+          succeeded: 'Board finished: every task merged.',
+          failed: 'Board finished with failed tasks.',
+          cancelled: 'Board cancelled.',
+          'needs-you': 'Board is waiting on you: approve merges or unblock tasks under "Needs you".',
+          timeout: 'Stopped waiting; the board is still running.',
+        };
+        io.out(said[outcome]);
+        return outcome === 'succeeded' ? 0 : outcome === 'needs-you' ? 3 : 1;
       }
 
       case 'templates':

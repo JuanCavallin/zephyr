@@ -93,7 +93,8 @@ async function call<T>(fn: () => T | Promise<T>): Promise<T> {
     return await fn();
   } catch (err) {
     if (err instanceof BoardError) {
-      const status = err.code === 'NOT_FOUND' ? 404 : err.code === 'CONFLICT' ? 409 : 400;
+      const status =
+        err.code === 'NOT_FOUND' ? 404 : err.code === 'CONFLICT' ? 409 : err.code === 'UNAVAILABLE' ? 503 : 400;
       throw new HttpError(status, 'BOARD_' + err.code, err.message);
     }
     throw err;

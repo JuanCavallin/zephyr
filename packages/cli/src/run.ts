@@ -43,6 +43,48 @@ export async function runTask(api: ApiClient, o: RunOptions): Promise<RunResult>
   return { board: started, started: true };
 }
 
+export type BoardOutcome = 'succeeded' | 'failed' | 'cancelled' | 'needs-you' | 'timeout';
+
+export interface WaitOptions {
+  pollMs?: number;
+  timeoutMs?: number;
+  /** Called with one line per task status change. */
+  onChange?: (line: string) => void;
+  signal?: AbortSignal;
+}
+
+const TERMINAL_RUN = new Set(['succeeded', 'failed', 'cancelled']);
+
+/**
+ * Follow a board until it ends, or until nothing can move without a person: no task is
+ * ready or running and at least one waits in review (merge approval) or is blocked.
+ */
+export async function waitForBoard(
+  api: ApiClient,
+  boardId: string,
+  o: WaitOptions = {},
+): Promise<{ outcome: BoardOutcome; board: BoardViewLite }> {
+  const pollMs = o.pollMs ?? 1_000;
+  const deadline = Date.now() + (o.timeoutMs ?? 30 * 60_000);
+  const seen = new Map<string, string>();
+  for (;;) {
+    const board = await api.get<BoardViewLite>(`/api/tasks/${encodeURIComponent(boardId)}`);
+    for (const t of board.tasks) {
+      if (seen.get(t.id) !== t.status) {
+        seen.set(t.id, t.status);
+        o.onChange?.(`  ${t.status.padEnd(8)} ${t.title}`);
+      }
+    }
+    if (TERMINAL_RUN.has(board.run.status)) return { outcome: board.run.status as BoardOutcome, board };
+    const moving = board.tasks.some((t) => t.status === 'ready' || t.status === 'running');
+    const waiting = board.tasks.some((t) => t.status === 'review' || t.status === 'blocked');
+    if (!moving && waiting) return { outcome: 'needs-you', board };
+    if (Date.now() >= deadline) return { outcome: 'timeout', board };
+    if (o.signal?.aborted) return { outcome: 'timeout', board };
+    await new Promise((r) => setTimeout(r, pollMs));
+  }
+}
+
 export function formatBoard(r: RunResult, webBase: string): string {
   const { board } = r;
   const lines = [`Board ${board.run.id}: ${board.tasks.length} task${board.tasks.length === 1 ? '' : 's'}`];

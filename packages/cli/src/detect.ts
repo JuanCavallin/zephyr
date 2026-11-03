@@ -35,6 +35,8 @@ export interface Detection {
   platform: NodeJS.Platform;
   binaries: FoundBinary[];
   keys: KeyStatus[];
+  /** GIT_MODE from the environment or .env; boards need 'live'. */
+  gitMode: 'mock' | 'live';
 }
 
 export interface DetectOptions {
@@ -139,7 +141,10 @@ export function detect(opts: DetectOptions = {}): Detection {
     const fromFile = dotenv[k.name]?.trim();
     return { ...k, present: Boolean(fromEnv || fromFile), source: fromEnv ? 'env' : fromFile ? '.env' : null };
   });
-  return { platform, binaries, keys };
+  // Same reading as apps/api/src/config.ts: MOCK_ALL is on for 1/true/yes/on and forces git to mock.
+  const mockAll = /^(1|true|yes|on)$/i.test((envGet(env, 'MOCK_ALL', platform) ?? dotenv.MOCK_ALL ?? '').trim());
+  const gitMode = !mockAll && (envGet(env, 'GIT_MODE', platform) ?? dotenv.GIT_MODE ?? '').trim() === 'live' ? 'live' : 'mock';
+  return { platform, binaries, keys, gitMode };
 }
 
 /** Quote one argument for cmd.exe when spawning a shim with `shell: true`. */
@@ -192,6 +197,12 @@ export function formatDetection(d: Detection, versions: Partial<Record<HarnessBi
   }
   if (!d.binaries.some((b) => b.path))
     lines.push('  No harness found: boards run on the scripted mock harness. Install Claude Code or Codex for real runs.');
+  lines.push('Workspaces');
+  lines.push(
+    d.gitMode === 'live'
+      ? '  ✓ GIT_MODE=live: tasks get git worktrees and the board merges them'
+      : '  ✗ GIT_MODE=mock: boards cannot run (the merge queue needs git). Set GIT_MODE=live in .env',
+  );
   lines.push('Keys (values are never shown)');
   for (const k of d.keys) lines.push(`  ${k.present ? '✓' : '·'} ${k.name}${k.source ? ` (${k.source})` : ''} — ${k.enables}`);
   return lines.join('\n');

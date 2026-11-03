@@ -6,6 +6,7 @@
 import { runTests } from '../core/tools/shaped/runTests.js';
 import type { OutputStore } from '../core/tools/shaped/outputStore.js';
 import type { MergeItem, TestTally } from '../core/coordination/mergeQueue.js';
+import { config } from '../config.js';
 import { bus, decisionService, providers, shapedTools, store } from './runtime.js';
 import { learningService } from './learning.runtime.js';
 import { BoardService } from './tasks.service.js';
@@ -35,6 +36,7 @@ let instance: BoardService | undefined;
 export function boardService(): BoardService {
   instance ??= new BoardService({
     store,
+    workspaceMode: config.providers.git.mode === 'live' ? 'live' : 'mock',
     emit: (runId, event) => bus.emit(runId, event),
     complete: (req, ctx) => providers.provider('text.model').complete(req, ctx),
     decisions: decisionService,

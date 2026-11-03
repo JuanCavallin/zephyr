@@ -120,6 +120,21 @@ await test('detect: keys from env and .env, empty values are absent, values neve
   assert.match(text, /✗ Codex \(codex\) not on PATH/);
 });
 
+await test('detect: GIT_MODE from env or .env; MOCK_ALL forces mock; mock warns that boards cannot run', () => {
+  const dotenv = join(scratch, 'git.env');
+  writeFileSync(dotenv, 'GIT_MODE=live\n');
+  const d = (env: NodeJS.ProcessEnv, platform: NodeJS.Platform = 'linux', withFile = true) =>
+    detect({ env, platform, ...(withFile ? { dotenvPath: dotenv } : {}) });
+  assert.equal(d({ PATH: '' }, 'linux', false).gitMode, 'mock', 'the default');
+  assert.equal(d({ PATH: '' }).gitMode, 'live', 'from .env');
+  assert.equal(d({ PATH: '', GIT_MODE: 'mock' }).gitMode, 'mock', 'env wins over .env');
+  assert.equal(d({ Path: '', git_mode: 'live' }, 'win32', false).gitMode, 'live', 'case-insensitive on Windows');
+  assert.equal(d({ PATH: '', MOCK_ALL: 'true' }).gitMode, 'mock', 'MOCK_ALL forces mock');
+  assert.equal(d({ PATH: '', MOCK_ALL: 'false' }).gitMode, 'live');
+  assert.match(formatDetection(d({ PATH: '' }, 'linux', false)), /✗ GIT_MODE=mock: boards cannot run/);
+  assert.match(formatDetection(d({ PATH: '' })), /✓ GIT_MODE=live/);
+});
+
 await test('detect: no harness at all says boards run on the mock harness', () => {
   const text = formatDetection(detect({ env: { PATH: '' }, platform: 'win32' }));
   assert.match(text, /No harness found/);
@@ -182,6 +197,14 @@ const task = (id: string, title: string, status = 'pending') => ({
   dependsOn: [],
 });
 
+type View = { run: { id: string; status: string }; tasks: ReturnType<typeof task>[]; waves: string[][] };
+const polls: View[] = [];
+const view = (run: string, ...statuses: string[]): View => ({
+  run: { id: 'run_board1', status: run },
+  tasks: [task('t1', 'Add the toggle', statuses[0]), task('t2', 'Persist the choice', statuses[1])],
+  waves: [['t1'], ['t2']],
+});
+
 const server = createServer(async (req, res) => {
   const b = await body(req);
   seen.push({ method: req.method!, url: req.url!, body: b });
@@ -208,6 +231,12 @@ const server = createServer(async (req, res) => {
       tasks: [task('t1', 'Add the toggle', 'running'), task('t2', 'Persist the choice')],
       waves: [['t1'], ['t2']],
     });
+  if (req.method === 'GET' && req.url === '/api/tasks/run_board1') {
+    // `--wait` polls: serve the scripted views in order, then repeat the last.
+    const v = polls.length > 1 ? polls.shift()! : polls[0];
+    if (!v) return json(res, 404, { error: { code: 'BOARD_NOT_FOUND', message: 'no board' } });
+    return json(res, 200, v);
+  }
   if (req.method === 'POST' && req.url === '/api/observed/claudecode') {
     const hookUrl = `${origin}/api/hooks/claudecode/hk_${seen.length}`;
     const otel = `${origin}/api/otel/hk_${seen.length}`;
@@ -284,6 +313,58 @@ await test('zephyr run: usage errors exit 2, server down exits 1, API errors are
   const failing = capture({ ZEPHYR_API: apiBase });
   assert.equal(await main(['run', 'explode'], failing), 1);
   assert.match(failing.errors[0]!, /VALIDATION/);
+});
+
+const WAIT = { ZEPHYR_API: apiBase, ZEPHYR_WAIT_POLL_MS: '5' };
+
+await test('zephyr run --wait: follows status changes, all merged exits 0', async () => {
+  polls.length = 0;
+  polls.push(
+    view('running', 'running', 'pending'),
+    view('running', 'running', 'pending'),
+    view('running', 'done', 'running'),
+    view('succeeded', 'done', 'done'),
+  );
+  const io = capture(WAIT);
+  assert.equal(await main(['run', 'add a toggle', '--wait'], io), 0, io.errors.join('\n'));
+  const out = io.lines.join('\n');
+  assert.match(out, /Waiting for the board/);
+  assert.match(out, /done\s+Add the toggle[\s\S]*running\s+Persist the choice[\s\S]*done\s+Persist the choice/);
+  const after = out.slice(out.indexOf('Waiting'));
+  assert.equal(after.match(/running\s+Add the toggle/g)?.length, 1, 'repeats are not printed');
+  assert.match(out, /every task merged/);
+});
+
+await test('zephyr run --wait: a merge waiting for approval exits 3, failures exit 1', async () => {
+  polls.length = 0;
+  polls.push(view('running', 'running', 'pending'), view('running', 'review', 'pending'));
+  const io = capture(WAIT);
+  assert.equal(await main(['run', 'x', '--wait'], io), 3);
+  assert.match(io.lines.join('\n'), /review\s+Add the toggle[\s\S]*waiting on you.*Needs you/);
+
+  polls.length = 0;
+  polls.push(view('running', 'blocked', 'done'));
+  assert.equal(await main(['run', 'x', '--wait'], capture(WAIT)), 3, 'blocked needs a person too');
+
+  polls.length = 0;
+  polls.push(view('failed', 'failed', 'done'));
+  const failed = capture(WAIT);
+  assert.equal(await main(['run', 'x', '--wait'], failed), 1);
+  assert.match(failed.lines.join('\n'), /failed tasks/);
+});
+
+await test('zephyr run --wait: times out with exit 1; --plan never waits', async () => {
+  polls.length = 0;
+  polls.push(view('running', 'running', 'pending'));
+  const io = capture({ ...WAIT, ZEPHYR_WAIT_TIMEOUT_MS: '40' });
+  assert.equal(await main(['run', 'x', '--wait'], io), 1);
+  assert.match(io.lines.join('\n'), /still running/);
+
+  seen.length = 0;
+  const plan = capture(WAIT);
+  assert.equal(await main(['run', 'x', '--plan', '--wait'], plan), 0);
+  assert.equal(seen.some((s) => s.method === 'GET' && s.url === '/api/tasks/run_board1'), false);
+  assert.ok(!plan.lines.join('\n').includes('Waiting'));
 });
 
 /* -------------------------------------------------------------------------- */
@@ -433,6 +514,7 @@ await test('help, unknown commands and usage', async () => {
   const io = capture();
   assert.equal(await main(['--help'], io), 0);
   assert.match(io.lines[0]!, /zephyr up/);
+  assert.match(io.lines[0]!, /--wait .*\n.*exit 0 merged, 1 failed or timed out, 3 needs you/);
   assert.equal(await main([], capture()), 1);
   assert.equal(await main(['frobnicate'], capture()), 2);
   assert.equal(await main(['hook'], capture()), 2);
