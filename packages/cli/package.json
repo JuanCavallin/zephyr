@@ -1,0 +1,22 @@
+{
+  "name": "@htn/cli",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "zephyr: start Zephyr, run a task on the board, install the Observed hook, summarize evidence",
+  "bin": {
+    "zephyr": "./bin/zephyr.mjs"
+  },
+  "scripts": {
+    "zephyr": "node bin/zephyr.mjs",
+    "check:cli": "tsx scripts/cli.check.ts",
+    "typecheck": "tsc --noEmit -p ."
+  },
+  "dependencies": {
+    "@htn/shared": "workspace:*",
+    "tsx": "^4.23.13"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0"
+  }
+}
