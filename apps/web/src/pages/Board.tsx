@@ -13,7 +13,7 @@ import { Icon } from '../components/ui/Icon';
 import { useBoard, useInbox } from '../hooks/useBoard';
 import { api } from '../lib/api';
 import { canRate, feedbackOrigin, runIsPrivate } from '../lib/learning';
-import { Thumbs } from '../components/learning/Feedback';
+import { Thumbs, VariantPicker } from '../components/learning/Feedback';
 import {
   ASSIGNEES,
   COLUMNS,
@@ -24,6 +24,7 @@ import {
   moved,
   orderedTasks,
   parseScope,
+  variantChoices,
   type BoardEditOp,
   type InboxItem,
 } from '../lib/board';
@@ -306,6 +307,25 @@ function TaskCard({
       ) : (
         <p className="board-meta">{assigneeLabel(task.assignee)}</p>
       )}
+      {canEdit ? (
+        <label className="board-pin">
+          <span>Build</span>
+          <select
+            aria-label={'Variants of ' + task.title}
+            value={String(task.variants ?? 1)}
+            onChange={(e) => {
+              const n = Number(e.target.value);
+              onEdit([{ op: 'update', taskId: task.id, variants: n > 1 ? n : null }]);
+            }}
+          >
+            <option value="1">one version</option>
+            <option value="2">2 variants, I pick</option>
+            <option value="3">3 variants, I pick</option>
+          </select>
+        </label>
+      ) : (
+        task.variants && <p className="board-meta">{task.variants} variants</p>
+      )}
       {p && (
         <p className="board-progress">
           {p.filesChanged} file{p.filesChanged === 1 ? '' : 's'} · tests {p.testsPassed}/{p.testsTotal} · {p.turns}{' '}
@@ -506,6 +526,23 @@ function InboxRow({ item, act }: { item: InboxItem; act: (fn: () => Promise<unkn
               Board
             </Link>
           )}
+        </div>
+      </>
+    );
+  }
+  if (item.kind === 'variant_pick') {
+    return (
+      <>
+        <p className="board-inbox-kind">Pick a variant · {when}</p>
+        <VariantPicker
+          title={item.title + ': ' + item.variants.length + ' variants built'}
+          variants={variantChoices(item.variants)}
+          onPick={(v) => api.pickVariant(item.boardRunId, item.taskId, v.id).then(() => undefined)}
+        />
+        <div>
+          <Link className="board-link" to={'/board/' + item.boardRunId}>
+            Board
+          </Link>
         </div>
       </>
     );

@@ -430,6 +430,13 @@ export const api = {
       { method: 'POST', body: JSON.stringify(assignee ? { assignee } : {}) },
     ),
 
+  /** Pick one of a task's built variants: it merges, the rest are deleted, the pick is a signal. */
+  pickVariant: (boardId: string, taskId: string, variantId: string) =>
+    request<{ task: Task }>(
+      '/tasks/' + encodeURIComponent(boardId) + '/tasks/' + encodeURIComponent(taskId) + '/variants/pick',
+      { method: 'POST', body: JSON.stringify({ variantId }) },
+    ),
+
   decideExtension: (boardId: string, requestId: string, outcome: 'approve' | 'reject') =>
     request<unknown>(
       '/tasks/' + encodeURIComponent(boardId) + '/extensions/' + encodeURIComponent(requestId),

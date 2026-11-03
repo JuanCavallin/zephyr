@@ -86,11 +86,18 @@ export function VariantPicker({
   origin = {},
   title = 'Which one fits better?',
   onPicked,
+  onPick,
 }: {
   variants: Variant[];
   origin?: Origin;
   title?: string;
   onPicked?: (variant: Variant) => void;
+  /**
+   * Acts on the pick instead of posting it to the learning endpoint. For a surface whose
+   * own endpoint records the signal (the board's variants/pick), so it is not recorded twice.
+   * A throw un-picks, so the person can try again.
+   */
+  onPick?: (variant: Variant) => Promise<void>;
 }) {
   const [picked, setPicked] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -99,13 +106,17 @@ export function VariantPicker({
   const pick = async (variant: Variant) => {
     const body = variantPickBody(variants, variant.id, origin);
     setPicked(variant.id);
-    onPicked?.(variant);
-    if (!body) return;
+    if (!onPick) onPicked?.(variant);
+    if (!onPick && !body) return;
     setBusy(true);
     setError('');
     try {
-      await api.learningVariantPick(body);
+      if (onPick) {
+        await onPick(variant);
+        onPicked?.(variant);
+      } else if (body) await api.learningVariantPick(body);
     } catch (issue) {
+      if (onPick) setPicked(null);
       setError(failure(issue));
     } finally {
       setBusy(false);

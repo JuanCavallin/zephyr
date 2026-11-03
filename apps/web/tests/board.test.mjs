@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { boardReducer, emptyBoard, moved, orderedTasks, parseScope, editable, assigneeId, needsYou } from '../src/lib/board.ts';
+import { boardReducer, emptyBoard, moved, orderedTasks, parseScope, editable, assigneeId, needsYou, inboxKey, variantChoices } from '../src/lib/board.ts';
 
 const at = '2026-11-02T00:00:00.000Z';
 const task = (id, over = {}) => ({
@@ -79,4 +79,35 @@ test('needsYou counts what waits on a person and links to it', () => {
     label: '2 approvals · 1 blocked · 1 scope request',
     to: '/board',
   });
+});
+
+test('a variant pick is its own inbox item, counted in Needs you, linking to its board', () => {
+  const pick = {
+    kind: 'variant_pick',
+    at,
+    boardRunId: 'b2',
+    taskId: 't3',
+    title: 'Polish',
+    variants: [
+      { id: 'v1', label: 'Polish — variant 1', branch: 'zephyr/r', filesChanged: 1, files: ['a.ts'] },
+      { id: 'v2', label: 'Polish — variant 2', branch: 'zephyr/r_v2', filesChanged: 0, files: [] },
+    ],
+  };
+  assert.equal(inboxKey(pick), 'pick:t3');
+  assert.deepEqual(needsYou([pick]), { count: 1, label: '1 pick', to: '/board/b2' });
+  const approval = { kind: 'approval', at, approval: { id: 'ap1', runId: 'r9' } };
+  assert.equal(needsYou([approval, pick, pick]).label, '1 approval · 2 picks');
+});
+
+test('variantChoices shows the changed files as the preview, capped, never empty', () => {
+  const files = Array.from({ length: 10 }, (_, i) => 'src/f' + i + '.ts');
+  const [a, b] = variantChoices([
+    { id: 'v1', label: 'one', branch: 'x', filesChanged: 10, files },
+    { id: 'v2', label: 'two', branch: 'y', filesChanged: 0, files: [] },
+  ]);
+  assert.equal(a.id, 'v1');
+  assert.equal(a.label, 'one');
+  assert.equal(a.preview.split('\n').length, 9);
+  assert.match(a.preview, /\+2 more$/);
+  assert.deepEqual(b, { id: 'v2', label: 'two' }, 'no files, no preview');
 });

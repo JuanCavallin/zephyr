@@ -18,7 +18,7 @@ export type BoardEditOp =
   | { op: 'merge'; taskIds: string[]; title?: string; acceptance?: string }
   | { op: 'reorder'; order: string[] }
   | { op: 'scope'; taskId: string; writeScope: string[] }
-  | { op: 'update'; taskId: string; title?: string; acceptance?: string; dependsOn?: string[] }
+  | { op: 'update'; taskId: string; title?: string; acceptance?: string; dependsOn?: string[]; variants?: number | null }
   | { op: 'pin'; taskId: string; assignee: Assignee | null };
 
 export interface BoardState {
@@ -191,11 +191,32 @@ export interface ExtensionRequest {
 export type InboxItem =
   | { kind: 'approval'; at: string; boardRunId?: string; taskId?: string; approval: Approval }
   | { kind: 'blocked_task'; at: string; boardRunId: string; taskId: string; title: string; reason: string }
-  | { kind: 'lease_extension'; at: string; boardRunId: string; taskId: string; request: ExtensionRequest };
+  | { kind: 'lease_extension'; at: string; boardRunId: string; taskId: string; request: ExtensionRequest }
+  | { kind: 'variant_pick'; at: string; boardRunId: string; taskId: string; title: string; variants: PendingVariant[] };
+
+/** One built variant of a task, waiting for a person to pick it (spec §11). */
+export interface PendingVariant {
+  id: string;
+  label: string;
+  branch: string;
+  filesChanged: number;
+  files: string[];
+}
+
+/** A pending pick as the picker's choices: its label, and the files it changed as the preview. */
+export function variantChoices(variants: PendingVariant[]): Array<{ id: string; label: string; preview?: string }> {
+  return variants.map((v) => {
+    const shown = v.files.slice(0, 8);
+    const more = v.files.length - shown.length;
+    const preview = shown.join('\n') + (more > 0 ? '\n+' + more + ' more' : '');
+    return { id: v.id, label: v.label, ...(preview ? { preview } : {}) };
+  });
+}
 
 export function inboxKey(item: InboxItem): string {
   if (item.kind === 'approval') return 'approval:' + item.approval.id;
   if (item.kind === 'blocked_task') return 'blocked:' + item.taskId;
+  if (item.kind === 'variant_pick') return 'pick:' + item.taskId;
   return 'extension:' + item.request.id;
 }
 
@@ -205,12 +226,13 @@ export function inboxKey(item: InboxItem): string {
  */
 export function needsYou(items: InboxItem[]): { count: number; label: string; to: string } | null {
   if (items.length === 0) return null;
-  const counts = { approval: 0, blocked_task: 0, lease_extension: 0 };
+  const counts = { approval: 0, blocked_task: 0, lease_extension: 0, variant_pick: 0 };
   for (const item of items) counts[item.kind]++;
   const parts = [
     counts.approval && `${counts.approval} approval${counts.approval === 1 ? '' : 's'}`,
     counts.blocked_task && `${counts.blocked_task} blocked`,
     counts.lease_extension && `${counts.lease_extension} scope request${counts.lease_extension === 1 ? '' : 's'}`,
+    counts.variant_pick && `${counts.variant_pick} pick${counts.variant_pick === 1 ? '' : 's'}`,
   ].filter(Boolean);
   const only = items.length === 1 ? items[0]! : undefined;
   const to = !only
