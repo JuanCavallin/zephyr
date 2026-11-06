@@ -35,6 +35,8 @@ export interface PublishInput {
   title: string;
   remote?: string;
   draft?: boolean;
+  /** Open a PR with `gh pr create` after the push. Default true; false pushes the branch only. */
+  openPr?: boolean;
   policy?: Pick<VerifyPolicy, 'fullSuiteBeforePublish'>;
   signal?: AbortSignal;
 }
@@ -96,22 +98,26 @@ export function publishCommands(input: PublishInput, bodyPath: string, commit = 
         ] as [string, string[]][])
       : []),
     ['git', ['push', '-u', remote, input.branch]],
-    [
-      'gh',
-      [
-        'pr',
-        'create',
-        '--head',
-        input.branch,
-        '--base',
-        input.base,
-        '--title',
-        input.title,
-        '--body-file',
-        bodyPath,
-        ...(input.draft ? ['--draft'] : []),
-      ],
-    ],
+    ...(input.openPr === false
+      ? []
+      : ([
+          [
+            'gh',
+            [
+              'pr',
+              'create',
+              '--head',
+              input.branch,
+              '--base',
+              input.base,
+              '--title',
+              input.title,
+              '--body-file',
+              bodyPath,
+              ...(input.draft ? ['--draft'] : []),
+            ],
+          ],
+        ] as [string, string[]][])),
   ];
 }
 

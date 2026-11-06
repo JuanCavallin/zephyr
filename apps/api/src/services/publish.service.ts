@@ -19,7 +19,15 @@ export interface PublishOptions {
   title: string;
   base?: string;
   draft?: boolean;
+  /** Open a PR after the push (needs `gh`). Default true; false pushes the branch only. */
+  openPr?: boolean;
   remote?: string;
+  /**
+   * The workspace to publish, when it is not the run's own (a graph node's worktree,
+   * `<runId>_<nodeId>`). Worktree, branch and diff come from it; the approval, the
+   * events and the evidence stay on `runId`.
+   */
+  workspaceRunId?: string;
   /** Step the approval blocks. Required: approvals bind to a run step. */
   stepId: string;
   sessionStateId?: string;
@@ -47,11 +55,12 @@ export async function publishRunLive(runId: string, options: PublishOptions): Pr
     import('./workspaces.service.js'),
     import('./evidence.service.js'),
   ]);
-  const worktree = providers.provider('workspace').pathOf(runId);
-  if (!worktree) throw new Error(`publish: run ${runId} has no workspace`);
-  const branch = 'zephyr/' + runId;
+  const wsRunId = options.workspaceRunId ?? runId;
+  const worktree = providers.provider('workspace').pathOf(wsRunId);
+  if (!worktree) throw new Error(`publish: run ${wsRunId} has no workspace`);
+  const branch = 'zephyr/' + wsRunId;
   const ws = await workspaces();
-  const binding = async () => ({ branch, diffHash: (await ws.diff(runId)).hash });
+  const binding = async () => ({ branch, diffHash: (await ws.diff(wsRunId)).hash });
   const bridge = createPermissionBridge({
     harness: options.harness ?? 'claudecode',
     worktree,
@@ -71,6 +80,7 @@ export async function publishRunLive(runId: string, options: PublishOptions): Pr
       title: options.title,
       ...(options.remote ? { remote: options.remote } : {}),
       ...(options.draft ? { draft: true } : {}),
+      ...(options.openPr === false ? { openPr: false } : {}),
       policy: options.policy ?? DEFAULT_VERIFY_POLICY,
       ...(options.signal ? { signal: options.signal } : {}),
     },
@@ -86,7 +96,10 @@ export async function publishRunLive(runId: string, options: PublishOptions): Pr
       },
       emit: (event) => bus.emit(runId, event).then(() => {}),
       evidence: async () => {
-        const { bundle, markdownPath } = await (await evidenceService()).produce(runId);
+        const { bundle, markdownPath } = await (await evidenceService()).produce(
+          runId,
+          wsRunId === runId ? {} : { diff: await ws.diff(wsRunId) },
+        );
         if (!markdownPath) throw new Error('evidence.md was not written');
         return { bundleId: bundle.id, diffHash: bundle.diff.hash, bodyPath: markdownPath };
       },
