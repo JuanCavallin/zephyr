@@ -201,7 +201,7 @@ const task = (id: string, title: string, status = 'pending') => ({
 
 type View = { run: { id: string; status: string }; tasks: ReturnType<typeof task>[]; waves: string[][] };
 const polls: View[] = [];
-let inbox: Array<{ kind: string; boardRunId?: string }> = [];
+let inbox: Array<{ kind: string; boardRunId?: string; taskId?: string }> = [];
 const view = (run: string, ...statuses: string[]): View => ({
   run: { id: 'run_board1', status: run },
   tasks: [task('t1', 'Add the toggle', statuses[0]), task('t2', 'Persist the choice', statuses[1])],
@@ -401,6 +401,18 @@ await test('zephyr run --wait: a merge waiting for approval exits 3, failures ex
   const io = capture(WAIT);
   assert.equal(await main(['run', 'x', '--wait'], io), 3);
   assert.match(io.lines.join('\n'), /review\s+Add the toggle[\s\S]*waiting on you.*Needs you/);
+
+  // A running task that asked for a tool approval waits on the person: exit 3 at once,
+  // even though the other task is still running.
+  polls.length = 0;
+  polls.push(view('running', 'running', 'running'));
+  inbox = [{ kind: 'approval', boardRunId: 'run_board1', taskId: 't1' }];
+  assert.equal(await main(['run', 'x', '--wait'], capture(WAIT)), 3, 'a running task waiting on an approval needs a person');
+  // ...but a board-level approval while tasks still run does not cut the wait short.
+  polls.length = 0;
+  polls.push(view('running', 'running', 'pending'));
+  inbox = [{ kind: 'approval', boardRunId: 'run_board1' }];
+  assert.equal(await main(['run', 'x', '--wait'], capture({ ...WAIT, ZEPHYR_WAIT_TIMEOUT_MS: '60' })), 1, 'still running');
 
   polls.length = 0;
   polls.push(view('running', 'blocked', 'done'));

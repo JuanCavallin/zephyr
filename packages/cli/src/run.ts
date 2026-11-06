@@ -22,6 +22,8 @@ export interface RunOptions {
   autoMergeGreen?: boolean;
   /** Build 2 or 3 variants of every task; a person picks one before it merges. */
   variants?: number;
+  /** When every task merged: push the integration branch, and open a PR for 'pr'. */
+  publish?: 'branch' | 'pr';
 }
 
 export interface RunResult {
@@ -35,6 +37,7 @@ export async function runTask(api: ApiClient, o: RunOptions): Promise<RunResult>
     ...(o.template ? { template: o.template } : {}),
     ...(o.private ? { private: true } : {}),
     ...(o.base ? { base: o.base } : {}),
+    ...(o.publish ? { publish: o.publish } : {}),
   });
   // One atomic edit before anything runs, the same op the board's "Build" selector sends.
   if (o.variants && o.variants > 1 && board.tasks.length)
@@ -66,6 +69,7 @@ const TERMINAL_RUN = new Set(['succeeded', 'failed', 'cancelled']);
 interface InboxItemLite {
   kind: string;
   boardRunId?: string;
+  taskId?: string;
 }
 
 /**
@@ -91,8 +95,17 @@ export async function waitForBoard(
       }
     }
     if (TERMINAL_RUN.has(board.run.status)) return { outcome: board.run.status as BoardOutcome, board };
-    const moving = board.tasks.some((t) => t.status === 'ready' || t.status === 'running');
-    if (!moving) {
+    const running = new Set(board.tasks.filter((t) => t.status === 'running').map((t) => t.id));
+    const moving = running.size > 0 || board.tasks.some((t) => t.status === 'ready');
+    if (moving) {
+      // A running task that asked for an approval (a harness tool call) is not moving:
+      // it waits on the person, so say so instead of sitting here until the timeout.
+      if (running.size) {
+        const { items } = await api.get<{ items: InboxItemLite[] }>('/api/tasks/inbox');
+        if (items.some((i) => i.kind === 'approval' && i.boardRunId === boardId && i.taskId && running.has(i.taskId)))
+          return { outcome: 'needs-you', board };
+      }
+    } else {
       const { items } = await api.get<{ items: InboxItemLite[] }>('/api/tasks/inbox');
       if (items.some((i) => i.boardRunId === boardId)) return { outcome: 'needs-you', board };
     }

@@ -25,7 +25,9 @@ Usage
       --plan                               create the board but do not start it
       --private                            keep the task on local models
       --base <ref>                         branch or commit to start from
-      --wait                               follow the board until it ends or needs you
+      --publish <branch|pr>                when every task merged, push zephyr/<board> (and open a
+                                           PR with gh, for pr); waits for your approval first
+      --wait                             follow the board until it ends or needs you
                                            (exit 0 merged, 1 failed or timed out, 3 needs you)
   zephyr templates                         list task templates
   zephyr hook install [--cwd <dir>]        point Claude Code in <dir> at Zephyr (observed mode)
@@ -81,6 +83,7 @@ export async function main(argv: string[], io: MainIo = defaultIo): Promise<numb
         plan: { type: 'boolean' },
         private: { type: 'boolean' },
         base: { type: 'string' },
+        publish: { type: 'string' },
         cwd: { type: 'string' },
         title: { type: 'string' },
         'no-open': { type: 'boolean' },
@@ -128,11 +131,17 @@ export async function main(argv: string[], io: MainIo = defaultIo): Promise<numb
             return 2;
           }
         }
+        const publish = values.publish as string | undefined;
+        if (publish !== undefined && publish !== 'branch' && publish !== 'pr') {
+          io.err('--publish must be branch or pr');
+          return 2;
+        }
         if (!(await api.healthy())) {
           io.err(`Zephyr is not running at ${apiBase}. Start it with: zephyr up`);
           return 1;
         }
         const result = await runTask(api, {
+          ...(publish ? { publish } : {}),
           request,
           ...(template ? { template: template as TaskTemplateId } : {}),
           ...(concurrency !== undefined ? { concurrency } : {}),
