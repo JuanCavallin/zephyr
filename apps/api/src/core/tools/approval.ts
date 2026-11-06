@@ -74,7 +74,7 @@ export class RunToolApprovalGate implements ToolApprovalGate {
       approvalId: approval.id,
     });
     const run = await this.store.patchRun(action.runId, { status: 'awaiting_approval' });
-    await this.sessions.setStatusForStep(action.runId, action.stepId, 'awaiting_approval');
+    await this.sessionStatus(action.runId, action.stepId, 'awaiting_approval');
     await this.bus.emit(action.runId, { type: 'step.upserted', step: blockedStep });
     await this.bus.emit(action.runId, { type: 'run.updated', run });
     await this.bus.emit(action.runId, { type: 'approval.requested', approval });
@@ -88,11 +88,28 @@ export class RunToolApprovalGate implements ToolApprovalGate {
       reversibility: descriptor.reversibility,
       payload: approval.proposedAction,
     };
-    const outcome = await waitForApproval(approval.id, proposed, signal);
+    let outcome: Awaited<ReturnType<typeof waitForApproval>>;
+    try {
+      outcome = await waitForApproval(approval.id, proposed, signal);
+    } catch (error) {
+      // Nobody is waiting any more (the run or the agent's task ended). Leaving it
+      // pending would show a person a question whose answer does nothing.
+      if (signal?.aborted) {
+        const expired = await this.store
+          .patchApproval(approval.id, {
+            status: 'expired',
+            decidedAt: nowIso(),
+            note: 'Expired because the agent stopped waiting before a decision was received.',
+          })
+          .catch(() => null);
+        if (expired) await this.bus.emit(action.runId, { type: 'approval.resolved', approval: expired }).catch(() => {});
+      }
+      throw error;
+    }
 
     const resumedRun = await this.store.patchRun(action.runId, { status: 'running' });
     const step = await this.store.patchStep(action.stepId, { status: 'running' });
-    await this.sessions.setStatusForStep(action.runId, action.stepId, 'running');
+    await this.sessionStatus(action.runId, action.stepId, 'running');
     await this.bus.emit(action.runId, { type: 'run.updated', run: resumedRun });
     await this.bus.emit(action.runId, { type: 'step.upserted', step });
 
@@ -105,6 +122,18 @@ export class RunToolApprovalGate implements ToolApprovalGate {
       };
     }
     return { approvalId: approval.id };
+  }
+
+  /**
+   * Mirror the wait on the step's agent session, when it has one. A Claude Code run a
+   * board or a graph node started has no session state (subscription mode needs no
+   * gateway binding); failing there used to turn every approval into a silent deny
+   * and leave the approval pending. More than one session still throws.
+   */
+  private async sessionStatus(runId: string, stepId: string, status: 'awaiting_approval' | 'running') {
+    const sessions = (await this.store.listSessionStates(runId)).filter((s) => s.stepId === stepId);
+    if (sessions.length === 0) return;
+    await this.sessions.setStatusForStep(runId, stepId, status);
   }
 }
 
