@@ -893,7 +893,12 @@ const svcPool: Assignee[] = [
 ];
 
 /** A BoardService over a real git repo, the scripted harness and the mock decision model. */
-async function svcBoard(name: string, request: string, over: Partial<BoardServiceDeps> = {}) {
+async function svcBoard(
+  name: string,
+  request: string,
+  over: Partial<BoardServiceDeps> = {},
+  create: { publish?: 'none' | 'branch' | 'pr' } = {},
+) {
   const { repo } = await mqRepo(name);
   const root = join(repo, '..');
   const store = createMemoryStore({ persistToDisk: false });
@@ -927,7 +932,7 @@ async function svcBoard(name: string, request: string, over: Partial<BoardServic
     executor: mockHarnessExecutor({ authorize: allowAuth }),
     ...over,
   });
-  const view = await svc.createBoard({ request });
+  const view = await svc.createBoard({ request, ...create });
   return { svc, store, events, repo, model, view, boardId: view.run.id };
 }
 
@@ -1485,6 +1490,90 @@ await test('variants: the update op takes 2..3 or null; the routes validate it t
   assert.equal(editOpSchemaFn.safeParse({ op: 'update', taskId: id, variants: 4 }).success, false);
   assert.equal(editOpSchemaFn.safeParse({ op: 'update', taskId: id, variants: null }).success, true);
   await assert.rejects(svc.pickVariant(boardId, id, 'v1'), (e: unknown) => e instanceof BoardError && e.code === 'CONFLICT');
+});
+
+console.log('10. publish');
+
+type BoardPublishInput = import('../src/services/tasks.service.js').BoardPublishInput;
+type PublishResult = import('../src/core/verify/publish.js').PublishResult;
+
+function fakePublish(result: (input: BoardPublishInput) => PublishResult) {
+  const calls: BoardPublishInput[] = [];
+  const publish = async (input: BoardPublishInput) => {
+    calls.push(input);
+    return result(input);
+  };
+  return { calls, publish };
+}
+
+await test('publish branch: pushed once after every task merged, on a board-run step', async () => {
+  const fake = fakePublish(() => ({
+    status: 'published',
+    branch: 'zephyr/b',
+    diffHash: 'h',
+    bundleId: 'e',
+    bodyPath: 'p',
+  }));
+  const { svc, store, boardId } = await svcBoard('svc-pub-branch', '- one\n- two', { publish: fake.publish }, { publish: 'branch' });
+  await svc.runReady(boardId, { autoMergeGreen: true });
+  await svc.whenIdle(boardId);
+  const v = await svc.getBoard(boardId);
+  assert.equal(v.run.status, 'succeeded', v.run.summary ?? '');
+  assert.equal(fake.calls.length, 1, 'published exactly once');
+  assert.equal(fake.calls[0]!.openPr, false);
+  assert.equal(fake.calls[0]!.boardRunId, boardId);
+  assert.match(v.run.summary ?? '', /All 2 tasks merged; pushed zephyr\/b/);
+  const step = (await store.listSteps(boardId)).find((s) => s.id === fake.calls[0]!.stepId);
+  assert.equal(step?.kind, 'publish');
+  assert.equal(step?.status, 'succeeded');
+});
+
+await test('publish pr blocked: the board still succeeds and says why it was not published', async () => {
+  const fake = fakePublish(() => ({ status: 'blocked', stage: 'pr', reason: 'gh exited null: spawn gh ENOENT' }));
+  const { svc, boardId } = await svcBoard('svc-pub-blocked', '- one', { publish: fake.publish }, { publish: 'pr' });
+  await svc.runReady(boardId, { autoMergeGreen: true });
+  await svc.whenIdle(boardId);
+  const v = await svc.getBoard(boardId);
+  assert.equal(fake.calls[0]!.openPr, true);
+  assert.equal(v.run.status, 'succeeded');
+  assert.match(v.run.summary ?? '', /not published \(pr: gh exited null: spawn gh ENOENT\)/);
+});
+
+await test('no publish option: never published; a failed board never publishes either', async () => {
+  const fake = fakePublish(() => ({ status: 'blocked', stage: 'push', reason: 'should not run' }));
+  const plain = await svcBoard('svc-pub-none', '- one', { publish: fake.publish });
+  await plain.svc.runReady(plain.boardId, { autoMergeGreen: true });
+  await plain.svc.whenIdle(plain.boardId);
+  assert.equal((await plain.svc.getBoard(plain.boardId)).run.status, 'succeeded');
+  const failing = await svcBoard(
+    'svc-pub-failed',
+    '- one',
+    { publish: fake.publish, executor: async () => ({ status: 'failed', detail: 'nope' }) },
+    { publish: 'branch' },
+  );
+  await failing.svc.runReady(failing.boardId, { autoMergeGreen: true });
+  await failing.svc.whenIdle(failing.boardId);
+  assert.equal((await failing.svc.getBoard(failing.boardId)).run.status, 'failed');
+  assert.equal(fake.calls.length, 0);
+});
+
+await test("inbox: an approval on the board's own run carries its boardRunId", async () => {
+  const { svc, store, boardId } = await svcBoard('svc-pub-inbox', '- one');
+  await store.createApproval({
+    id: 'apr_board_push',
+    runId: boardId,
+    stepId: 'step_x',
+    question: 'Allow git.publish?',
+    proposedAction: {},
+    reversibility: 'irreversible',
+    riskClass: 'ask_human',
+    policyRule: 'exact-tool-action-requires-approval',
+    status: 'pending',
+    createdAt: new Date().toISOString(),
+  });
+  const item = (await svc.inbox()).find((i) => i.kind === 'approval' && i.approval.id === 'apr_board_push');
+  assert.ok(item, 'listed');
+  assert.equal((item as { boardRunId?: string }).boardRunId, boardId);
 });
 
 console.log(`\n${passed} passed`);

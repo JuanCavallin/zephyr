@@ -42,6 +42,8 @@ export const createBoardBody = z.object({
   private: z.boolean().optional(),
   base: z.string().min(1).max(200).optional(),
   template: taskTemplateIdSchema.optional(),
+  /** After every task merged: push the integration branch ('branch'), and open a PR ('pr'). */
+  publish: z.enum(['none', 'branch', 'pr']).optional(),
 });
 
 export const editOpSchema = z.discriminatedUnion('op', [

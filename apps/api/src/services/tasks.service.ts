@@ -64,7 +64,7 @@ import { candidateKey } from '../core/decisions/routing.js';
 import { requestWordingSignal, variantPickSignal } from '../core/learning/signalLog.js';
 import { InMemorySignalLog } from '../core/learning/signals.mock.js';
 import { createPermissionBridge, type Authorizer } from '../core/tools/permissionBridge.js';
-import type { Exec } from '../core/verify/publish.js';
+import type { Exec, PublishResult } from '../core/verify/publish.js';
 import { newId, nowIso } from '../lib/ids.js';
 import { createMockHarness, type MockHarnessStep } from '../providers/mockharness/index.js';
 import type { Store } from '../store/types.js';
@@ -94,6 +94,10 @@ export interface TaskExecutionContext {
   taskRunId: string;
   stepId: string;
   worktree: string;
+  /** The worktree's own run id: `taskRunId`, or `<taskRunId>_v<i>` for a variant. */
+  workspaceRunId: string;
+  /** The worktree's branch, `zephyr/<workspaceRunId>`. */
+  branch: string;
   leases: LeaseTable;
   tracker: ProgressTracker;
   signal: AbortSignal;
@@ -231,6 +235,22 @@ export interface BoardServiceDeps {
   onTaskFinished?(t: { taskId: string; runId?: string; outcome: 'passed' | 'failed' }): void;
   budget?: TaskBudget;
   leaseTtlMs?: number;
+  /**
+   * Push the board's integration branch (and open a PR when `openPr`) once every task
+   * merged. Must wait for a person's approval: pushing is irreversible.
+   */
+  publish?(input: BoardPublishInput): Promise<PublishResult>;
+}
+
+export type BoardPublish = 'none' | 'branch' | 'pr';
+
+export interface BoardPublishInput {
+  boardRunId: string;
+  /** The board-run step the approval blocks. */
+  stepId: string;
+  title: string;
+  openPr: boolean;
+  signal: AbortSignal;
 }
 
 /** What a template sets on a board's runs (docs/cacp-09, templates). */
@@ -248,6 +268,8 @@ export interface CreateBoardInput {
   private?: boolean;
   /** Base ref the integration branch starts from. */
   base?: string;
+  /** After every task merged: push the integration branch, and open a PR for 'pr'. Default 'none'. */
+  publish?: BoardPublish;
 }
 
 export type BoardEditOp =
@@ -332,6 +354,9 @@ interface Board {
   /** Per-task budget from the board's template; overrides the service default. */
   budget?: TaskBudget;
   policy?: BoardPolicy;
+  publish: BoardPublish;
+  /** Set once the publish step started, so the scheduler never publishes twice. */
+  publishing: boolean;
   inFlight: Set<string>;
   active: Set<Promise<unknown>>;
   pumping: Promise<void>;
@@ -407,9 +432,12 @@ export class BoardService {
   async inbox(): Promise<InboxItem[]> {
     const items: InboxItem[] = [];
     const runs = await this.deps.store.listRuns({ limit: 10_000 });
-    const taskOfRun = new Map<string, { boardRunId: string; taskId: string }>();
-    for (const b of this.boards.values())
+    const taskOfRun = new Map<string, { boardRunId: string; taskId?: string }>();
+    for (const b of this.boards.values()) {
+      // The board's own approvals (its publish step) belong to it too.
+      taskOfRun.set(b.run.id, { boardRunId: b.run.id });
       for (const t of b.tasks.values()) if (t.runId) taskOfRun.set(t.runId, { boardRunId: b.run.id, taskId: t.id });
+    }
     for (const run of runs) {
       if (isTerminal(run.status)) continue;
       for (const approval of await this.deps.store.listApprovals(run.id)) {
@@ -475,6 +503,7 @@ export class BoardService {
         request: input.request,
         private: input.private ?? false,
         ...(template ? { template: template.id } : {}),
+        ...(input.publish && input.publish !== 'none' ? { publish: input.publish } : {}),
       } as Json,
       createdAt: at,
       updatedAt: at,
@@ -498,6 +527,8 @@ export class BoardService {
             policy: { levers: { ...template.levers }, verify: { ...template.verify, protectedGlobs: [...template.verify.protectedGlobs] } },
           }
         : {}),
+      publish: input.publish ?? 'none',
+      publishing: false,
       inFlight: new Set(),
       active: new Set(),
       pumping: Promise.resolve(),
@@ -821,14 +852,52 @@ export class BoardService {
   }
 
   private async maybeFinish(b: Board): Promise<void> {
-    if (isTerminal(b.run.status) || b.inFlight.size || b.active.size) return;
+    if (isTerminal(b.run.status) || b.inFlight.size || b.active.size || b.publishing) return;
     const tasks = [...b.tasks.values()];
     if (!tasks.length || !tasks.every((t) => t.status === 'done' || t.status === 'failed')) return;
     const failed = tasks.filter((t) => t.status === 'failed').length;
-    await this.patchBoard(b, {
-      status: failed ? 'failed' : 'succeeded',
-      summary: failed ? failed + ' of ' + tasks.length + ' tasks failed' : 'All ' + tasks.length + ' tasks merged',
+    let summary = failed ? failed + ' of ' + tasks.length + ' tasks failed' : 'All ' + tasks.length + ' tasks merged';
+    // Before the board turns terminal: that closes the integration worktree.
+    if (!failed && b.publish !== 'none' && this.deps.publish && b.integration) {
+      b.publishing = true;
+      summary += '; ' + (await this.publishBoard(b));
+    }
+    await this.patchBoard(b, { status: failed ? 'failed' : 'succeeded', summary });
+  }
+
+  /** Push the integration branch behind one approval. Returns the summary clause. */
+  private async publishBoard(b: Board): Promise<string> {
+    const openPr = b.publish === 'pr';
+    const step = await this.deps.store.appendStep({
+      id: newId('step'),
+      runId: b.run.id,
+      parentStepId: null,
+      kind: 'publish',
+      label: openPr ? 'Push ' + b.integration!.branch + ' and open a PR' : 'Push ' + b.integration!.branch,
+      status: 'running',
+      input: { branch: b.integration!.branch, openPr } as Json,
+      startedAt: nowIso(),
     });
+    await this.emit(b, { type: 'step.upserted', step });
+    const request = (b.run.input as { request?: string } | null)?.request ?? b.run.title;
+    try {
+      const r = await this.deps.publish!({
+        boardRunId: b.run.id,
+        stepId: step.id,
+        title: clip('zephyr: ' + request.split(/\r?\n/)[0]!, 120),
+        openPr,
+        signal: b.abort.signal,
+      });
+      if (r.status === 'published') {
+        await this.endStep(b.run.id, step.id, 'succeeded');
+        return r.prUrl ? 'opened ' + r.prUrl : 'pushed ' + r.branch;
+      }
+      await this.endStep(b.run.id, step.id, 'failed', r.stage + ': ' + r.reason);
+      return 'not published (' + r.stage + ': ' + r.reason + ')';
+    } catch (err) {
+      await this.endStep(b.run.id, step.id, 'failed', (err as Error).message);
+      return 'not published: ' + (err as Error).message;
+    }
   }
 
   /** Route, open the worktree, lease, execute, release, then merge. */
@@ -912,7 +981,7 @@ export class BoardService {
         const opened = await this.deps.openWorkspace(runId, b.integration!.branch);
         ws = { runId, worktree: opened.path, branch: opened.branch };
       }
-      const r = await this.attempt(b, taskId, taskRun.id, ws.worktree, route.assignee, k > 1 ? { i, k } : undefined);
+      const r = await this.attempt(b, taskId, taskRun.id, ws, route.assignee, k > 1 ? { i, k } : undefined);
       if (r.status === 'blocked') {
         b.leases.release(taskId);
         await this.move(b, taskId, 'blocked', { reason: r.detail });
@@ -982,7 +1051,7 @@ export class BoardService {
     b: Board,
     taskId: string,
     taskRunId: string,
-    worktree: string,
+    ws: { runId: string; worktree: string; branch: string },
     assignee: Assignee,
     variant?: { i: number; k: number },
   ): Promise<{ status: 'done' | 'failed' | 'blocked'; detail: string; filesChanged: number }> {
@@ -1026,7 +1095,9 @@ export class BoardService {
         task: seen,
         taskRunId,
         stepId: step.id,
-        worktree,
+        worktree: ws.worktree,
+        workspaceRunId: ws.runId,
+        branch: ws.branch,
         leases: b.leases,
         tracker,
         signal: b.abort.signal,

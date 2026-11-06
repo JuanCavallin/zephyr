@@ -9,7 +9,9 @@ import type { MergeItem, TestTally } from '../core/coordination/mergeQueue.js';
 import { config } from '../config.js';
 import { bus, decisionService, providers, shapedTools, store } from './runtime.js';
 import { learningService } from './learning.runtime.js';
-import { BoardService } from './tasks.service.js';
+import { claudeCodeExecutor } from './claudeCodeRunner.js';
+import { publishRunLive } from './publish.service.js';
+import { BoardService, type BoardServiceDeps } from './tasks.service.js';
 import { workspaces } from './workspaces.service.js';
 
 /**
@@ -33,8 +35,24 @@ export function shapedTestTally(outputs: OutputStore) {
 
 let instance: BoardService | undefined;
 
+/** Live Claude Code runs board tasks; otherwise the scripted mock harness does. */
+function liveHarness(): Pick<BoardServiceDeps, 'executor' | 'candidates'> {
+  if (config.providers.claudecode.mode !== 'live') return {};
+  return {
+    executor: claudeCodeExecutor(),
+    candidates: [
+      { kind: 'agent', harness: 'claudecode', tier: 'standard' },
+      { kind: 'human', reason: 'reviewer' },
+    ],
+  };
+}
+
 export function boardService(): BoardService {
   instance ??= new BoardService({
+    ...liveHarness(),
+    // Pushes `zephyr/<boardRunId>` (never main) behind the run's approval gate.
+    publish: ({ boardRunId, stepId, title, openPr, signal }) =>
+      publishRunLive(boardRunId, { stepId, title, openPr, base: 'main', signal }),
     store,
     workspaceMode: config.providers.git.mode === 'live' ? 'live' : 'mock',
     emit: (runId, event) => bus.emit(runId, event),
