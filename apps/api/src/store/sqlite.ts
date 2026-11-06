@@ -18,7 +18,7 @@ import type {
   StoredEvent,
 } from '@htn/shared';
 import { nowIso } from '../lib/ids.js';
-import { NotFoundError, type ListRunsFilter, type Store } from './types.js';
+import { NotFoundError, type ListRunsFilter, type Store, type StoredSecret } from './types.js';
 
 export interface SqliteStore extends Store {
   hydrate(): Promise<void>;
@@ -144,6 +144,14 @@ export function createSqliteStore(path: string): SqliteStore {
       body TEXT NOT NULL
     );
     CREATE INDEX IF NOT EXISTS mcp_connections_name ON mcp_connections(name);
+
+    CREATE TABLE IF NOT EXISTS secrets (
+      ref TEXT PRIMARY KEY,
+      kind TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      body TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS secrets_kind ON secrets(kind);
   `);
 
   // Additive run-lineage migration. Older databases stored graphId only inside
@@ -327,6 +335,24 @@ export function createSqliteStore(path: string): SqliteStore {
     },
     async deleteMcpConnection(id) {
       return Number(db.prepare('DELETE FROM mcp_connections WHERE id = ?').run(id).changes) > 0;
+    },
+
+    async putSecret(secret) {
+      db.prepare(
+        `INSERT INTO secrets(ref, kind, updated_at, body) VALUES (?, ?, ?, ?)
+         ON CONFLICT(ref) DO UPDATE SET kind=excluded.kind, updated_at=excluded.updated_at,
+           body=excluded.body`,
+      ).run(secret.ref, secret.kind, secret.updatedAt, encode(secret));
+    },
+    async listSecrets(kind) {
+      return readRows<StoredSecret>(
+        kind
+          ? db.prepare('SELECT body FROM secrets WHERE kind = ? ORDER BY ref').all(kind)
+          : db.prepare('SELECT body FROM secrets ORDER BY ref').all(),
+      );
+    },
+    async deleteSecret(ref) {
+      return Number(db.prepare('DELETE FROM secrets WHERE ref = ?').run(ref).changes) > 0;
     },
 
     async getTargetMemory(key) {

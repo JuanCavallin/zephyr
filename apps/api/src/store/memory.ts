@@ -26,7 +26,7 @@ import type {
   StoredEvent,
 } from '@htn/shared';
 import { nowIso } from '../lib/ids.js';
-import { NotFoundError, type ListRunsFilter, type Store } from './types.js';
+import { NotFoundError, type ListRunsFilter, type Store, type StoredSecret } from './types.js';
 
 interface Snapshot {
   graphs?: AgentGraph[];
@@ -52,6 +52,8 @@ export function createMemoryStore(opts: { persistToDisk?: boolean } = {}): Store
   const approvals = new Map<string, Approval>();
   const sessionStates = new Map<string, AgentSessionState>();
   const mcpConnections = new Map<string, McpConnection>();
+  // The in-memory vault key is ephemeral, so its ciphertext is too: not in the snapshot.
+  const secrets = new Map<string, StoredSecret>();
   const egress = new Map<string, EgressEvent[]>();
   const pii = new Map<string, PiiSpanWithValue[]>();
   const scheduleDecisions = new Map<string, ScheduleDecision[]>();
@@ -265,6 +267,20 @@ export function createMemoryStore(opts: { persistToDisk?: boolean } = {}): Store
       const deleted = mcpConnections.delete(id);
       if (deleted) scheduleSave();
       return deleted;
+    },
+
+    /* ------------------------------------- Vault rows (never snapshotted) */
+    async putSecret(secret) {
+      secrets.set(secret.ref, structuredClone(secret));
+    },
+    async listSecrets(kind) {
+      return [...secrets.values()]
+        .filter((secret) => !kind || secret.kind === kind)
+        .sort((a, b) => a.ref.localeCompare(b.ref))
+        .map((secret) => structuredClone(secret));
+    },
+    async deleteSecret(ref) {
+      return secrets.delete(ref);
     },
 
     async getTargetMemory(key) {

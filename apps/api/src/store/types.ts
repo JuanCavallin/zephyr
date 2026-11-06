@@ -29,6 +29,20 @@ import type {
   StoredEvent,
 } from '@htn/shared';
 
+/** One vault row. `ciphertext`, `iv` and `tag` are base64; the plaintext never reaches the store. */
+export interface StoredSecret {
+  ref: string;
+  kind: string;
+  ciphertext: string;
+  iv: string;
+  tag: string;
+  version: number;
+  /** Non-secret attributes (e.g. a Browserbase project ID). */
+  metadata?: Record<string, string>;
+  createdAt: string;
+  updatedAt: string;
+}
+
 export interface ListRunsFilter {
   graphId?: string;
   status?: RunStatus;
@@ -83,6 +97,11 @@ export interface Store {
   getMcpConnection(id: string): Promise<McpConnection | null>;
   listMcpConnections(): Promise<McpConnection[]>;
   deleteMcpConnection(id: string): Promise<boolean>;
+
+  // Encrypted secrets (services/vault.ts). Ciphertext only; never plaintext.
+  putSecret(secret: StoredSecret): Promise<void>;
+  listSecrets(kind?: string): Promise<StoredSecret[]>;
+  deleteSecret(ref: string): Promise<boolean>;
 
   // Egress ledger (append-only)
   appendEgress(event: EgressEvent): Promise<EgressEvent>;
