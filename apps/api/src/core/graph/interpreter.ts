@@ -30,6 +30,7 @@
 import type { AgentGraph, DataLabel, GraphEdge, GraphNode, Json, ModelTier } from '@htn/shared';
 import { graphAncestorIds } from '@htn/shared';
 import type { PlaybookContext, PlaybookOutcome } from '../playbooks/types.js';
+import { runInSandbox } from '../sandbox/codeSandbox.js';
 import { collectRefs, lookup, resolveRefs, type RefScope } from './refs.js';
 import { toolRisk, UNKNOWN_TOOL_ACTION_KIND } from './toolRisk.js';
 import { isStaticDispatch, nodeHash, usableDispatch } from './compile.js';
@@ -327,6 +328,8 @@ async function executeNode(
       return runJudge(ctx, node, scope);
     case 'agent_task':
       return runAgentTaskNode(ctx, node, scope, graph);
+    case 'code':
+      return runCode(ctx, node, scope);
     case 'swarm':
       return runSwarm(ctx, node, scope, graph);
     case 'submit':
@@ -440,6 +443,69 @@ async function runDecide(
 
   void graph;
   return { value: { text }, output: { chars: text.length } };
+}
+
+/* --------------------------------------------------------------------- code */
+
+const CODE_SYSTEM =
+  'You write one small JavaScript ES module. It reads JSON from stdin shaped {"inputs": {...}}, ' +
+  'does the task, and prints exactly ONE JSON value to stdout with console.log(JSON.stringify(...)). ' +
+  'No network, no child processes, no files: none are available. No dependencies beyond built-in ' +
+  'JavaScript. Reply with the code only, no explanation and no markdown fences.';
+
+/** Models fence code anyway; take the first fenced block if there is one. */
+export function stripCodeFence(text: string): string {
+  const m = /```(?:\w+)?\r?\n([\s\S]*?)```/.exec(text);
+  return (m ? m[1]! : text).trim();
+}
+
+async function runCode(
+  ctx: PlaybookContext,
+  node: Extract<GraphNode, { type: 'code' }>,
+  scope: RefScope,
+): Promise<NodeResult> {
+  const cfg = resolveRefs(node.config, scope);
+
+  const out = await ctx.step(
+    { label: node.label, kind: 'code', nodeId: node.id, providerId: cfg.source ? undefined : ctx.providerFor('text.model') },
+    async (step) => {
+      let source = cfg.source;
+      let generated = false;
+      if (!source) {
+        // TODO(code-node): look up a cached, previously-green script for hash(goal + input
+        // keys) before paying for generation, and store this one if it passes.
+        const model = ctx.provider('text.model');
+        const res = await model.complete(
+          {
+            // Input KEYS only: the values may be private and never go to the model.
+            prompt:
+              'Task: ' +
+              cfg.goal +
+              '\nAvailable input keys: ' +
+              (Object.keys(cfg.inputs).join(', ') || '(none)'),
+            system: CODE_SYSTEM,
+            tier: cfg.tier ?? 'standard',
+            maxTokens: 2048,
+            temperature: 0,
+          },
+          ctx.callContext({ stepId: step.id, policyRule: 'graph-code-generation' }),
+        );
+        if (!res.ok) throw new Error('Could not generate code for "' + node.label + '": ' + res.error.code);
+        source = stripCodeFence(res.data.text);
+        generated = true;
+      }
+      // TODO(code-node): generated source runs UNREVIEWED here. Gate the first run of a
+      // given source hash behind an approval before this leaves the demo.
+      const run = await runInSandbox(source, { inputs: cfg.inputs, timeoutMs: cfg.timeoutMs, signal: ctx.signal });
+      if (!run.ok) throw new Error('Code node "' + node.label + '" failed (' + run.failure + '): ' + run.error);
+      return { result: run.result, generated, sourceHash: run.sourceHash, durationMs: run.durationMs };
+    },
+  );
+
+  return {
+    value: out as unknown as Json,
+    output: { generated: out.generated, sourceHash: out.sourceHash, durationMs: out.durationMs },
+  };
 }
 
 /* ---------------------------------------------------------------- tool calls */

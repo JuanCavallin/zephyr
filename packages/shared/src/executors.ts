@@ -59,6 +59,9 @@ export const EXECUTOR_BY_NODE_TYPE: Record<GraphNodeType, NodeExecutor> = {
   judge: 'decision',
   decide: 'model',
   agent_task: 'agent',
+  // Sandboxed script. Classed `program` because the RUN is deterministic code; when the
+  // source is generated that costs one `model` call first (TODO(code-node): surface it).
+  code: 'program',
   approval: 'human',
   handoff: 'human',
   swarm: 'group',
@@ -167,6 +170,7 @@ export const NODE_TYPE_ICON: Record<GraphNodeType | 'worker' | 'task', string> =
   dispatch: '⚙️',
   decide: '◆',
   agent_task: '🕶️',
+  code: '⌘',
   swarm: '⋯',
   judge: '⚖',
   submit: '↥',
