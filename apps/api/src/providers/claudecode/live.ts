@@ -31,6 +31,7 @@ import { join } from 'node:path';
 import type {
   AgentRuntimeAdapter,
   NativeToolRequest,
+  PermissionBridgeSeam,
   PermissionVerdict,
   ProviderCallContext,
   ProviderErrorCode,
@@ -179,6 +180,22 @@ export interface ClaudeCodeRuntimeDeps {
   worktrees?: RunWorktrees;
   /** Step 5 L2: builds the Jev-ranked context pack prepended to the goal. */
   contextPack?: ContextPackBuilder;
+  /**
+   * Run in a worktree someone else already opened (a board task's, a graph node's)
+   * instead of opening one for `runId`. Checkpoints and diffs then use
+   * `workspaceRunId`; approvals, hooks and events stay on the run. `taskId` and
+   * `leases` bind the permission bridge to a board task's write lease. Keyed by run
+   * AND step, so two coding nodes of one graph run never share a worktree.
+   */
+  attach?: (runId: string, stepId: string | undefined) => AttachedWorkspace | undefined;
+}
+
+export interface AttachedWorkspace {
+  path: string;
+  branch: string;
+  workspaceRunId: string;
+  taskId?: string;
+  leases?: PermissionBridgeSeam;
 }
 
 interface TaskRecord {
@@ -200,6 +217,8 @@ interface TaskRecord {
   stateDir: string;
   worktree: string;
   branch: string;
+  /** The workspace checkpoints and diffs use: `runId`, or the attached workspace's. */
+  workspaceRunId: string;
   /** Resolves when the current turn's background work (checkpoint + prompt) ends. */
   turn: Promise<void>;
 }
@@ -277,7 +296,7 @@ export function createClaudeCodeRuntime(deps: ClaudeCodeRuntimeDeps): ClaudeCode
       const turnId = newId('turn');
       try {
         const ws = await deps.workspaces();
-        const checkpoint = await ws.checkpointTurn(record.runId);
+        const checkpoint = await ws.checkpointTurn(record.workspaceRunId);
         record.log.push('checkpoint: turn ' + checkpoint.turn + ' @ ' + checkpoint.ref);
         await emit(record.runId, {
           type: 'workspace.checkpoint',
@@ -353,7 +372,9 @@ export function createClaudeCodeRuntime(deps: ClaudeCodeRuntimeDeps): ClaudeCode
       const levers = resolveLevers(input.levers);
       try {
         const ws = await deps.workspaces();
-        const workspace = await ws.open(ctx.runId);
+        const attached = deps.attach?.(ctx.runId, ctx.stepId);
+        const workspace = attached ?? (await ws.open(ctx.runId));
+        const workspaceRunId = attached?.workspaceRunId ?? ctx.runId;
         worktrees.bind(ctx.runId, workspace.path);
         boundWorktree = workspace.path;
         stateDir = await mkdtemp(join(tmpdir(), 'zephyr-claudecode-'));
@@ -378,9 +399,11 @@ export function createClaudeCodeRuntime(deps: ClaudeCodeRuntimeDeps): ClaudeCode
             : {}),
           ...(deps.authorize ? { authorize: deps.authorize } : {}),
           ...(approvals ? { approvals } : {}),
+          ...(attached?.leases ? { leases: attached.leases } : {}),
+          ...(attached?.taskId ? { taskId: attached.taskId } : {}),
           publishBinding: async () => ({
             branch: workspace.branch,
-            diffHash: (await ws.diff(ctx.runId)).hash,
+            diffHash: (await ws.diff(workspaceRunId)).hash,
           }),
           onLifecycle: (lifecycle) => emit(ctx.runId, { type: 'tool.lifecycle', lifecycle }).then(() => {}),
           log: (m) => log('native permission: ' + m),
@@ -457,6 +480,7 @@ export function createClaudeCodeRuntime(deps: ClaudeCodeRuntimeDeps): ClaudeCode
           stateDir,
           worktree: workspace.path,
           branch: workspace.branch,
+          workspaceRunId,
           turn: Promise.resolve(),
         };
         tasks.set(record.taskId, record);
@@ -583,7 +607,13 @@ export function createLiveClaudeCode(cfg: ProviderConfig): AgentRuntimeAdapter {
       onPermissionRequest: async () => 'deny',
     };
   }
-  return createClaudeCodeRuntime({
+  return createClaudeCodeRuntime(liveClaudeCodeDeps(cfg));
+}
+
+/** The production deps over the runtime singletons. Requires `cfg.binary`. */
+export function liveClaudeCodeDeps(cfg: ProviderConfig): ClaudeCodeRuntimeDeps {
+  if (!cfg.binary) throw new Error('CLAUDECODE_BINARY (claude-agent-acp dist/index.js) is not set');
+  return {
     // Subscription unless CLAUDECODE_AUTH=api: forgetting the toggle must never bill credits.
     auth: cfg.auth ?? 'subscription',
     harness: claudeCodeHarness({ binary: cfg.binary, mcp: Boolean(cfg.mcpUrl), auth: cfg.auth ?? 'subscription' }),
@@ -609,5 +639,5 @@ export function createLiveClaudeCode(cfg: ProviderConfig): AgentRuntimeAdapter {
     apiBaseUrl: `http://127.0.0.1:${config.port}`,
     gatewayUrl: anthropicBaseUrl(cfg.baseUrl ?? config.modelGateway.baseUrl),
     ...(cfg.mcpUrl ? { mcpUrl: cfg.mcpUrl } : {}),
-  });
+  };
 }

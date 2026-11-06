@@ -103,6 +103,11 @@ export interface PermissionBridgeOptions {
    * lease reason so the agent can request an extension or submit a hot-file intent.
    */
   leases?: PermissionBridgeSeam;
+  /**
+   * The board task this bridge serves, for requests that do not carry a `taskId`
+   * themselves (Claude Code's ACP and hook requests never do).
+   */
+  taskId?: string;
 }
 
 export interface PermissionBridge {
@@ -225,14 +230,15 @@ export function createPermissionBridge(opts: PermissionBridgeOptions): Permissio
     // Step 7: a board task writes only inside its lease. Checked before anything is
     // asked of a person: an out-of-lease write is denied, never escalated.
     let lease: LeaseDecision | undefined;
+    const taskId = req.taskId ?? opts.taskId;
     if (
       opts.leases &&
-      req.taskId &&
+      taskId &&
       exact.toolId === 'fs.write' &&
       exact.defaultPolicy !== 'deny' &&
       typeof args.path === 'string'
     ) {
-      lease = opts.leases.checkLease(req.taskId, args.path.replace(/\\/g, '/'), 'write');
+      lease = opts.leases.checkLease(taskId, args.path.replace(/\\/g, '/'), 'write');
       if (!lease.allowed) {
         const reason = 'lease ' + lease.reason + ': ' + lease.message;
         log('deny ' + req.toolName + ': ' + reason);
