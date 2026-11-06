@@ -3,6 +3,7 @@ import { config, logConfigSummary } from './config.js';
 import { flushObservability, initObservability } from './lib/observability.js';
 import { seedGraphs } from './services/graphs.service.js';
 import { store } from './store/index.js';
+import { credentials } from './services/credentials.js';
 import { initializeRuntimeProviders, recoverInterruptedRuns } from './services/runtime.js';
 import { reapOrphanWorkspaces } from './services/workspaces.service.js';
 
@@ -20,6 +21,8 @@ async function main(): Promise<void> {
 
   // SQLite performs schema setup at construction; memory hydrate is a no-op.
   await store.hydrate();
+  // Persisted user keys, decrypted from the vault. Unreadable ones are reported, not dropped.
+  await credentials.hydrate();
   await recoverInterruptedRuns();
   // A crashed process leaves its runs' worktrees on disk; nothing is active yet.
   await reapOrphanWorkspaces();
