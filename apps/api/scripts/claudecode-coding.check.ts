@@ -39,7 +39,7 @@ const { mockPeerHarness } = await import('../src/providers/_acp/mockPeer.js');
 const { createLiveGitWorkspaces } = await import('../src/providers/git/live.js');
 const { createWorkspacesService } = await import('../src/services/workspaces.service.js');
 const { execArgv } = await import('../src/services/publish.service.js');
-const { createAttachableClaudeCode, runClaudeCodeInWorktree, claudeCodeExecutor, boardTaskPrompt } = await import(
+const { createAttachableClaudeCode, runClaudeCodeInWorktree, claudeCodeExecutor, boardTaskPrompt, parseIntents } = await import(
   '../src/services/claudeCodeRunner.js'
 );
 const { createCodingTaskRunner, codingWorkspaceRunId } = await import('../src/services/codingTask.service.js');
@@ -351,6 +351,46 @@ await test('executor: Claude Code writes, the tracker sees the file, ctx.step ra
   assert.ok(steps.n >= 1, 'progress published');
   assert.equal(ctx.tracker.snapshot().turns, 1);
   await base.finish('run_exec', 'cancelled', { keepBranch: false });
+});
+
+await test('parseIntents: valid lines become intents, malformed ones are errors, prose is ignored', () => {
+  const ok = parseIntents(
+    'Done.\nZEPHYR_INTENT {"kind":"export_symbol","path":"src/index.js","payload":{"from":"./math.js","symbols":["clamp"]},"description":"export clamp"}\n',
+  );
+  assert.deepEqual(ok.errors, []);
+  assert.deepEqual(ok.intents, [
+    { kind: 'export_symbol', path: 'src/index.js', payload: { from: './math.js', symbols: ['clamp'] }, description: 'export clamp' },
+  ]);
+  assert.equal(parseIntents('ZEPHYR_INTENT {"kind":"export_symbol"').errors.length, 1, 'truncated JSON');
+  assert.equal(parseIntents('ZEPHYR_INTENT {"kind":"delete_repo","path":"x","payload":{},"description":"x"}').errors.length, 1);
+  // The prompt's own examples never parse as a request, even when echoed back.
+  const echoed = parseIntents(boardTaskPrompt({ title: 't', acceptance: 'a', writeScope: ['src/a.js'] }));
+  assert.deepEqual(echoed, { intents: [], errors: [] });
+});
+
+await test('executor: a ZEPHYR_INTENT line is submitted; a rejected one fails the task', async () => {
+  const intent = { kind: 'export_symbol', path: 'src/index.js', payload: { from: './math.js', symbols: ['clamp'] }, description: 'export clamp' };
+  const ws = await base.open('run_intent');
+  const ctx = execCtx(makeTask('say:ZEPHYR_INTENT ' + JSON.stringify(intent)), ws, 'run_intent', { n: 0 });
+  const submitted: unknown[] = [];
+  ctx.submitIntent = async (sub) => {
+    submitted.push(sub);
+    return { status: 'applied' };
+  };
+  const out = await claudeCodeExecutor({ claudeCode: () => cc, pollMs: 20 })(ctx);
+  assert.equal(out.status, 'done', out.detail);
+  assert.deepEqual(submitted, [intent]);
+
+  ctx.submitIntent = async () => ({ status: 'rejected', error: 'export_symbol payload: not a relative module specifier' });
+  const rejected = await claudeCodeExecutor({ claudeCode: () => cc, pollMs: 20 })(ctx);
+  assert.equal(rejected.status, 'failed');
+  assert.match(rejected.detail ?? '', /intent rejected: export_symbol payload/);
+
+  const bad = execCtx(makeTask('say:ZEPHYR_INTENT {not json}'), ws, 'run_intent', { n: 0 });
+  const malformed = await claudeCodeExecutor({ claudeCode: () => cc, pollMs: 20 })(bad);
+  assert.equal(malformed.status, 'failed');
+  assert.match(malformed.detail ?? '', /malformed ZEPHYR_INTENT/);
+  await base.finish('run_intent', 'cancelled', { keepBranch: false });
 });
 
 await test('executor: a budget breach thrown by ctx.step propagates after teardown', async () => {

@@ -8,8 +8,10 @@
  * permission bridge, and a board task's bridge enforces its write lease.
  */
 
-import type { PermissionBridgeSeam, ProviderCallContext, Task } from '@htn/shared';
+import type { Json, PermissionBridgeSeam, ProviderCallContext, Task } from '@htn/shared';
+import { z } from 'zod';
 import { config } from '../config.js';
+import type { IntentSubmission } from '../core/coordination/integrator.js';
 import type { Exec } from '../core/verify/publish.js';
 import {
   createClaudeCodeRuntime,
@@ -168,7 +170,49 @@ export function boardTaskPrompt(task: Pick<Task, 'title' | 'acceptance' | 'write
     ...(task.acceptance ? ['Done when: ' + task.acceptance, ''] : []),
     'Change files only inside: ' + task.writeScope.join(', ') + '. Writes anywhere else are denied.',
     'Run the tests you add. Do not commit, push or switch branches: Zephyr commits and merges your work.',
+    '',
+    'Shared files (barrels such as src/index.js, package.json) are never yours to edit. When the task',
+    'needs one changed, end your final message with one line per change: the word ZEPHYR_INTENT, a',
+    'space, then one JSON object on the same line. Zephyr applies it for you. The two kinds:',
+    '  {"kind":"export_symbol","path":"src/index.js","payload":{"from":"./math.js","symbols":["clamp"]},"description":"export clamp"}',
+    '  {"kind":"add_dependency","path":"package.json","payload":{"name":"zod","version":"^3.23.0"},"description":"add zod"}',
   ].join('\n');
+}
+
+const INTENT_LINE = /^\s*ZEPHYR_INTENT\s+(\{.*\})\s*$/;
+
+const intentLineSchema = z.object({
+  kind: z.enum(['export_symbol', 'add_dependency']),
+  path: z.string().min(1).max(500),
+  description: z.string().min(1).max(300),
+  payload: z.record(z.string(), z.unknown()),
+});
+
+/**
+ * The hot-file intents in Claude Code's final message. Every `ZEPHYR_INTENT` line
+ * must parse: a malformed one is returned as an error, never skipped, so an
+ * export the task was asked for cannot vanish without a trace.
+ */
+export function parseIntents(text: string): { intents: Omit<IntentSubmission, 'taskId'>[]; errors: string[] } {
+  const intents: Omit<IntentSubmission, 'taskId'>[] = [];
+  const errors: string[] = [];
+  for (const line of text.split(/\r?\n/)) {
+    if (!/^\s*ZEPHYR_INTENT\b/.test(line)) continue;
+    const json = INTENT_LINE.exec(line)?.[1];
+    let parsed: unknown;
+    try {
+      parsed = json ? JSON.parse(json) : undefined;
+    } catch {
+      parsed = undefined;
+    }
+    const r = intentLineSchema.safeParse(parsed);
+    if (!r.success) {
+      errors.push('malformed ZEPHYR_INTENT line: ' + line.trim().slice(0, 200));
+      continue;
+    }
+    intents.push({ ...r.data, payload: r.data.payload as Json });
+  }
+  return { intents, errors };
 }
 
 /** The board's executor on live Claude Code. */
@@ -194,8 +238,16 @@ export function claudeCodeExecutor(
       },
     });
     ctx.tracker.observeTurn();
-    return result.status === 'done'
-      ? { status: 'done', ...(result.text ? { detail: result.text.slice(0, 500) } : {}) }
-      : { status: 'failed', detail: result.detail ?? 'Claude Code failed' };
+    if (result.status !== 'done') return { status: 'failed', detail: result.detail ?? 'Claude Code failed' };
+
+    // Hot-file changes the task asked for, applied by the integrator.
+    const { intents, errors } = parseIntents(result.text);
+    if (errors.length) return { status: 'failed', detail: errors.join('; ') };
+    for (const intent of intents) {
+      const r = await ctx.submitIntent(intent);
+      if (r.status === 'rejected') return { status: 'failed', detail: 'intent rejected: ' + (r.error ?? intent.description) };
+    }
+    const text = result.text.slice(0, 500);
+    return { status: 'done', ...(text ? { detail: text } : {}) };
   };
 }

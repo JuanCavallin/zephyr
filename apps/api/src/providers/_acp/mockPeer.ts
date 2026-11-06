@@ -8,6 +8,7 @@
  *
  *   complete            text chunks + a tool call, then end_turn
  *   write:<name>=<text> write <text> to <session cwd>/<name>, then end_turn
+ *   say:<text>          say <text> verbatim (one line), then end_turn
  *   session-meta        write the session/new `_meta` to <cwd>/session-meta.json, then end_turn
  *   permission          ask session/request_permission; write permitted.txt
  *                       and say "allowed" if granted, say "denied" otherwise
@@ -231,6 +232,11 @@ function runPeer(): void {
       update(sessionId, { sessionUpdate: 'tool_call', toolCallId, title: toolName, kind, status: 'completed', rawInput: input });
       if (flag !== 'nohook') await postHook('PostToolUse', { ...common, tool_response: response });
       say(sessionId, 'allowed:' + toolName);
+      return done();
+    }
+
+    if (scenario.startsWith('say:')) {
+      say(sessionId, scenario.slice('say:'.length));
       return done();
     }
 
