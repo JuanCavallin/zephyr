@@ -5,6 +5,9 @@ import { credentialsRouter } from '../src/api/credentials.routes.js';
 import { HttpError } from '../src/api/middleware/validate.js';
 import { parseEnvCredentials } from '../src/services/credentialImport.js';
 import { verifyCredential } from '../src/services/credentialVerify.js';
+import { buildIntegrations } from '../src/services/integrations.service.js';
+import { integrationsRouter } from '../src/api/integrations.routes.js';
+import type { IntegrationsResponse, McpConnection } from '@htn/shared';
 
 // ---- .env parsing: CRLF, export prefixes, quotes, comments, aliases, metadata.
 {
@@ -153,3 +156,127 @@ try {
 }
 
 console.log('Integrations: .env import, verify and import routes checks passed.');
+
+// ---- buildIntegrations: one truthful status per item, summary counts.
+{
+  const at = '2026-11-05T00:00:00.000Z';
+  const mcp = (status: McpConnection['status'], tools: number, lastError?: string) =>
+    ({
+      id: 'm-' + status,
+      name: 'MCP ' + status,
+      url: 'https://mcp.example/' + status,
+      transport: 'streamable_http',
+      enabled: status !== 'disabled',
+      headerEnv: {},
+      status,
+      toolIds: Array.from({ length: tools }, (_, i) => 't' + i),
+      executableToolIds: [],
+      ...(lastError ? { lastError } : {}),
+      createdAt: at,
+      updatedAt: at,
+    }) satisfies McpConnection;
+  const result = buildIntegrations({
+    credentials: [
+      {
+        providerId: 'anthropic',
+        purpose: 'model',
+        source: 'user',
+        configured: true,
+        version: 2,
+        last4: 'abcd',
+        updatedAt: at,
+      },
+      { providerId: 'gemini', purpose: 'model', source: 'user', configured: false },
+      {
+        providerId: 'tavily',
+        purpose: 'search',
+        source: 'user',
+        configured: false,
+        error: 'Vault key changed; re-enter this key.',
+      },
+      {
+        providerId: 'browserbase',
+        purpose: 'browser',
+        source: 'operator',
+        configured: true,
+        last4: '9999',
+      },
+    ],
+    mcp: [mcp('connected', 3), mcp('error', 0, 'HTTP 500'), mcp('disabled', 1)],
+    providers: [
+      { id: 'hermes', mode: 'live', capabilities: [], healthy: true, detail: 'Configured' },
+      {
+        id: 'claudecode',
+        mode: 'live',
+        capabilities: [],
+        healthy: false,
+        detail: 'binary missing',
+      },
+      { id: 'composio', mode: 'mock', capabilities: [], healthy: true },
+      { id: 'gemini', mode: 'live', capabilities: [], healthy: true },
+    ],
+  });
+  const item = (kind: string, id: string) =>
+    result.items.find((i) => i.kind === kind && i.id === id)!;
+  assert.deepEqual(
+    { s: item('key', 'anthropic').status, d: item('key', 'anthropic').detail },
+    { s: 'connected', d: '…abcd · your key' },
+  );
+  assert.equal(item('key', 'anthropic').updatedAt, at);
+  assert.equal(item('key', 'browserbase').detail, '…9999 · operator key');
+  assert.equal(item('key', 'gemini').status, 'available');
+  assert.equal(item('key', 'tavily').status, 'error');
+  assert.match(item('key', 'tavily').reason ?? '', /Vault key changed/);
+  assert.equal(item('mcp', 'm-connected').detail, '3 tools');
+  assert.equal(item('mcp', 'm-error').status, 'error');
+  assert.equal(item('mcp', 'm-error').reason, 'HTTP 500');
+  assert.equal(item('mcp', 'm-disabled').status, 'disabled');
+  assert.equal(item('harness', 'hermes').status, 'connected');
+  assert.equal(item('harness', 'claudecode').status, 'needs_attention');
+  assert.equal(item('harness', 'claudecode').reason, 'binary missing');
+  assert.match(item('harness', 'claudecode').fix ?? '', /CLAUDECODE_MODE/);
+  assert.equal(item('connector', 'composio').status, 'available');
+  assert.equal(item('connector', 'composio').detail, 'mock');
+  assert.equal(
+    result.items.some((i) => i.id === 'gemini' && i.kind !== 'key'),
+    false,
+  );
+  assert.deepEqual(result.summary, { connected: 4, needsAttention: 3, available: 2 });
+  console.log('Integrations: aggregate status mapping checks passed.');
+}
+
+// ---- GET /api/integrations requires the local capability and returns the read model.
+{
+  const app2 = express();
+  app2.use(express.json());
+  app2.use('/api', credentialsRouter);
+  app2.use('/api', integrationsRouter);
+  app2.use(
+    (error: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+      res.status(error instanceof HttpError ? error.status : 500).json({ error: 'error' });
+    },
+  );
+  const server2 = app2.listen(0, '127.0.0.1');
+  await new Promise<void>((resolve) => server2.once('listening', resolve));
+  const port = (server2.address() as { port: number }).port;
+  try {
+    const url = 'http://127.0.0.1:' + port + '/api';
+    assert.equal((await fetch(url + '/integrations')).status, 401);
+    const session = await fetch(url + '/credentials/session', {
+      method: 'POST',
+      headers: { Origin: config.webOrigin },
+    });
+    const cookie = session.headers.get('set-cookie')!.split(';')[0]!;
+    const response = await fetch(url + '/integrations', {
+      headers: { Cookie: cookie, Origin: config.webOrigin },
+    });
+    assert.equal(response.status, 200);
+    const body = (await response.json()) as IntegrationsResponse;
+    assert.equal(typeof body.summary.connected, 'number');
+    assert.ok(body.items.some((i) => i.kind === 'key' && i.id === 'anthropic'));
+    assert.ok(body.items.some((i) => i.kind === 'harness' && i.id === 'hermes'));
+  } finally {
+    await new Promise<void>((resolve) => server2.close(() => resolve()));
+  }
+  console.log('Integrations: route checks passed.');
+}

@@ -20,6 +20,7 @@ export * from './domain.js';
 export * from './evidenceSummary.js';
 export * from './events.js';
 export * from './executors.js';
+export * from './integrations.js';
 export * from './mcp.js';
 export * from './policy.js';
 export * from './pricing.js';
