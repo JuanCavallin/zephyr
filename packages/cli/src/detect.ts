@@ -197,6 +197,11 @@ export function formatDetection(d: Detection, versions: Partial<Record<HarnessBi
   }
   if (!d.binaries.some((b) => b.path))
     lines.push('  No harness found: boards run on the scripted mock harness. Install Claude Code or Codex for real runs.');
+  if (d.binaries.some((b) => b.name === 'claude' && b.path))
+    lines.push(
+      '  Use your Claude Code subscription instead of API credits: zephyr hook install --cwd <project>',
+      '  (Observed mode: your own sessions appear on /runs. Board and supervised runs bill ANTHROPIC_API_KEY.)',
+    );
   lines.push('Workspaces');
   lines.push(
     d.gitMode === 'live'

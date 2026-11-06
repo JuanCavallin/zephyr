@@ -118,6 +118,7 @@ await test('detect: keys from env and .env, empty values are absent, values neve
   assert.ok(!JSON.stringify(d).includes(SECRET), 'a key value leaked into the detection');
   assert.match(text, /✓ Claude Code .*claude\.cmd \(shim\), 9\.9\.9/);
   assert.match(text, /✗ Codex \(codex\) not on PATH/);
+  assert.match(text, /subscription.*zephyr hook install/s, 'Claude Code present: the Observed hint shows');
 });
 
 await test('detect: GIT_MODE from env or .env; MOCK_ALL forces mock; mock warns that boards cannot run', () => {
@@ -133,6 +134,7 @@ await test('detect: GIT_MODE from env or .env; MOCK_ALL forces mock; mock warns 
   assert.equal(d({ PATH: '', MOCK_ALL: 'false' }).gitMode, 'live');
   assert.match(formatDetection(d({ PATH: '' }, 'linux', false)), /✗ GIT_MODE=mock: boards cannot run/);
   assert.match(formatDetection(d({ PATH: '' })), /✓ GIT_MODE=live/);
+  assert.doesNotMatch(formatDetection(d({ PATH: '' })), /subscription/, 'no claude on PATH: no hint');
 });
 
 await test('detect: no harness at all says boards run on the mock harness', () => {
