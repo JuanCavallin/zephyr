@@ -507,6 +507,32 @@ await test('adapter helpers', () => {
   assert.deepEqual(h.gatewayEnv('http://gw', 't'), { ANTHROPIC_BASE_URL: 'http://gw', ANTHROPIC_AUTH_TOKEN: 't' });
   assert.equal(h.env({ cwd: worktree, gateway: { url: '', token: '' }, stateDir: '/s' }).CLAUDE_CONFIG_DIR, '/s');
 });
+await test('subscription auth: no gateway env, real config dir, ambient API creds scrubbed, hooks via --settings', async () => {
+  const { settingsMeta } = await import('../src/providers/claudecode/live.js');
+  const { buildHarnessEnv } = await import('../src/providers/_acp/config.js');
+  const h = claudeCodeHarness({ binary: '/x/dist/index.js', auth: 'subscription' });
+  assert.deepEqual(h.gatewayEnv('http://gw', 't'), {});
+  const dirty = {
+    PATH: process.env.PATH ?? '',
+    ANTHROPIC_API_KEY: 'sk-ant-leak',
+    ANTHROPIC_AUTH_TOKEN: 'leak',
+    ANTHROPIC_BASE_URL: 'http://leak',
+  } as NodeJS.ProcessEnv;
+  const env = buildHarnessEnv(h, { cwd: worktree, gateway: { url: 'http://gw', token: 't' }, stateDir: '/s' }, dirty);
+  assert.equal(env.CLAUDE_CONFIG_DIR, undefined);
+  assert.equal(env.ANTHROPIC_API_KEY, undefined);
+  assert.equal(env.ANTHROPIC_AUTH_TOKEN, undefined);
+  assert.equal(env.ANTHROPIC_BASE_URL, undefined);
+  const meta = settingsMeta('/s/settings.json', { claudeCode: { options: { extraArgs: { 'strict-mcp-config': null } } } }) as {
+    claudeCode: { options: { extraArgs: Record<string, string | null> } };
+  };
+  assert.deepEqual(meta.claudeCode.options.extraArgs, { 'strict-mcp-config': null, settings: '/s/settings.json' });
+  // api mode (the opt-in) still routes through the gateway.
+  const api = buildHarnessEnv(claudeCodeHarness({ auth: 'api' }), { cwd: worktree, gateway: { url: 'http://gw', token: 't' }, stateDir: '/s' }, dirty);
+  assert.equal(api.ANTHROPIC_BASE_URL, 'http://gw');
+  assert.equal(api.CLAUDE_CONFIG_DIR, '/s');
+  assert.equal(api.ANTHROPIC_API_KEY, undefined);
+});
 await test('registry entry: mock by default, live without a binary refuses', async () => {
   const mock = createClaudeCode({ id: 'claudecode', mode: 'mock' } as never);
   assert.equal(mock.mode, 'mock');

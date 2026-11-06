@@ -67,6 +67,29 @@ import { claudeCodeSessionMeta, nativeToolPolicy } from '../../core/tools/toolPo
 import { runWorktrees, type RunWorktrees } from '../../core/tools/shaped/worktrees.js';
 import { goalWithContextPack, type ContextPackBuilder } from '../../core/context/index.js';
 
+/**
+ * `subscription`: the user's own logged-in `claude` credentials, no API spend.
+ * `api`: Zephyr's model gateway, billed to ANTHROPIC_API_KEY credits.
+ */
+export type ClaudeCodeAuth = 'subscription' | 'api';
+
+/**
+ * Subscription mode keeps Claude Code's real config dir (that is where the login is), so
+ * the per-run hooks file is handed over as `--settings`, merged with any session meta.
+ */
+export function settingsMeta(
+  settingsPath: string,
+  meta?: Record<string, unknown>,
+): Record<string, unknown> {
+  const claudeCode = (meta?.claudeCode ?? {}) as { options?: Record<string, unknown> };
+  const options = claudeCode.options ?? {};
+  const extraArgs = (options.extraArgs ?? {}) as Record<string, string | null>;
+  return {
+    ...meta,
+    claudeCode: { ...claudeCode, options: { ...options, extraArgs: { ...extraArgs, settings: settingsPath } } },
+  };
+}
+
 /** The claude-agent-acp release this Zephyr build was verified against. */
 export const CLAUDE_AGENT_ACP_VERSION = '0.99.1';
 
@@ -75,19 +98,27 @@ export const CLAUDE_AGENT_ACP_VERSION = '0.99.1';
  * under this Node (no shell, no `.cmd` shim), anything else is spawned as given.
  */
 export function claudeCodeHarness(
-  opts: { binary?: string; mcp?: boolean } = {},
+  opts: { binary?: string; mcp?: boolean; auth?: ClaudeCodeAuth } = {},
   overrides: Partial<AcpHarnessConfig> = {},
 ): AcpHarnessConfig {
   const binary = opts.binary ?? 'claude-agent-acp';
   const isScript = /\.(c|m)?js$/i.test(binary);
+  const subscription = opts.auth === 'subscription';
   return {
     harness: 'claudecode',
     binary: isScript ? process.execPath : binary,
     args: isScript ? [binary] : [],
-    gatewayEnv: (url, token) => ({ ANTHROPIC_BASE_URL: url, ANTHROPIC_AUTH_TOKEN: token }),
+    // Subscription: nothing points Claude Code at an endpoint or hands it a token, so it
+    // uses the login in the user's own ~/.claude. The env is an allowlist, so an ambient
+    // ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN / ANTHROPIC_BASE_URL never reaches it.
+    gatewayEnv: subscription
+      ? () => ({})
+      : (url, token) => ({ ANTHROPIC_BASE_URL: url, ANTHROPIC_AUTH_TOKEN: token }),
     env: (ctx) => ({
-      // Per-run user settings (the hooks) and session state, outside the worktree.
-      ...(ctx.stateDir ? { CLAUDE_CONFIG_DIR: ctx.stateDir } : {}),
+      // Per-run user settings (the hooks) and session state, outside the worktree. Not in
+      // subscription mode: the login lives in the config dir, and Zephyr must not copy it.
+      // The hooks reach Claude Code through `--settings` instead (see settingsMeta).
+      ...(ctx.stateDir && !subscription ? { CLAUDE_CONFIG_DIR: ctx.stateDir } : {}),
       DISABLE_AUTOUPDATER: '1',
       CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
     }),
@@ -137,6 +168,11 @@ export interface ClaudeCodeRuntimeDeps {
   platform?: ShellPlatform;
   /** Require a trusted gateway credential on startTask (production: yes). */
   requireGatewayCredentials?: boolean;
+  /**
+   * Must match how `harness` was built. `subscription` skips the gateway entirely: no
+   * model credential is required or minted. Default `api`.
+   */
+  auth?: ClaudeCodeAuth;
   stderr?: 'inherit' | 'ignore';
   log?: (message: string) => void;
   /** Where shaped tools find a run's worktree (Step 5 L1). Defaults to the process registry. */
@@ -301,7 +337,11 @@ export function createClaudeCodeRuntime(deps: ClaudeCodeRuntimeDeps): ClaudeCode
 
     async startTask(input, ctx) {
       const started = Date.now();
-      if (deps.requireGatewayCredentials !== false && !ctx.gatewayCredentials) {
+      const subscription = deps.auth === 'subscription';
+      // Subscription mode never touches the model gateway, so only an MCP endpoint (which
+      // has its own token) needs a trusted binding.
+      const needsBinding = subscription ? Boolean(deps.mcpUrl) : deps.requireGatewayCredentials !== false;
+      if (needsBinding && !ctx.gatewayCredentials) {
         return failure('startTask', started, 'AUTH', 'A trusted scoped gateway binding is required.');
       }
       const stepId = ctx.stepId ?? 'unbound';
@@ -364,7 +404,7 @@ export function createClaudeCodeRuntime(deps: ClaudeCodeRuntimeDeps): ClaudeCode
         });
         await writeFile(join(stateDir, 'settings.json'), JSON.stringify(settings, null, 2), 'utf8');
 
-        gatewayToken = deps.gatewayTokens?.mint({
+        gatewayToken = subscription ? undefined : deps.gatewayTokens?.mint({
           runId: ctx.runId,
           harness: 'claudecode',
           ...(ctx.sessionStateId ? { sessionStateId: ctx.sessionStateId } : {}),
@@ -379,6 +419,8 @@ export function createClaudeCodeRuntime(deps: ClaudeCodeRuntimeDeps): ClaudeCode
           ...(deps.mcpUrl ? { mcp: { url: deps.mcpUrl, token: ctx.gatewayCredentials?.mcp ?? '' } } : {}),
           stateDir,
         };
+        const policyMeta = toolPolicy ? claudeCodeSessionMeta(toolPolicy) : undefined;
+        const sessionMeta = subscription ? settingsMeta(join(stateDir, 'settings.json'), policyMeta) : policyMeta;
         let record: TaskRecord | undefined;
         client = await AcpClient.start({
           harness: deps.harness,
@@ -397,7 +439,7 @@ export function createClaudeCodeRuntime(deps: ClaudeCodeRuntimeDeps): ClaudeCode
         const session = await client.newSession({
           cwd: workspace.path,
           mcpServers: deps.harness.mcpServers(launch),
-          ...(toolPolicy ? { meta: claudeCodeSessionMeta(toolPolicy) } : {}),
+          ...(sessionMeta ? { meta: sessionMeta } : {}),
         });
         record = {
           taskId: session.sessionId,
@@ -542,7 +584,9 @@ export function createLiveClaudeCode(cfg: ProviderConfig): AgentRuntimeAdapter {
     };
   }
   return createClaudeCodeRuntime({
-    harness: claudeCodeHarness({ binary: cfg.binary, mcp: Boolean(cfg.mcpUrl) }),
+    // Subscription unless CLAUDECODE_AUTH=api: forgetting the toggle must never bill credits.
+    auth: cfg.auth ?? 'subscription',
+    harness: claudeCodeHarness({ binary: cfg.binary, mcp: Boolean(cfg.mcpUrl), auth: cfg.auth ?? 'subscription' }),
     // Lazy: runtime.ts builds the registry, so importing it at load time would cycle.
     workspaces: async () => (await import('../../services/workspaces.service.js')).workspaces(),
     approvals: async () => (await import('../../services/runtime.js')).toolApprovalGate,

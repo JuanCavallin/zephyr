@@ -171,6 +171,11 @@ const envSchema = z.object({
   // executable on PATH. Every native tool call goes through the permission bridge.
   CLAUDECODE_MODE: modeEnum.default('mock'),
   CLAUDECODE_BINARY: optionalString,
+  // How Claude Code authenticates. `subscription` (default) uses the login the user's own
+  // `claude` CLI already holds in ~/.claude: no API key, no gateway, no per-token spend,
+  // and ANTHROPIC_* is scrubbed from the child env. `api` is the opt-in: Claude Code is
+  // pointed at Zephyr's gateway and bills ANTHROPIC_API_KEY credits.
+  CLAUDECODE_AUTH: z.enum(['subscription', 'api']).default('subscription'),
   GPTZERO_API_KEY: optionalString,
   GPTZERO_BASE_URL: optionalUrl,
   /** P(ai) at or above which an authorized outbound send stops for a human. */
@@ -223,6 +228,8 @@ export interface ProviderConfig {
   workspacesDir?: string;
   /** Harness entry point: a .js file (run with node) or an executable (claudecode only). */
   binary?: string;
+  /** Claude Code billing: the user's subscription login (default) or API credits via the gateway. */
+  auth?: 'subscription' | 'api';
   /** Name of the env var that would enable live mode. Shown in health detail. */
   keyVar: string;
 }
@@ -314,6 +321,7 @@ function resolveClaudeCode(): ProviderConfig {
   return {
     mode: env.MOCK_ALL ? 'mock' : env.CLAUDECODE_MODE,
     ...(env.CLAUDECODE_BINARY ? { binary: env.CLAUDECODE_BINARY } : {}),
+    auth: env.CLAUDECODE_AUTH,
     baseUrl: env.MODEL_GATEWAY_BASE_URL ?? `http://127.0.0.1:${env.PORT}/v1`,
     keyVar: 'CLAUDECODE_MODE',
   };
