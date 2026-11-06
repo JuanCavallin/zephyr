@@ -121,11 +121,14 @@ console.log('\n3. The executor axis stays in sync with the node types');
 
   // The one mark that must never be wrong: dashed means we cannot see inside.
   const opaque = GRAPH_NODE_TYPES.filter((t) => styleOf(t).opaque);
+  // Opaque means an agent harness runs its own loop: Hermes (agent_task) or Claude
+  // Code (coding_task). Nothing else may be dashed.
   check(
-    'exactly one node type is opaque, and it is the agent harness',
-    opaque.length === 1 && opaque[0] === 'agent_task',
+    'only the agent-harness node types are opaque',
+    opaque.join(',') === 'agent_task,coding_task',
     opaque.join(', '),
   );
+  check('a Claude Code coding task is priced like the agent harness', styleOf('coding_task').cost === 'high');
 
   check(
     'dispatch is priced as a decision, not as a free tool',

@@ -50,6 +50,7 @@ const modelTierSchema = z.enum(['cheap', 'standard', 'frontier']);
  *   agent_task opaque  delegate a subtask to the agent runtime (Hermes)
  *   code       maybe   run a script in a SANDBOX; the script is authored (`source`)
  *                      or generated once by a text.model call from `goal`
+ *   coding_task opaque Claude Code edits the git repository on its own branch
  *   swarm      both    fan out N workers
  *   judge      yes     decision provider adjudicates
  *   submit     no      tool call BEHIND an approval gate (irreversible)
@@ -74,6 +75,7 @@ export const GRAPH_NODE_TYPES = [
   'decide',
   'agent_task',
   'code',
+  'coding_task',
   'swarm',
   'judge',
   'submit',
@@ -312,6 +314,32 @@ export const codeNodeSchema = nodeVariant(
   }),
 );
 
+/**
+ * Claude Code changes the configured git repository (GIT_REPO_ROOT). It works in its
+ * own worktree on branch `zephyr/<runId>_<nodeId>`, created from `base`; every native
+ * tool call goes through the permission bridge. Afterwards:
+ *
+ *   publish 'none'    commit on that branch locally (nothing leaves the machine)
+ *   publish 'branch'  push that branch to `origin`, after a person approves the exact push
+ *   publish 'pr'      push, then open a PR against main with `gh` (also approved)
+ *
+ * Never pushes to or merges into main. Needs CLAUDECODE_MODE=live and GIT_MODE=live.
+ */
+export const codingTaskNodeSchema = nodeVariant(
+  'coding_task',
+  z.object({
+    /** What to build or fix, with how to tell it is done (tests to add or pass). */
+    goal: z.string().min(1),
+    /** Branch or commit to start from. Default: the repository's HEAD. */
+    base: z.string().min(1).max(200).optional(),
+    publish: z.enum(['none', 'branch', 'pr']).default('none'),
+    /** Commit message and PR title. Default: the node label. */
+    title: z.string().min(1).max(200).optional(),
+    /** Wall-clock limit for the Claude Code session. Default 30 minutes. */
+    maxDurationMs: z.number().int().min(60_000).max(3_600_000).optional(),
+  }),
+);
+
 export const swarmNodeSchema = nodeVariant(
   'swarm',
   z.object({
@@ -424,6 +452,7 @@ export const graphNodeSchema = z.discriminatedUnion('type', [
   decideNodeSchema,
   agentTaskNodeSchema,
   codeNodeSchema,
+  codingTaskNodeSchema,
   swarmNodeSchema,
   judgeNodeSchema,
   submitNodeSchema,

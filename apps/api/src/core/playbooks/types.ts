@@ -129,6 +129,29 @@ export interface AgentTaskResult {
   completionDecision: CompletionDecision;
 }
 
+export interface CodingTaskSpec {
+  /** The step this task runs under: approvals (the push) block it. */
+  stepId: string;
+  nodeId: string;
+  goal: string;
+  base?: string;
+  publish: 'none' | 'branch' | 'pr';
+  /** Commit message and PR title. */
+  title: string;
+  maxDurationMs?: number;
+}
+
+export interface CodingTaskResult {
+  branch: string;
+  /** Files the task changed, relative to the repository root. */
+  files: string[];
+  /** Claude Code's closing message. */
+  summary: string;
+  toolCalls: number;
+  /** 'committed': on the local branch only. */
+  published: { status: 'committed' | 'pushed' | 'pr_opened'; prUrl?: string };
+}
+
 export interface PlaybookContext {
   readonly runId: string;
   readonly signal: AbortSignal;
@@ -189,6 +212,12 @@ export interface PlaybookContext {
    * Blocks until the task reports done, fails, or maxPolls is exceeded.
    */
   runAgentTask(spec: AgentTaskSpec): Promise<AgentTaskResult>;
+
+  /**
+   * Claude Code changes the configured git repository on its own branch (a graph
+   * `coding_task` node). Absent when Claude Code or git workspaces are not live.
+   */
+  runCodingTask?(spec: CodingTaskSpec): Promise<CodingTaskResult>;
 
   /** Evaluate an explicit checkpoint through the same verified completion gate. */
   judgeCompletion(checkpoint: SessionCheckpoint, stepId?: string): Promise<CompletionDecision>;

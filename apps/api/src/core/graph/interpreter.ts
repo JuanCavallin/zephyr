@@ -330,6 +330,8 @@ async function executeNode(
       return runAgentTaskNode(ctx, node, scope, graph);
     case 'code':
       return runCode(ctx, node, scope);
+    case 'coding_task':
+      return runCodingTaskNode(ctx, node, scope);
     case 'swarm':
       return runSwarm(ctx, node, scope, graph);
     case 'submit':
@@ -505,6 +507,47 @@ async function runCode(
   return {
     value: out as unknown as Json,
     output: { generated: out.generated, sourceHash: out.sourceHash, durationMs: out.durationMs },
+  };
+}
+
+/* -------------------------------------------------------------- coding_task */
+
+/** Labels that must never reach Claude Code, a remote model. */
+const NOT_FOR_CLAUDE_CODE: readonly DataLabel[] = ['local_only', 'secret'];
+
+async function runCodingTaskNode(
+  ctx: PlaybookContext,
+  node: Extract<GraphNode, { type: 'coding_task' }>,
+  scope: RefScope,
+): Promise<NodeResult> {
+  const cfg = resolveRefs(node.config, scope);
+  const blocked = (node.dataLabels ?? []).filter((l) => NOT_FOR_CLAUDE_CODE.includes(l));
+  if (blocked.length) {
+    throw new Error('Coding task "' + node.label + '" is labelled ' + blocked.join(', ') + '; Claude Code is a remote model.');
+  }
+  const run = ctx.runCodingTask;
+  if (!run) {
+    throw new Error(
+      'Coding task "' + node.label + '" needs Claude Code and git worktrees: set CLAUDECODE_MODE=live, ' +
+        'CLAUDECODE_BINARY and GIT_MODE=live, then restart Zephyr.',
+    );
+  }
+  const out = await ctx.step(
+    { label: node.label, kind: 'coding_task', nodeId: node.id, providerId: 'claudecode' },
+    (step) =>
+      run({
+        stepId: step.id,
+        nodeId: node.id,
+        goal: cfg.goal,
+        publish: cfg.publish,
+        title: cfg.title ?? node.label,
+        ...(cfg.base ? { base: cfg.base } : {}),
+        ...(cfg.maxDurationMs ? { maxDurationMs: cfg.maxDurationMs } : {}),
+      }),
+  );
+  return {
+    value: out as unknown as Json,
+    output: { branch: out.branch, files: out.files.length, published: out.published.status },
   };
 }
 

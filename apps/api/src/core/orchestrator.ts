@@ -43,6 +43,8 @@ import { getPlaybook } from './playbooks/registry.js';
 import type {
   AgentTaskResult,
   AgentTaskSpec,
+  CodingTaskResult,
+  CodingTaskSpec,
   FanOutSpec,
   PlaybookContext,
   RedactionOutput,
@@ -110,6 +112,8 @@ export interface OrchestratorDeps {
    * it is the ONLY way an agent task runs Hermes more than once.
    */
   agentCeilings?: { maxDurationMs: number; networkRetries?: number };
+  /** Claude Code on the git repository, for graph `coding_task` nodes. Absent: not live. */
+  codingTask?: (spec: CodingTaskSpec & { runId: string; signal: AbortSignal }) => Promise<CodingTaskResult>;
 }
 
 /** Retries for an unreachable agent when no ceiling says otherwise. */
@@ -340,9 +344,12 @@ export class Orchestrator {
       return decision;
     };
 
+    const codingTask = this.deps.codingTask;
     const ctx: PlaybookContext = {
       runId,
       signal,
+
+      ...(codingTask ? { runCodingTask: (spec) => codingTask({ ...spec, runId, signal }) } : {}),
 
       log: async (level, message) => {
         await bus.emit(runId, { type: 'log', runId, level, message, at: nowIso() });

@@ -78,6 +78,15 @@ CHOOSING A NODE TYPE IS THE MOST IMPORTANT DECISION YOU MAKE.
               relevant catalog tool candidates in availableTools. Set explicit
               maxDurationMs and maxFailedToolCalls within the schema's limits.
 
+  coding_task Use when the request is to change code in the user's git repository:
+              add a feature, fix a bug, write or fix tests, refactor. Claude Code
+              does the whole change on its own branch, so give it ONE node with the
+              full request as its goal (files, functions, tests, how to tell it is
+              done). Never use agent_task, code or decide to write repository code.
+              Set "publish": "branch" only when the user asks to push or share the
+              change, "pr" only when they ask for a pull request; otherwise "none".
+              The push itself waits for a person's approval; add no approval node.
+
 Choose the simplest execution that can complete the objective. Graphs without
 dispatch or agent_task are valid. Do not add Jev choices or Hermes tasks merely
 to increase delegation metrics. Keep fixed steps around adaptive subtasks.

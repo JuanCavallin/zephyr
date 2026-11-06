@@ -62,6 +62,8 @@ export const EXECUTOR_BY_NODE_TYPE: Record<GraphNodeType, NodeExecutor> = {
   // Sandboxed script. Classed `program` because the RUN is deterministic code; when the
   // source is generated that costs one `model` call first (TODO(code-node): surface it).
   code: 'program',
+  // Claude Code running its own loop in a worktree: as opaque as any harness.
+  coding_task: 'agent',
   approval: 'human',
   handoff: 'human',
   swarm: 'group',
@@ -171,6 +173,7 @@ export const NODE_TYPE_ICON: Record<GraphNodeType | 'worker' | 'task', string> =
   decide: '◆',
   agent_task: '🕶️',
   code: '⌘',
+  coding_task: '⌥',
   swarm: '⋯',
   judge: '⚖',
   submit: '↥',

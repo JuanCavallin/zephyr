@@ -11,6 +11,7 @@
     "check:acp": "tsx scripts/acp.check.ts",
     "check:claudecode": "tsx scripts/claudecode.check.ts",
     "check:code-node": "tsx scripts/code-node.check.ts",
+    "check:claudecode-coding": "tsx scripts/claudecode-coding.check.ts",
     "check:gateway": "tsx scripts/gateway.check.ts",
     "check:levers": "tsx scripts/levers.check.ts",
     "check:verify": "tsx scripts/verify.check.ts",

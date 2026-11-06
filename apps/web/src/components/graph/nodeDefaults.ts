@@ -19,6 +19,7 @@ const TYPE_LABEL: Record<GraphNodeType, string> = {
   decide: 'Decide',
   agent_task: 'Agent subtask',
   code: 'Run code (sandbox)',
+  coding_task: 'Claude Code (repo change)',
   swarm: 'Fan out',
   judge: 'Judge',
   submit: 'Submit (approval)',
@@ -73,6 +74,12 @@ export function buildDefaultNode(
         ...base,
         type,
         config: { goal: 'Describe what the script should compute', inputs: {}, language: 'javascript' },
+      };
+    case 'coding_task':
+      return {
+        ...base,
+        type,
+        config: { goal: 'Describe the code change and the tests that prove it', publish: 'none' },
       };
     case 'swarm':
       return { ...base, type, config: { items: ['item-1'] } };

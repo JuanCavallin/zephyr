@@ -41,6 +41,7 @@ import { McpConnectionManager } from '../core/mcp/connections.js';
 import { store } from '../store/index.js';
 import { invalidateToolCatalogCache } from './toolCatalog.js';
 import { configureGraphCompile, recordCompiledDecision } from './graphCompile.service.js';
+import { liveCodingTaskRunner } from './codingTask.service.js';
 
 export const bus = new RunBus((runId, event) => store.appendEvent(runId, event));
 
@@ -240,6 +241,10 @@ export const orchestrator = new Orchestrator({
   toolDiscovery: composioToolCatalog,
   localToolCandidates,
   recordCompiledDecision,
+  // Graph coding_task nodes: Claude Code on GIT_REPO_ROOT, only when both are live.
+  ...(config.providers.claudecode.mode === 'live' && config.providers.git.mode === 'live'
+    ? { codingTask: liveCodingTaskRunner() }
+    : {}),
   releaseRunResources: async ({ runId, stepId }) => {
     const ctx = { runId, stepId, policyRule: 'agent-task-resource-release' };
     await browserTools.closeRunSessions(runId, ctx);
