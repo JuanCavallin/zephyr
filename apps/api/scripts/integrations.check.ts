@@ -3,7 +3,11 @@ import express from 'express';
 import { config } from '../src/config.js';
 import { credentialsRouter } from '../src/api/credentials.routes.js';
 import { HttpError } from '../src/api/middleware/validate.js';
-import { parseEnvCredentials } from '../src/services/credentialImport.js';
+import { randomBytes } from 'node:crypto';
+import { importCredentials, parseEnvCredentials } from '../src/services/credentialImport.js';
+import { CredentialStore, vaultCredentialPersistence } from '../src/services/credentials.js';
+import { SecretVault } from '../src/services/vault.js';
+import { createMemoryStore } from '../src/store/memory.js';
 import { verifyCredential } from '../src/services/credentialVerify.js';
 import { buildIntegrations } from '../src/services/integrations.service.js';
 import { integrationsRouter } from '../src/api/integrations.routes.js';
@@ -30,6 +34,81 @@ import type { IntegrationsResponse, McpConnection } from '@htn/shared';
   assert.equal(by.gemini, undefined, 'blank values are skipped');
   assert.equal(parsed.ignored, 1, 'only unrecognised assignments count as ignored');
   assert.deepEqual(parseEnvCredentials(''), { matches: [], ignored: 0 });
+
+  // Quoted values followed by a comment: quotes and comment both go.
+  const commented = parseEnvCredentials(
+    'ANTHROPIC_API_KEY="sk-ant-abc123" # main key\n' +
+      "GEMINI_API_KEY='gem-xyz'   # other\n" +
+      'TAVILY_API_KEY=tv-plain # note\n' +
+      'BROWSERBASE_API_KEY=bb\nBROWSERBASE_PROJECT_ID="proj-1" # mine\n',
+  );
+  const c = Object.fromEntries(commented.matches.map((m) => [m.providerId, m]));
+  assert.equal(c.anthropic?.secret, 'sk-ant-abc123');
+  assert.equal(c.gemini?.secret, 'gem-xyz');
+  assert.equal(c.tavily?.secret, 'tv-plain');
+  assert.deepEqual(c.browserbase?.metadata, { projectId: 'proj-1' });
+  // A project ID PUT would reject is dropped, not stored.
+  const badProject = parseEnvCredentials('BROWSERBASE_API_KEY=bb\nBROWSERBASE_PROJECT_ID=a b/c\n');
+  assert.equal(badProject.matches[0]?.metadata, undefined);
+}
+
+// ---- importCredentials: all or nothing, and rollback restores exactly what was there.
+{
+  const mem = createMemoryStore();
+  const key = randomBytes(32);
+  const vaultPersistence = vaultCredentialPersistence(new SecretVault(mem, key));
+  const failOn = new Set<string>();
+  const flaky = {
+    ...vaultPersistence,
+    async save(...args: Parameters<typeof vaultPersistence.save>) {
+      if (failOn.has(args[1])) throw new Error('disk full');
+      return vaultPersistence.save(...args);
+    },
+  };
+
+  // Operator billing: a user key saved earlier must survive a failed import untouched.
+  const operator = new CredentialStore({
+    source: 'operator',
+    persistence: flaky,
+    operator: { anthropic: { secret: 'operator-anthropic' } },
+  });
+  await operator.save('local-user', 'anthropic', 'user-anthropic-1');
+  failOn.add('gemini');
+  await assert.rejects(
+    importCredentials(operator, 'local-user', [
+      { providerId: 'anthropic', envVar: 'ANTHROPIC_API_KEY', secret: 'user-anthropic-2' },
+      { providerId: 'gemini', envVar: 'GEMINI_API_KEY', secret: 'g' },
+    ]),
+    /disk full/,
+  );
+  assert.equal(operator.userEntry('local-user', 'anthropic')?.secret, 'user-anthropic-1');
+  const reloaded = new CredentialStore({ source: 'user', persistence: vaultPersistence });
+  await reloaded.hydrate();
+  assert.equal(reloaded.userEntry('local-user', 'anthropic')?.secret, 'user-anthropic-1');
+  assert.equal(reloaded.userEntry('local-user', 'gemini'), undefined);
+
+  // A replaced key comes back with its metadata.
+  const user = new CredentialStore({ source: 'user', browserSource: 'user', persistence: flaky });
+  await user.save('local-user', 'browserbase', 'bb-old', { projectId: 'proj-old' });
+  await assert.rejects(
+    importCredentials(user, 'local-user', [
+      { providerId: 'browserbase', envVar: 'BROWSERBASE_API_KEY', secret: 'bb-new' },
+      { providerId: 'gemini', envVar: 'GEMINI_API_KEY', secret: 'g' },
+    ]),
+    /disk full/,
+  );
+  assert.deepEqual(user.userEntry('local-user', 'browserbase'), {
+    secret: 'bb-old',
+    metadata: { projectId: 'proj-old' },
+  });
+
+  // Success stores every selected key.
+  failOn.clear();
+  await importCredentials(user, 'local-user', [
+    { providerId: 'gemini', envVar: 'GEMINI_API_KEY', secret: 'g-ok' },
+  ]);
+  assert.equal(user.userEntry('local-user', 'gemini')?.secret, 'g-ok');
+  console.log('Integrations: import rollback checks passed.');
 }
 
 // ---- verify: real outcomes, never the secret in the detail.

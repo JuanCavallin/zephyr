@@ -315,6 +315,26 @@ export class CredentialStore {
       throw new Error('Credential expired or was removed.');
   }
 
+  /**
+   * The user's own stored key, whatever the billing source. For restoring exactly what
+   * was there (import rollback); never an operator key. Never serialize it.
+   */
+  userEntry(
+    principalId: string,
+    providerId: CredentialProvider,
+  ): { secret: string; metadata?: { projectId?: string } } | undefined {
+    const value = this.user.get(principalId + ':' + providerId);
+    if (!value) return undefined;
+    return value.metadata
+      ? { secret: value.secret, metadata: { ...value.metadata } }
+      : { secret: value.secret };
+  }
+
+  /** A stored user key exists but could not be decrypted. */
+  unreadable(principalId: string, providerId: CredentialProvider): boolean {
+    return this.broken.has(principalId + ':' + providerId);
+  }
+
   /** The key a status row describes, for a local verify call. Never serialize it. */
   currentSecret(principalId: string, providerId: CredentialProvider): string | undefined {
     return this.sourceFor(CREDENTIAL_PROVIDERS[providerId]) === 'user'

@@ -3,7 +3,7 @@
  * Only recognised variables are returned; everything else is counted, never echoed.
  */
 
-import type { CredentialProvider } from './credentials.js';
+import type { CredentialProvider, CredentialStatus, CredentialStore } from './credentials.js';
 
 /** Env var -> credential provider. Earlier entries win when two map to one provider. */
 export const ENV_CREDENTIALS: Readonly<Record<string, CredentialProvider>> = {
@@ -28,13 +28,15 @@ export interface EnvCredentialMatch {
 
 function unquote(raw: string): string {
   const value = raw.trim();
-  const quote = value[0];
-  if ((quote === '"' || quote === "'") && value.endsWith(quote) && value.length >= 2) {
-    return value.slice(1, -1);
-  }
+  // A quoted value, optionally followed by ` # comment`.
+  const quoted = /^(["'])(.*?)\1\s*(?:#.*)?$/.exec(value);
+  if (quoted) return quoted[2]!;
   // Unquoted values may carry a trailing ` # comment`.
   return value.replace(/\s+#.*$/, '');
 }
+
+/** Same rule PUT /credentials/:providerId enforces for metadata.projectId. */
+const PROJECT_ID = /^[a-zA-Z0-9_-]{1,128}$/;
 
 export function parseEnvCredentials(text: string): {
   matches: EnvCredentialMatch[];
@@ -65,7 +67,50 @@ export function parseEnvCredentials(text: string): {
   for (const [envVar, { provider, field }] of Object.entries(METADATA_VARS)) {
     const value = values.get(envVar);
     const target = byProvider.get(provider);
-    if (value && target) target.metadata = { ...target.metadata, [field]: value };
+    if (value && target && PROJECT_ID.test(value)) {
+      target.metadata = { ...target.metadata, [field]: value };
+    }
   }
   return { matches: [...byProvider.values()], ignored };
+}
+
+/**
+ * Store the selected keys, all or nothing. On a failed write, every key this call
+ * already replaced goes back exactly as it was (secret and metadata); a key that did
+ * not exist is removed again; an unreadable previous key is left alone so its
+ * "re-enter" signal survives.
+ */
+export async function importCredentials(
+  store: CredentialStore,
+  principalId: string,
+  selected: EnvCredentialMatch[],
+): Promise<CredentialStatus[]> {
+  const done: Array<{
+    providerId: CredentialProvider;
+    previous?: { secret: string; metadata?: { projectId?: string } };
+    unreadable: boolean;
+  }> = [];
+  try {
+    for (const match of selected) {
+      const previous = store.userEntry(principalId, match.providerId);
+      const unreadable = store.unreadable(principalId, match.providerId);
+      await store.save(principalId, match.providerId, match.secret, match.metadata);
+      done.push({ providerId: match.providerId, ...(previous ? { previous } : {}), unreadable });
+    }
+  } catch (error) {
+    for (const { providerId, previous, unreadable } of done.reverse()) {
+      if (previous) {
+        await store
+          .save(principalId, providerId, previous.secret, previous.metadata)
+          .catch(() => undefined);
+      } else if (!unreadable) {
+        await store.delete(principalId, providerId).catch(() => undefined);
+      }
+    }
+    throw error;
+  }
+  const statuses = store.statuses(principalId);
+  return selected.map((match) =>
+    statuses.find((status) => status.providerId === match.providerId)!,
+  );
 }
