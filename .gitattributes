@@ -1,2 +1,6 @@
 # Shell scripts run inside Linux/WSL; CRLF breaks bash.
 *.sh text eol=lf
+
+# Benchmark fixture repos are replayed byte-for-byte: reference fixes find exact
+# "\n"-terminated text, so a CRLF checkout (core.autocrlf=true) breaks them.
+apps/api/bench/coding/** text eol=lf
