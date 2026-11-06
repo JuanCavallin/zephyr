@@ -315,6 +315,13 @@ export class CredentialStore {
       throw new Error('Credential expired or was removed.');
   }
 
+  /** The key a status row describes, for a local verify call. Never serialize it. */
+  currentSecret(principalId: string, providerId: CredentialProvider): string | undefined {
+    return this.sourceFor(CREDENTIAL_PROVIDERS[providerId]) === 'user'
+      ? this.user.get(principalId + ':' + providerId)?.secret
+      : this.operatorCredential(providerId)?.secret;
+  }
+
   private status(principalId: string, providerId: CredentialProvider): CredentialStatus {
     const purpose = CREDENTIAL_PROVIDERS[providerId];
     const source = this.sourceFor(purpose);

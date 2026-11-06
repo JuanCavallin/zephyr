@@ -62,7 +62,8 @@
     "test:jev": "tsx --env-file-if-exists=../../.env scripts/test-jev.ts",
     "test:jev:routing": "tsx --env-file-if-exists=../../.env scripts/test-jev-routing.ts",
     "bench:browser": "tsx --env-file-if-exists=../../.env scripts/bench-browser.ts",
-    "check:vault": "tsx scripts/vault.check.ts"
+    "check:vault": "tsx scripts/vault.check.ts",
+    "check:integrations": "tsx scripts/integrations.check.ts"
   },
   "dependencies": {
     "@agentclientprotocol/sdk": "^1.4.0",
