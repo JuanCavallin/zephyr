@@ -18,6 +18,7 @@ const TYPE_LABEL: Record<GraphNodeType, string> = {
   redact: 'Redact PII',
   decide: 'Decide',
   agent_task: 'Agent subtask',
+  code: 'Run code (sandbox)',
   swarm: 'Fan out',
   judge: 'Judge',
   submit: 'Submit (approval)',
@@ -66,6 +67,12 @@ export function buildDefaultNode(
         ...base,
         type,
         config: { goal: 'Describe the subtask', availableTools: toolNames.slice(0, 4) },
+      };
+    case 'code':
+      return {
+        ...base,
+        type,
+        config: { goal: 'Describe what the script should compute', inputs: {}, language: 'javascript' },
       };
     case 'swarm':
       return { ...base, type, config: { items: ['item-1'] } };
