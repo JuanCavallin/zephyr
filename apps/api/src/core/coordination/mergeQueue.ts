@@ -107,6 +107,8 @@ const QUEUE_KEY = 'merge';
 export class MergeQueue {
   private readonly lock = new KeyedLock();
   private readonly parked = new Map<string, { item: MergeItem; approvalId: string }>();
+  /** Tasks inside `approve()`: settles once the task is parked, or turns out not to be. */
+  private readonly parking = new Map<string, Promise<void>>();
   private readonly results: MergeResult[] = [];
   private readonly now: () => string;
 
@@ -131,13 +133,16 @@ export class MergeQueue {
    * Finish a parked task. `approved` re-runs rebase + tests and merges without asking
    * again; `rejected` and `revised` record a signal, and `revised` spawns a fix task.
    */
-  resolveApproval(
+  async resolveApproval(
     taskId: string,
     decision: { outcome: 'approved' | 'rejected' | 'revised'; comment?: string },
     signal?: AbortSignal,
   ): Promise<MergeResult> {
+    // A person can decide the moment approve() makes the approval visible, before the
+    // task is parked: wait for that rather than reject a real decision.
+    await this.parking.get(taskId);
     const parked = this.parked.get(taskId);
-    if (!parked) return Promise.reject(new MergeQueueError(taskId + ' is not awaiting a merge approval'));
+    if (!parked) throw new MergeQueueError(taskId + ' is not awaiting a merge approval');
     this.parked.delete(taskId);
     if (decision.outcome === 'approved') return this.serial((s) => this.process(parked.item, true, s), signal);
     return this.serial(
@@ -223,11 +228,20 @@ export class MergeQueue {
     if (!approved && !this.deps.policy?.autoMergeGreen) {
       if (!this.deps.approve)
         throw new MergeQueueError('merge needs an approval and no approval gate is configured');
-      const verdict = await this.deps.approve(item, tests);
+      // Remember the agent's head: what the user changes from here on is their edit.
+      const head = (await this.git(worktree, ['rev-parse', 'HEAD'], signal)).trim();
+      let settle!: () => void;
+      this.parking.set(task.id, new Promise<void>((r) => (settle = r)));
+      let verdict: ApprovalVerdict;
+      try {
+        verdict = await this.deps.approve(item, tests);
+        if (verdict.status === 'pending')
+          this.parked.set(task.id, { item: { ...item, agentCommit: item.agentCommit ?? head }, approvalId: verdict.approvalId });
+      } finally {
+        this.parking.delete(task.id);
+        settle();
+      }
       if (verdict.status === 'pending') {
-        // Remember the agent's head: what the user changes from here on is their edit.
-        const head = (await this.git(worktree, ['rev-parse', 'HEAD'], signal)).trim();
-        this.parked.set(task.id, { item: { ...item, agentCommit: item.agentCommit ?? head }, approvalId: verdict.approvalId });
         return this.finish({
           taskId: task.id,
           outcome: 'awaiting_approval',

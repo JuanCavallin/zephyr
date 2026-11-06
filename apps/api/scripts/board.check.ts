@@ -857,6 +857,24 @@ await test('without auto-merge: pending approval parks; approved merges; rejecte
   assert.equal(fixes.length, 0, 'a plain rejection spawns no fix');
 });
 
+await test('a decision that lands while the queue is still parking the task merges', async () => {
+  const { repo, task } = await mqRepo('mq-fast-decision');
+  const n = await task('n', { 'src/n/index.ts': 'export const n = 1;\n' });
+  let decided: Promise<{ outcome: string }> | undefined;
+  const { deps } = mqDeps(repo, {
+    policy: { autoMergeGreen: false },
+    // A person approves the instant the approval is visible, before process() has parked n.
+    approve: async (item) => {
+      decided = queue.resolveApproval(item.task.id, { outcome: 'approved' });
+      return { status: 'pending', approvalId: 'apr_n' };
+    },
+  });
+  const queue = new MergeQueue(deps);
+  assert.equal((await queue.enqueue(n)).outcome, 'awaiting_approval');
+  assert.equal((await decided!).outcome, 'merged');
+  assert.deepEqual(queue.awaiting(), []);
+});
+
 await test('a revised approval records a signal and sends a fix task back', async () => {
   const { repo, task } = await mqRepo('mq-revised');
   const k = await task('k', { 'src/k/index.ts': 'export const k = 1;\n' });
