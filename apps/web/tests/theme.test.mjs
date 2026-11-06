@@ -58,8 +58,16 @@ const ratio = (a, b) => {
 
 /** The roles allowed to leave the surface hue, and so to run into the gamut boundary. */
 const ACCENTS = new Set([
-  'accent-soft', 'accent-line', 'accent-line-2', 'accent-text-dim', 'accent-text',
-  'accent-text-2', 'accent', 'accent-bright', 'accent-ink', 'edge-done',
+  'accent-soft',
+  'accent-line',
+  'accent-line-2',
+  'accent-text-dim',
+  'accent-text',
+  'accent-text-2',
+  'accent',
+  'accent-bright',
+  'accent-ink',
+  'edge-done',
 ]);
 
 const DARK = ['sage', 'slate', 'ember', 'mono'];
@@ -148,4 +156,14 @@ test('no colour literal escapes the theme blocks', () => {
     if (!inBlock && /#[0-9a-fA-F]{3,8}\b/.test(line)) strays.push(`${index + 1}: ${line.trim()}`);
   }
   assert.deepEqual(strays, [], 'every colour must come from a token, or a theme half-lands');
+});
+
+test('the integrations stylesheet uses tokens only', () => {
+  const sheet = readFileSync(new URL('../src/integrations.css', import.meta.url), 'utf8');
+  const strays = sheet
+    .split('\n')
+    .map((line, index) => [index + 1, line])
+    .filter(([, line]) => /#[0-9a-fA-F]{3,8}\b|rgba?\(|hsla?\(|box-shadow/.test(line))
+    .map(([index, line]) => `${index}: ${line.trim()}`);
+  assert.deepEqual(strays, [], 'no colour literals and no shadows outside the theme blocks');
 });

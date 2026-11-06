@@ -170,13 +170,13 @@ All routes below are under `/api` unless shown otherwise.
 The board UI (`apps/web/src/pages/Board.tsx`) and `zephyr run` both use these. Boards need
 `GIT_MODE=live`; on mock git "Run ready tasks" answers `503 BOARD_UNAVAILABLE`.
 
-| Purpose        | Method and path                                    | Notes                                                                                                   |
-| -------------- | -------------------------------------------------- | ------------------------------------------------------------------------------------------------------- |
-| Create board   | `POST /tasks`                                      | body: `{ request, template?, private?, base? }`; returns the planned board, nothing runs                |
-| Board          | `GET /tasks/:boardId`                              | run, tasks, waves                                                                                       |
-| Edit plan      | `PATCH /tasks/:boardId`                            | body: `{ ops }`, applied atomically; an `update` op may set `variants: 2 \| 3 \| null`                  |
-| Run            | `POST /tasks/:boardId/run`                         | body: `{ concurrency?, autoMergeGreen? }`                                                               |
-| Needs you      | `GET /tasks/inbox`, `GET /tasks/inbox/stream`      | items by `kind`: approvals, blocked tasks, lease extensions, and `variant_pick`                         |
+| Purpose        | Method and path                                    | Notes                                                                                                  |
+| -------------- | -------------------------------------------------- | ------------------------------------------------------------------------------------------------------ |
+| Create board   | `POST /tasks`                                      | body: `{ request, template?, private?, base? }`; returns the planned board, nothing runs               |
+| Board          | `GET /tasks/:boardId`                              | run, tasks, waves                                                                                      |
+| Edit plan      | `PATCH /tasks/:boardId`                            | body: `{ ops }`, applied atomically; an `update` op may set `variants: 2 \| 3 \| null`                 |
+| Run            | `POST /tasks/:boardId/run`                         | body: `{ concurrency?, autoMergeGreen? }`                                                              |
+| Needs you      | `GET /tasks/inbox`, `GET /tasks/inbox/stream`      | items by `kind`: approvals, blocked tasks, lease extensions, and `variant_pick`                        |
 | Pick a variant | `POST /tasks/:boardId/tasks/:taskId/variants/pick` | body: `{ variantId }`; records the `variant_pick` signal itself, so do not also post it to `/learning` |
 
 A task with `variants` set builds 2 or 3 versions, each in its own worktree. If more than one
@@ -359,6 +359,30 @@ endpoint as an upstream connection.
 The statuses are `connected`, `error`, and `disabled`. Adding or refreshing may take up
 to about 20 seconds because the server performs discovery before responding.
 
+### Model keys and the Integrations read model
+
+All routes below require the local-control session (`POST /api/credentials/session`
+sets it; the web client does this automatically). No response ever contains a secret:
+key status carries only `configured`, `last4`, `version`, `updatedAt` and, when a stored
+key cannot be decrypted, `error`. Keys are encrypted in the local vault and survive
+restarts when `PERSIST_TO_DISK=true` (`lifetime: 'persisted'`); otherwise they last for
+the process (`lifetime: 'process'`). Spec: `docs/byo-integrations.md`.
+
+- `GET /api/credentials` → `{ source, browserSource, lifetime, providers: CredentialStatus[] }`
+- `PUT /api/credentials/:providerId` `{ secret, metadata?: { projectId } }` → `{ provider }`
+  (500 `CREDENTIAL_NOT_PERSISTED` when the vault write fails; nothing changes)
+- `DELETE /api/credentials/:providerId` → `{ provider }`
+- `POST /api/credentials/:providerId/verify` → `{ ok: true | false | null, detail }` — one
+  live read-only call; `null` means the provider has no verification endpoint. 400
+  `CREDENTIAL_MISSING` when no key is saved.
+- `POST /api/credentials/import/env` `{ text }` (≤ 64 KiB) →
+  `{ matches: [{ providerId, envVar, last4, replaces }], ignored }` — preview only.
+- `POST /api/credentials/import/env/commit` `{ text, providerIds }` → `{ providers }` —
+  all-or-nothing; 400 `NOT_IN_FILE` for a provider the text has no key for.
+- `GET /api/integrations` → `{ summary: { connected, needsAttention, available }, items }`,
+  `items: { kind: 'key'|'harness'|'mcp'|'connector', id, name, status, detail, reason?, fix?, updatedAt? }`,
+  `status ∈ connected | needs_attention | available | error | disabled`.
+
 ## Recommended screens
 
 ### 1. Task composer
@@ -378,8 +402,10 @@ to about 20 seconds because the server performs discovery before responding.
 - egress/privacy ledger;
 - token, latency, and cost metrics.
 
-### 3. Connections
+### 3. Integrations (`/integrations/:kind?/:id?`; `/connections` redirects)
 
+- category rail: Model keys, Harnesses, MCP servers, Connectors, System;
+- model keys: save, verify, remove, `.env` import with a review step;
 - Composio connect/refresh state;
 - generic MCP add/list/enable/disable/refresh/remove;
 - reviewed tool inventory with `available`, `requires_connection`, or `unavailable`;

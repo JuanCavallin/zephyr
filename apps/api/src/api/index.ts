@@ -19,6 +19,7 @@ import { mcpGatewayRouter } from './mcp.routes.js';
 import { mcpConnectionsRouter } from './mcpConnections.routes.js';
 import { actionEvidenceRouter } from './actionEvidence.routes.js';
 import { credentialsRouter } from './credentials.routes.js';
+import { integrationsRouter } from './integrations.routes.js';
 import { browserRouter } from './browser.routes.js';
 import { tasksRouter } from './tasks.routes.js';
 import { learningRouter } from './learning.routes.js';
@@ -70,6 +71,7 @@ export function mountRoutes(app: Express): void {
   api.use(streamRouter);
   api.use(toolsRouter);
   api.use(mcpConnectionsRouter);
+  api.use(integrationsRouter);
   // Per-run /v1/messages accounting (tokens incl. cache reads/writes, hit rate).
   api.use(createGatewayLedgerRouter(() => modelGateway.messages));
   // Observed mode: mint a token + settings snippet for an unmodified Claude Code.

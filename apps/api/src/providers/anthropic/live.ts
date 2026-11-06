@@ -146,7 +146,7 @@ export function createLiveAnthropic(
         const apiKey = credential?.secret ?? cfg.apiKey;
         if (!apiKey)
           throw new Error(
-            'User credentials are required for anthropic. Configure them in Connections.',
+            'User credentials are required for anthropic. Add your key in Integrations.',
           );
         const client = createClient(apiKey);
         ctx.signal?.throwIfAborted();

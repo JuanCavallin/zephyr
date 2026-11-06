@@ -8,7 +8,7 @@
  */
 
 import { existsSync } from 'node:fs';
-import { resolve as resolvePath } from 'node:path';
+import { dirname, resolve as resolvePath } from 'node:path';
 import { z } from 'zod';
 import { PROVIDER_IDS, type ProviderId, type ProviderMode } from '@htn/shared';
 
@@ -46,6 +46,8 @@ const envSchema = z.object({
   MOCK_ALL: boolish,
   PERSIST_TO_DISK: boolish,
   SQLITE_PATH: z.string().default('../../.data/agentos.sqlite'),
+  /** base64, 32 bytes. Unset: a key file next to the database (persisted) or an ephemeral key. */
+  ZEPHYR_VAULT_KEY: optionalString,
   MOCK_FAILURE_RATE: z.coerce.number().min(0).max(1).default(0),
   MOCK_MIN_LATENCY_MS: z.coerce.number().int().min(0).default(250),
   MOCK_MAX_LATENCY_MS: z.coerce.number().int().min(0).default(900),
@@ -385,11 +387,18 @@ export const config = Object.freeze({
   webOrigin: env.WEB_ORIGIN,
   persistToDisk: env.PERSIST_TO_DISK,
   sqlitePath: env.SQLITE_PATH,
+  vault: {
+    envKey: env.ZEPHYR_VAULT_KEY,
+    keyPath: resolvePath(dirname(resolvePath(process.cwd(), env.SQLITE_PATH)), 'vault.key'),
+    persist: env.PERSIST_TO_DISK,
+  },
   modelGateway: {
     baseUrl: env.MODEL_GATEWAY_BASE_URL ?? `http://127.0.0.1:${env.PORT}/v1`,
     apiKey: env.MODEL_GATEWAY_API_KEY,
     messagesBudget: {
-      ...(env.GATEWAY_RUN_MAX_TOKENS !== undefined ? { maxTokens: env.GATEWAY_RUN_MAX_TOKENS } : {}),
+      ...(env.GATEWAY_RUN_MAX_TOKENS !== undefined
+        ? { maxTokens: env.GATEWAY_RUN_MAX_TOKENS }
+        : {}),
       ...(env.GATEWAY_RUN_MAX_COST_CENTS !== undefined
         ? { maxCostCents: env.GATEWAY_RUN_MAX_COST_CENTS }
         : {}),

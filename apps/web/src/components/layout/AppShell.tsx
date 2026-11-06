@@ -80,7 +80,6 @@ export function AppShell({ children }: { children: ReactNode }) {
         <Nav
           open={navOpen}
           onClose={() => setNavOpen(false)}
-          onConnect={() => setConnectionOpen(true)}
           theme={theme}
           onThemeChange={setTheme}
         />
@@ -116,8 +115,8 @@ export function AppShell({ children }: { children: ReactNode }) {
                       ? 'Run history'
                       : location.pathname.startsWith('/runs/')
                         ? 'Execution'
-                        : location.pathname === '/connections'
-                          ? 'Connections'
+                        : location.pathname.startsWith('/integrations')
+                          ? 'Integrations'
                           : location.pathname === '/compare'
                             ? 'Compare'
                             : location.pathname === '/benchmarks'
@@ -235,7 +234,12 @@ function NeedsYou() {
   const summary = needsYou(items);
   if (!summary) return null;
   return (
-    <Link to={summary.to} className="needs-you-chip" title={summary.label} aria-label={'Needs you: ' + summary.label}>
+    <Link
+      to={summary.to}
+      className="needs-you-chip"
+      title={summary.label}
+      aria-label={'Needs you: ' + summary.label}
+    >
       Needs you <span>{summary.count}</span>
     </Link>
   );

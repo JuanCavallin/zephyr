@@ -1,16 +1,15 @@
 /**
- * Truthful connections screen: what AgentOS is actually wired to, not what a demo
- * script claims. Every fact here comes straight from a live route response — no
- * credential status never returns secret values. User API-key inputs live only
- * in the setup form until saved to the local API process. See docs/frontend-handoff.md.
+ * The truthful wiring sections the Integrations tab mounts per category: what Zephyr
+ * is actually connected to, not what a demo script claims. Every fact comes straight
+ * from a live route response, and no route here returns a secret value.
+ * See docs/frontend-handoff.md.
  */
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { Capability, McpConnection, ProviderId, ProviderStatus } from '@htn/shared';
-import { api, ApiError, type ToolCatalogEntry } from '../lib/api';
-import { Icon } from '../components/ui/Icon';
-import { CredentialsPanel } from '../components/connections/CredentialsPanel';
-import { SupervisionExamples } from '../components/actions/SupervisionExamples';
+import { api, ApiError, type ToolCatalogEntry } from '../../lib/api';
+import { Icon } from '../ui/Icon';
+import { SupervisionExamples } from '../actions/SupervisionExamples';
 
 type ComposioTool = { name: string; toolkit?: string; version?: string; connected: boolean };
 
@@ -21,7 +20,7 @@ interface AsyncState<T> {
 }
 
 /** Local-only fetch/reload hook. No caching beyond this page's lifetime. */
-function useAsync<T>(fn: () => Promise<T>) {
+export function useAsync<T>(fn: () => Promise<T>) {
   const [state, setState] = useState<AsyncState<T>>({ data: null, loading: true, error: null });
   const fnRef = useRef(fn);
   fnRef.current = fn;
@@ -98,30 +97,43 @@ function LoadError({ error, onRetry }: { error: string; onRetry: () => void }) {
   );
 }
 
-export function Connections() {
+/** System: provider modes, browser backends, supervision examples, reviewed tools. */
+export function SystemCategory() {
   const providers = useAsync(() => api.providers());
-  const mcp = useAsync(() => api.listMcpConnections());
-  const composio = useAsync(() => api.composioTools());
   const tools = useAsync(() => api.tools());
-
   return (
-    <div className="library-page connections-page">
-      <header className="library-heading">
-        <div>
-          <h1>Connections</h1>
-          <p>
-            What the control plane is actually wired to right now — providers, tool sources, and the
-            reviewed catalog Hermes is allowed to see.
-          </p>
-        </div>
-      </header>
-
+    <div className="connections-page integrations-legacy">
       <ProvidersSection state={providers} />
       <BrowserBackendsSection providers={providers} tools={tools} />
-      <CredentialsPanel />
       <SupervisionExamples />
-      <ToolSourcesSection composio={composio} mcp={mcp} />
       <ToolInventorySection state={tools} />
+    </div>
+  );
+}
+
+/** MCP servers. `onChange` lets the tab refresh its summary after an add/remove. */
+export function McpCategory({ onChange }: { onChange?: () => void }) {
+  const mcp = useAsync(() => api.listMcpConnections());
+  const reload = mcp.reload;
+  const state = {
+    ...mcp,
+    reload: () => {
+      reload();
+      onChange?.();
+    },
+  };
+  return (
+    <div className="connections-page integrations-legacy">
+      <McpCard state={state} />
+    </div>
+  );
+}
+
+export function ConnectorsCategory() {
+  const composio = useAsync(() => api.composioTools());
+  return (
+    <div className="connections-page integrations-legacy">
+      <ComposioCard state={composio} />
     </div>
   );
 }
@@ -334,26 +346,6 @@ function BrowserBackendsSection({
 }
 
 /* ---------------------------------------------------------------- Tool sources */
-
-function ToolSourcesSection({
-  composio,
-  mcp,
-}: {
-  composio: ReturnType<typeof useAsync<{ tools: ComposioTool[] }>>;
-  mcp: ReturnType<typeof useAsync<{ connections: McpConnection[] }>>;
-}) {
-  return (
-    <section className="surface-section">
-      <header>
-        <h2>Tool sources</h2>
-      </header>
-      <div className="tool-sources-grid">
-        <ComposioCard state={composio} />
-        <McpCard state={mcp} />
-      </div>
-    </section>
-  );
-}
 
 function ComposioCard({
   state,

@@ -20,7 +20,10 @@ import { waitWhilePaused } from '../pauseGate.js';
 import type { RegisteredTool } from '../tools/registry.js';
 import { modelRoutesFor } from './catalog.js';
 import type { ToolDescriptorCatalog } from './toolCatalog.js';
-import { DEFAULT_MAX_TOOL_CALLS_PER_TURN, TOOL_BUDGET_EXHAUSTED_INSTRUCTION } from './turnBudget.js';
+import {
+  DEFAULT_MAX_TOOL_CALLS_PER_TURN,
+  TOOL_BUDGET_EXHAUSTED_INSTRUCTION,
+} from './turnBudget.js';
 import { AnthropicMessagesGateway, type MessagesGatewayOptions } from './messages.js';
 
 export interface OpenAiMessage {
@@ -291,7 +294,7 @@ export class ModelGatewayService {
       return this.finalReply(
         session,
         '[AgentOS] Stopped this agent run: no model with eligible credentials is available. ' +
-          'Configure model credentials in Connections or enable local Ollama.',
+          'Add a model key in Integrations or enable local Ollama.',
       );
     }
     // The all-tools baseline arm pins a cost tier so it measures "frontier
@@ -303,7 +306,12 @@ export class ModelGatewayService {
         )
       : undefined;
     if (session.pinnedCostTier && !pinnedRoute) {
-      return this.finalReply(session, '[AgentOS] Baseline unavailable: no privacy-eligible ' + session.pinnedCostTier + ' cloud model is configured. No alternative route was used.');
+      return this.finalReply(
+        session,
+        '[AgentOS] Baseline unavailable: no privacy-eligible ' +
+          session.pinnedCostTier +
+          ' cloud model is configured. No alternative route was used.',
+      );
     }
     let modelDecision: Pick<
       Awaited<ReturnType<DecisionService['selectModel']>>,
@@ -453,8 +461,14 @@ export class ModelGatewayService {
       // Labels or credentials can change while paused; recheck eligibility
       // against the current session state, not the one routing saw.
       const dispatchState = await this.sessions.requireGatewayTurn(binding);
-      if (!eligibleModelRoutes(decisionStateFromSession(dispatchState), [selectedRoute]).length || !this.routeAvailable(selectedRoute, callContext)) {
-        return this.finalReply(dispatchState, '[AgentOS] Model context or credentials changed. Review the current privacy requirements before continuing.');
+      if (
+        !eligibleModelRoutes(decisionStateFromSession(dispatchState), [selectedRoute]).length ||
+        !this.routeAvailable(selectedRoute, callContext)
+      ) {
+        return this.finalReply(
+          dispatchState,
+          '[AgentOS] Model context or credentials changed. Review the current privacy requirements before continuing.',
+        );
       }
       completed = await this.backend.complete(
         {
@@ -541,7 +555,9 @@ export class ModelGatewayService {
     await this.sessions.appendContext(session.id, [
       {
         role: 'assistant',
-        summary: session.dataLabels.every(label => label === 'public') ? compactSummary(completed.text || '(model proposed tool calls)') : '(Private model result withheld from persisted context.)',
+        summary: session.dataLabels.every((label) => label === 'public')
+          ? compactSummary(completed.text || '(model proposed tool calls)')
+          : '(Private model result withheld from persisted context.)',
         // A model answer may incorporate a harness system prompt, so it is not
         // automatically promoted into remote-safe Jev context.
         sanitizedSummary: undefined,
@@ -738,7 +754,9 @@ function ioPreview(
 ): { inputPreview?: string; outputPreview?: string; ioWithheld?: boolean } {
   if (!labels.every((label) => label === 'public')) return { ioWithheld: true };
   const clip = (text: string, max: number) =>
-    text.length <= max ? text : text.slice(0, max) + '… [+' + (text.length - max).toString() + ' chars]';
+    text.length <= max
+      ? text
+      : text.slice(0, max) + '… [+' + (text.length - max).toString() + ' chars]';
   const shown = messages.slice(-8);
   const skipped = messages.length - shown.length;
   const input = [
@@ -751,10 +769,14 @@ function ioPreview(
         message.role +
         '] ' +
         clip(text, message.role === 'system' ? 300 : 1500) +
-        calls.map((call) => '\n  -> ' + call.function.name + ' ' + clip(call.function.arguments, 300)).join('')
+        calls
+          .map((call) => '\n  -> ' + call.function.name + ' ' + clip(call.function.arguments, 300))
+          .join('')
       );
     }),
-    ...(toolNames.length > 0 ? ['tools offered: ' + toolNames.join(', ')] : ['tools offered: none']),
+    ...(toolNames.length > 0
+      ? ['tools offered: ' + toolNames.join(', ')]
+      : ['tools offered: none']),
   ].join('\n\n');
   if (!output) return { inputPreview: input };
   const outputText = [
@@ -817,7 +839,9 @@ function summarizeMessage(
     (role === 'tool' && Boolean(trustedToolEntry) && labelsArePublic(dataLabels));
   return {
     role,
-    summary: labelsArePublic(dataLabels) ? summary : '(Private harness message withheld from persisted context.)',
+    summary: labelsArePublic(dataLabels)
+      ? summary
+      : '(Private harness message withheld from persisted context.)',
     sanitizedSummary: maySanitize ? summary : undefined,
     dataLabels,
     tokenEstimate: Math.ceil(text.length / 4),

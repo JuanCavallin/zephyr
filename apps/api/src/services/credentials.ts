@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { config } from '../config.js';
+import { vault, type SecretVault } from './vault.js';
 
 export type CredentialPurpose = 'model' | 'decision' | 'browser' | 'search';
 export type CredentialSource = 'operator' | 'user';
@@ -37,6 +38,11 @@ export interface CredentialStatus {
   configured: boolean;
   version?: number;
   metadata?: { projectId?: string };
+  /** Last four characters only; the key itself never leaves the server. */
+  last4?: string;
+  updatedAt?: string;
+  /** A stored key that could not be read back (e.g. the vault key changed). */
+  error?: string;
 }
 
 export class CredentialRequiredError extends Error {
@@ -47,7 +53,7 @@ export class CredentialRequiredError extends Error {
   ) {
     super(
       source === 'user'
-        ? 'User credentials are required for ' + providerId + '. Configure them in Connections.'
+        ? 'User credentials are required for ' + providerId + '. Add your key in Integrations.'
         : 'Operator credentials are required for ' +
             providerId +
             '. Configure the provider key in .env or select user funding.',
@@ -59,13 +65,91 @@ export interface CredentialStoreOptions {
   source: CredentialSource;
   browserSource?: CredentialSource;
   operator?: Partial<Record<CredentialProvider, { secret?: string; projectId?: string }>>;
+  /** Durable storage for user keys. Absent: keys live for the process only. */
+  persistence?: CredentialPersistence;
 }
 
-/** Single-user local MVP. All secrets and run pins disappear on process restart. */
+export interface PersistedCredential {
+  principalId: string;
+  providerId: CredentialProvider;
+  version: number;
+  secret?: string;
+  metadata?: { projectId?: string };
+  updatedAt: string;
+  /** Set when the stored ciphertext could not be read back. */
+  error?: string;
+}
+
+export interface CredentialPersistence {
+  load(): Promise<PersistedCredential[]>;
+  save(
+    principalId: string,
+    providerId: CredentialProvider,
+    secret: string,
+    metadata?: { projectId?: string },
+  ): Promise<{ version: number; updatedAt: string }>;
+  delete(principalId: string, providerId: CredentialProvider): Promise<void>;
+}
+
+const CREDENTIAL_KIND = 'credential';
+const credentialRef = (principalId: string, providerId: string) =>
+  'vault:' + CREDENTIAL_KIND + '/' + encodeURIComponent(principalId) + '/' + providerId;
+
+export function vaultCredentialPersistence(vault: SecretVault): CredentialPersistence {
+  return {
+    async load() {
+      const rows: PersistedCredential[] = [];
+      for (const entry of await vault.entries(CREDENTIAL_KIND)) {
+        const [, principal, provider] = entry.ref.split('/');
+        if (!principal || !provider || !Object.hasOwn(CREDENTIAL_PROVIDERS, provider)) continue;
+        rows.push({
+          principalId: decodeURIComponent(principal),
+          providerId: provider as CredentialProvider,
+          version: entry.version,
+          updatedAt: entry.updatedAt,
+          ...(entry.plaintext !== undefined ? { secret: entry.plaintext } : {}),
+          ...(entry.metadata?.projectId
+            ? { metadata: { projectId: entry.metadata.projectId } }
+            : {}),
+          ...(entry.error ? { error: entry.error } : {}),
+        });
+      }
+      return rows;
+    },
+    async save(principalId, providerId, secret, metadata) {
+      const saved = await vault.put(
+        credentialRef(principalId, providerId),
+        CREDENTIAL_KIND,
+        secret,
+        metadata?.projectId ? { projectId: metadata.projectId } : undefined,
+      );
+      return { version: saved.version, updatedAt: saved.updatedAt };
+    },
+    async delete(principalId, providerId) {
+      await vault.remove(credentialRef(principalId, providerId));
+    },
+  };
+}
+
+function validSecret(secret: string): string {
+  const trimmed = secret.trim();
+  if (!trimmed || trimmed.length > 8192 || /[\r\n\0]/.test(trimmed)) {
+    throw new Error('Provide a non-empty API key with no line breaks.');
+  }
+  return trimmed;
+}
+
+/**
+ * Single-user local store. With `persistence`, user keys survive restarts (encrypted
+ * in the vault); run pins are always process-local.
+ */
 export class CredentialStore {
   readonly source: CredentialSource;
   readonly browserSource: CredentialSource;
-  private readonly user = new Map<string, ResolvedCredential>();
+  readonly persisted: boolean;
+  private readonly user = new Map<string, ResolvedCredential & { updatedAt: string }>();
+  /** Stored keys that could not be decrypted, by principal:provider. */
+  private readonly broken = new Map<string, string>();
   private readonly principals = new Map<string, string>();
   private readonly pins = new Map<string, { reference: string; version: number }>();
   private readonly listeners = new Set<
@@ -75,6 +159,46 @@ export class CredentialStore {
   constructor(private readonly options: CredentialStoreOptions) {
     this.source = options.source;
     this.browserSource = options.browserSource ?? options.source;
+    this.persisted = Boolean(options.persistence);
+  }
+
+  /** Load persisted user keys. Call once at boot, before serving requests. */
+  async hydrate(): Promise<void> {
+    if (!this.options.persistence) return;
+    for (const row of await this.options.persistence.load()) {
+      const key = row.principalId + ':' + row.providerId;
+      if (row.secret === undefined) {
+        this.broken.set(key, row.error ?? 'Stored key is unreadable; re-enter it.');
+        continue;
+      }
+      this.user.set(key, {
+        reference: randomUUID(),
+        version: row.version,
+        secret: row.secret,
+        source: 'user',
+        metadata: row.metadata?.projectId ? { projectId: row.metadata.projectId } : undefined,
+        updatedAt: row.updatedAt,
+      });
+    }
+  }
+
+  /** Persist first, then update memory, so a failed write changes nothing. */
+  async save(
+    principalId: string,
+    providerId: CredentialProvider,
+    secret: string,
+    metadata?: { projectId?: string },
+  ): Promise<CredentialStatus> {
+    const trimmed = validSecret(secret);
+    if (!this.options.persistence) return this.put(principalId, providerId, trimmed, metadata);
+    const saved = await this.options.persistence.save(principalId, providerId, trimmed, metadata);
+    return this.set(principalId, providerId, trimmed, metadata, saved.version, saved.updatedAt);
+  }
+
+  async delete(principalId: string, providerId: CredentialProvider): Promise<CredentialStatus> {
+    await this.options.persistence?.delete(principalId, providerId);
+    this.broken.delete(principalId + ':' + providerId);
+    return this.remove(principalId, providerId);
   }
 
   bindRun(runId: string, principalId = LOCAL_PRINCIPAL): void {
@@ -103,19 +227,37 @@ export class CredentialStore {
     secret: string,
     metadata?: { projectId?: string },
   ): CredentialStatus {
-    const trimmed = secret.trim();
-    if (!trimmed || trimmed.length > 8192 || /[\r\n\0]/.test(trimmed)) {
-      throw new Error('Provide a non-empty API key with no line breaks.');
-    }
+    const trimmed = validSecret(secret);
+    const previous = this.user.get(principalId + ':' + providerId);
+    return this.set(
+      principalId,
+      providerId,
+      trimmed,
+      metadata,
+      (previous?.version ?? 0) + 1,
+      new Date().toISOString(),
+    );
+  }
+
+  private set(
+    principalId: string,
+    providerId: CredentialProvider,
+    secret: string,
+    metadata: { projectId?: string } | undefined,
+    version: number,
+    updatedAt: string,
+  ): CredentialStatus {
     const key = principalId + ':' + providerId;
     const previous = this.user.get(key);
     this.user.set(key, {
       reference: randomUUID(),
-      version: (previous?.version ?? 0) + 1,
-      secret: trimmed,
+      version,
+      secret,
       source: 'user',
       metadata: metadata?.projectId ? { projectId: metadata.projectId } : undefined,
+      updatedAt,
     });
+    this.broken.delete(key);
     if (previous) this.invalidate(previous.reference, providerId);
     return this.status(principalId, providerId);
   }
@@ -152,7 +294,13 @@ export class CredentialStore {
       );
     }
     this.pins.set(key, { reference: value.reference, version: value.version });
-    return { ...value, metadata: value.metadata ? { ...value.metadata } : undefined };
+    return {
+      reference: value.reference,
+      version: value.version,
+      secret: value.secret,
+      source: value.source,
+      metadata: value.metadata ? { ...value.metadata } : undefined,
+    };
   }
 
   async require(context: CredentialContext): Promise<ResolvedCredential> {
@@ -167,13 +315,39 @@ export class CredentialStore {
       throw new Error('Credential expired or was removed.');
   }
 
+  /**
+   * The user's own stored key, whatever the billing source. For restoring exactly what
+   * was there (import rollback); never an operator key. Never serialize it.
+   */
+  userEntry(
+    principalId: string,
+    providerId: CredentialProvider,
+  ): { secret: string; metadata?: { projectId?: string } } | undefined {
+    const value = this.user.get(principalId + ':' + providerId);
+    if (!value) return undefined;
+    return value.metadata
+      ? { secret: value.secret, metadata: { ...value.metadata } }
+      : { secret: value.secret };
+  }
+
+  /** A stored user key exists but could not be decrypted. */
+  unreadable(principalId: string, providerId: CredentialProvider): boolean {
+    return this.broken.has(principalId + ':' + providerId);
+  }
+
+  /** The key a status row describes, for a local verify call. Never serialize it. */
+  currentSecret(principalId: string, providerId: CredentialProvider): string | undefined {
+    return this.sourceFor(CREDENTIAL_PROVIDERS[providerId]) === 'user'
+      ? this.user.get(principalId + ':' + providerId)?.secret
+      : this.operatorCredential(providerId)?.secret;
+  }
+
   private status(principalId: string, providerId: CredentialProvider): CredentialStatus {
     const purpose = CREDENTIAL_PROVIDERS[providerId];
     const source = this.sourceFor(purpose);
-    const value =
-      source === 'user'
-        ? this.user.get(principalId + ':' + providerId)
-        : this.operatorCredential(providerId);
+    const key = principalId + ':' + providerId;
+    const value = source === 'user' ? this.user.get(key) : this.operatorCredential(providerId);
+    const error = source === 'user' && !value ? this.broken.get(key) : undefined;
     return {
       providerId,
       purpose,
@@ -181,6 +355,9 @@ export class CredentialStore {
       configured: Boolean(value),
       version: value?.version,
       metadata: value?.metadata,
+      ...(value ? { last4: value.secret.slice(-4) } : {}),
+      ...(value && 'updatedAt' in value ? { updatedAt: value.updatedAt as string } : {}),
+      ...(error ? { error } : {}),
     };
   }
 
@@ -228,6 +405,9 @@ export class CredentialStore {
 export const credentials = new CredentialStore({
   source: config.credentials.source,
   browserSource: config.credentials.browserSource,
+  // Only a persisted deployment keeps keys across restarts; an in-memory one would
+  // encrypt under an ephemeral key for nothing.
+  ...(config.persistToDisk ? { persistence: vaultCredentialPersistence(vault) } : {}),
   operator: {
     gemini: { secret: config.providers.gemini.apiKey },
     anthropic: { secret: config.providers.anthropic.apiKey },

@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
+import { randomBytes } from 'node:crypto';
 import express from 'express';
-import { CredentialStore } from '../src/services/credentials.js';
+import { CredentialStore, vaultCredentialPersistence } from '../src/services/credentials.js';
+import { SecretVault } from '../src/services/vault.js';
 import { credentialsRouter } from '../src/api/credentials.routes.js';
 import { HttpError } from '../src/api/middleware/validate.js';
 import { createGeminiBackend } from '../src/providers/gemini/backend.js';
@@ -467,3 +469,72 @@ try {
 console.log(
   'Credential isolation, live backend BYOK, rotation/removal, privacy and local authenticated API checks passed.',
 );
+
+// ---- Persistence through the vault: keys survive a restart, pins still hold.
+{
+  const mem = createMemoryStore();
+  const key = randomBytes(32);
+  const persisted = () =>
+    new CredentialStore({
+      source: 'user',
+      persistence: vaultCredentialPersistence(new SecretVault(mem, key)),
+    });
+  const first = persisted();
+  assert.equal(first.persisted, true);
+  const saved = await first.save('local-user', 'anthropic', 'sk-abcd1234');
+  assert.equal(saved.configured, true);
+  assert.equal(saved.last4, '1234');
+  assert.ok(saved.updatedAt);
+
+  const restarted = persisted();
+  await restarted.hydrate();
+  const ctx = { runId: 'persist-run', providerId: 'anthropic', purpose: 'model' as const };
+  assert.equal((await restarted.require(ctx)).secret, 'sk-abcd1234', 'key survives restart');
+  const status = restarted.statuses('local-user').find((s) => s.providerId === 'anthropic')!;
+  assert.equal(status.last4, '1234');
+  assert.equal(status.version, 1);
+
+  await restarted.save('local-user', 'anthropic', 'sk-new-5678');
+  await assert.rejects(restarted.require(ctx), /start a new run/, 'pinned run fails closed');
+  assert.ok(!JSON.stringify(restarted.statuses('local-user')).includes('sk-'));
+
+  // A different vault key: the entry is reported broken, never silently dropped.
+  const broken = new CredentialStore({
+    source: 'user',
+    persistence: vaultCredentialPersistence(new SecretVault(mem, randomBytes(32))),
+  });
+  await broken.hydrate();
+  const brokenStatus = broken.statuses('local-user').find((s) => s.providerId === 'anthropic')!;
+  assert.equal(brokenStatus.configured, false);
+  assert.match(brokenStatus.error ?? '', /Vault key changed/);
+  assert.equal(broken.available({ ...ctx, runId: 'fresh-run' }), false);
+  const repaired = await broken.save('local-user', 'anthropic', 'sk-fixed-0000');
+  assert.equal(repaired.configured, true);
+  assert.equal(repaired.error, undefined, 're-entering the key repairs it');
+
+  await restarted.delete('local-user', 'anthropic');
+  const afterDelete = persisted();
+  await afterDelete.hydrate();
+  assert.equal(
+    afterDelete.statuses('local-user').find((s) => s.providerId === 'anthropic')!.configured,
+    false,
+  );
+
+  // A failed write leaves memory untouched.
+  const failing = new CredentialStore({
+    source: 'user',
+    persistence: {
+      load: async () => [],
+      save: async () => {
+        throw new Error('disk full');
+      },
+      delete: async () => undefined,
+    },
+  });
+  await assert.rejects(failing.save('local-user', 'gemini', 'g-1'), /disk full/);
+  assert.equal(
+    failing.statuses('local-user').find((s) => s.providerId === 'gemini')!.configured,
+    false,
+  );
+  console.log('Credential persistence through the vault checks passed.');
+}

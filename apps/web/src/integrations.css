@@ -1,0 +1,366 @@
+/*
+ * Integrations tab. Brightness is evidence: a connected row is lit and solid, an
+ * available one sits dim with a dashed (planned) edge, amber is reserved for what
+ * needs a person, rose for failure. Tokens only — no colour literals (theme test).
+ */
+
+.integrations-page .library-heading {
+  align-items: flex-end;
+}
+.integrations-summary {
+  font-size: 12px;
+  color: var(--secondary);
+  white-space: nowrap;
+}
+.integrations-summary a {
+  color: var(--amber-text);
+  text-underline-offset: 4px;
+}
+.integrations-summary a:hover {
+  text-decoration: underline;
+}
+
+.integrations-layout {
+  display: grid;
+  grid-template-columns: 188px minmax(0, 1fr);
+  margin-top: 26px;
+  border: 1px solid var(--line-2);
+  border-radius: 12px;
+  min-height: 560px;
+  overflow: hidden;
+}
+
+/* Rail */
+.integration-rail {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 12px 8px;
+  background: var(--rail);
+  border-right: 1px solid var(--line-2);
+}
+.integration-rail-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 10px;
+  border-radius: 7px;
+  font-size: 12px;
+  color: var(--secondary);
+}
+.integration-rail-item:hover {
+  background: var(--panel-2);
+  color: var(--text);
+}
+.integration-rail-item.is-current {
+  background: var(--accent-soft);
+  color: var(--sage);
+}
+.integration-rail-item--system {
+  margin-top: auto;
+  border-top: 1px solid var(--line);
+  border-radius: 0 0 7px 7px;
+  padding-top: 12px;
+}
+.integration-rail-count {
+  font-size: 10px;
+  color: var(--quiet);
+}
+.integration-rail-item.is-current .integration-rail-count {
+  color: var(--accent-text);
+}
+
+/* Body */
+.integrations-body {
+  min-width: 0;
+  background: var(--panel);
+}
+.integration-split {
+  display: grid;
+  grid-template-columns: minmax(250px, 320px) minmax(0, 1fr);
+  min-height: 100%;
+}
+.integration-list {
+  padding: 16px 14px;
+  border-right: 1px solid var(--line-2);
+  min-width: 0;
+}
+.integration-list--wide {
+  border-right: 0;
+  max-width: 760px;
+}
+.integration-list-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 0 4px 12px;
+}
+.integration-list-head h2,
+.integration-detail-head h2 {
+  font-size: 15px;
+  font-weight: 500;
+  color: var(--text-2);
+}
+.integration-list-head .secondary-button {
+  padding: 6px 10px;
+  font-size: 11px;
+}
+.integration-rows {
+  display: grid;
+  gap: 4px;
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+/* Rows: lit when real, dashed when only available. */
+.integration-row {
+  display: grid;
+  grid-template-columns: 10px minmax(0, 1fr) auto;
+  align-items: center;
+  column-gap: 10px;
+  row-gap: 4px;
+  padding: 9px 10px;
+  border: 1px solid var(--line-2);
+  border-radius: 7px;
+  background: var(--raised-panel);
+  color: var(--text);
+  font-size: 12px;
+}
+a.integration-row:hover {
+  border-color: var(--line-4);
+}
+.integration-row--planned,
+.integration-row--off {
+  background: var(--node-planned-fill);
+  border-style: dashed;
+  border-color: var(--node-planned-line);
+  color: var(--node-planned-text);
+}
+.integration-row.is-selected {
+  background: var(--accent-soft);
+  border-style: solid;
+  border-color: var(--accent-line);
+  color: var(--sage);
+}
+.integration-row.is-focused {
+  border-color: var(--line-4);
+}
+.integration-row-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.integration-row-detail {
+  font-size: 11px;
+  color: var(--quiet);
+  white-space: nowrap;
+}
+.integration-row.is-selected .integration-row-detail {
+  color: var(--accent-text);
+}
+.integration-row--attention .integration-row-detail {
+  color: var(--amber-text);
+}
+.integration-row--error .integration-row-detail {
+  color: var(--danger-text);
+}
+.integration-row-reason {
+  grid-column: 2 / -1;
+  font-size: 11px;
+  line-height: 1.6;
+  color: var(--secondary);
+}
+
+.status-mark {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--edge-done);
+}
+.status-mark--attention {
+  background: var(--amber);
+  border-radius: 1px;
+  transform: rotate(45deg);
+}
+.status-mark--error {
+  background: var(--danger);
+}
+.status-mark--planned,
+.status-mark--off {
+  background: transparent;
+  border: 1px dashed var(--node-planned-line);
+}
+
+/* Detail */
+.integration-detail {
+  padding: 20px 26px 26px;
+  background: var(--raised-panel);
+  min-width: 0;
+}
+.integration-detail-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 18px;
+}
+.integration-facts {
+  display: grid;
+  grid-template-columns: 120px minmax(0, 1fr);
+  gap: 9px 16px;
+  margin: 0 0 20px;
+  padding: 14px 0;
+  border-top: 1px solid var(--line-2);
+  border-bottom: 1px solid var(--line-2);
+  font-size: 12px;
+}
+.integration-facts dt {
+  color: var(--quiet);
+}
+.integration-facts dd {
+  margin: 0;
+  color: var(--text-2);
+  overflow-wrap: anywhere;
+}
+.integration-form {
+  display: grid;
+  gap: 14px;
+  max-width: 440px;
+}
+.integration-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 4px;
+}
+.integration-danger {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  margin-top: 28px;
+  padding-top: 16px;
+  border-top: 1px solid var(--line-2);
+  font-size: 12px;
+  color: var(--danger-text);
+}
+.danger-button {
+  display: inline-flex;
+  align-items: center;
+  padding: 8px 13px;
+  border-radius: 7px;
+  border: 1px solid var(--danger-line);
+  background: transparent;
+  color: var(--danger-text);
+  font-size: 12px;
+  font-weight: 500;
+}
+.danger-button:hover:not(:disabled) {
+  background: var(--danger-soft);
+}
+
+/* Legacy sections mounted as categories keep their own layout, padded to the panel. */
+.integrations-legacy {
+  padding: 4px 22px 22px;
+}
+
+/* Import dialog */
+.import-dialog {
+  width: min(560px, calc(100vw - 32px));
+}
+.import-dialog h2 {
+  font-size: 20px;
+}
+.import-dialog .field {
+  margin-top: 14px;
+}
+.import-dialog textarea {
+  width: 100%;
+  font-size: 12px;
+  border: 1px solid var(--line-3);
+  border-radius: 6px;
+  padding: 8px 10px;
+  background: var(--panel-sunken);
+  color: var(--text);
+  resize: vertical;
+}
+.file-button {
+  margin-top: 14px;
+  cursor: pointer;
+}
+.file-button input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+}
+.file-button:focus-within {
+  outline: 2px solid var(--mark-strong);
+  outline-offset: 2px;
+}
+.import-review-list {
+  list-style: none;
+  margin: 16px 0 0;
+  padding: 0;
+  display: grid;
+  gap: 6px;
+}
+.import-review-row {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--line-2);
+  border-radius: 7px;
+  background: var(--raised-panel);
+  cursor: pointer;
+}
+.import-review-row input {
+  accent-color: var(--sage);
+}
+.import-review-text {
+  display: grid;
+  gap: 2px;
+  font-size: 12px;
+}
+.import-review-text span {
+  color: var(--quiet);
+  font-size: 11px;
+}
+
+@media (max-width: 900px) {
+  .integrations-layout {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: auto minmax(0, 1fr);
+    min-height: 0;
+  }
+  .integration-rail {
+    flex-direction: row;
+    align-items: center;
+    overflow-x: auto;
+    border-right: 0;
+    border-bottom: 1px solid var(--line-2);
+  }
+  .integration-rail-item {
+    white-space: nowrap;
+  }
+  .integration-rail-item--system {
+    margin-top: 0;
+    border-top: 0;
+    border-radius: 7px;
+    padding-top: 8px;
+  }
+  .integration-split {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .integration-list {
+    border-right: 0;
+    border-bottom: 1px solid var(--line-2);
+  }
+  .integration-facts {
+    grid-template-columns: 100px minmax(0, 1fr);
+  }
+}
