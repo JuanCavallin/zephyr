@@ -6,13 +6,11 @@ import { THEMES, type ThemeId } from '../../lib/theme';
 export function Nav({
   open = false,
   onClose,
-  onConnect,
   theme,
   onThemeChange,
 }: {
   open?: boolean;
   onClose?: () => void;
-  onConnect?: () => void;
   theme: ThemeId;
   onThemeChange: (theme: ThemeId) => void;
 }) {
@@ -63,9 +61,9 @@ export function Nav({
           <Icon name="activity" />
           <span>Benchmarks</span>
         </NavLink>
-        <NavLink to="/connections">
+        <NavLink to="/integrations">
           <Icon name="connect" />
-          <span>Connections</span>
+          <span>Integrations</span>
         </NavLink>
       </nav>
       <div className="sidebar-section">
@@ -95,10 +93,10 @@ export function Nav({
         </p>
       </div>
       <div className="sidebar-bottom">
-        <button className="sidebar-utility" onClick={onConnect}>
+        <Link className="sidebar-utility" to="/integrations/harnesses">
           <Icon name="connect" size={17} />
           Harness connection
-        </button>
+        </Link>
         <button
           className="sidebar-utility"
           aria-expanded={themes}

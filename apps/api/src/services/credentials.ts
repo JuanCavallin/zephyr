@@ -53,7 +53,7 @@ export class CredentialRequiredError extends Error {
   ) {
     super(
       source === 'user'
-        ? 'User credentials are required for ' + providerId + '. Configure them in Connections.'
+        ? 'User credentials are required for ' + providerId + '. Add your key in Integrations.'
         : 'Operator credentials are required for ' +
             providerId +
             '. Configure the provider key in .env or select user funding.',

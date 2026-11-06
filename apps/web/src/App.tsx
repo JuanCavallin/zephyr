@@ -1,9 +1,9 @@
-import { Link, Route, Routes, useLocation } from 'react-router-dom';
+import { Link, Navigate, Route, Routes, useLocation } from 'react-router-dom';
 import { AppShell } from './components/layout/AppShell';
 import { Benchmarks } from './pages/Benchmarks';
 import { BoardHome, BoardPage } from './pages/Board';
 import { Compare } from './pages/Compare';
-import { Connections } from './pages/Connections';
+import { Integrations } from './pages/Integrations';
 import { GraphEditor } from './pages/GraphEditor';
 import { Learned } from './pages/Learned';
 import { Workspace, LiveRunWorkspace } from './pages/Workspace';
@@ -19,7 +19,8 @@ export function App() {
         <Route path="/runs/:id" element={<LiveRunWorkspace key={location.pathname} />} />
         <Route path="/board" element={<BoardHome />} />
         <Route path="/board/:id" element={<BoardPage key={location.pathname} />} />
-        <Route path="/connections" element={<Connections />} />
+        <Route path="/integrations/:kind?/:id?" element={<Integrations />} />
+        <Route path="/connections" element={<Navigate to="/integrations" replace />} />
         <Route path="/compare" element={<Compare />} />
         <Route path="/benchmarks" element={<Benchmarks />} />
         <Route path="/learned" element={<Learned />} />

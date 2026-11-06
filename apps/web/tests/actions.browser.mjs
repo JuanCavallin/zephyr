@@ -22,7 +22,7 @@ const waitReady = async () => {
   });
 };
 const openExample = async (label) => {
-  await page.goto(root + '/connections');
+  await page.goto(root + '/integrations/system');
   await page.getByRole('button', { name: label, exact: true }).click();
   await page.waitForURL('**/runs/**');
   await page.getByRole('complementary', { name: 'Action workspace' }).waitFor();
@@ -57,8 +57,8 @@ try {
     reducedMotion: 'reduce',
   });
   page.on('pageerror', (error) => errors.push(error.message));
-  await page.goto(root + '/connections');
-  await page.getByText('Model credential source:', { exact: false }).waitFor();
+  await page.goto(root + '/integrations/system');
+  await page.getByRole('heading', { name: 'Try supervision' }).waitFor();
   const status = await (await page.request.get(root + '/api/providers')).json();
   assert.equal(
     status.providers.find((item) => item.id === 'hermes')?.mode,
@@ -217,7 +217,7 @@ try {
     'Spreadsheet cell preview and rejection during revision prevent the pending second write while retaining the completed first write',
   );
 
-  await page.goto(root + '/connections');
+  await page.goto(root + '/integrations/system');
   await page.route('**/api/runs/*/previews/*', (route) =>
     route.fulfill({
       status: 410,
@@ -246,8 +246,8 @@ try {
   await page.unroute('**/api/runs/*/previews/*');
   passed.push('Expired preview disables approve/revise and preserves reject');
 
-  await page.goto(root + '/connections');
-  await page.getByText('Model credential source:', { exact: false }).waitFor();
+  await page.goto(root + '/integrations/system');
+  await page.getByRole('heading', { name: 'Try supervision' }).waitFor();
   await createRun([
     {
       id: 'office',

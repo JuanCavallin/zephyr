@@ -10,6 +10,7 @@ import type {
   Conversation,
   ConversationMessage,
   CreateMcpConnectionInput,
+  IntegrationsResponse,
   EgressEvent,
   GraphAssertion,
   GraphCritique,
@@ -45,13 +46,24 @@ export interface CredentialStatus {
   source: string;
   version?: number;
   metadata?: { projectId?: string };
+  last4?: string;
+  updatedAt?: string;
+  /** A stored key the server could not read back (vault key changed). */
+  error?: string;
 }
 
 export interface CredentialConfiguration {
   source: 'operator' | 'user';
   browserSource: 'operator' | 'user';
-  lifetime: 'process';
+  lifetime: 'process' | 'persisted';
   providers: CredentialStatus[];
+}
+
+export type VerifyResult = { ok: boolean | null; detail: string };
+
+export interface EnvImportPreview {
+  matches: Array<{ providerId: string; envVar: string; last4: string; replaces: boolean }>;
+  ignored: number;
 }
 
 export interface RunDetail {
@@ -387,6 +399,20 @@ export const api = {
     credentialRequest<{ provider: CredentialStatus }>('/credentials/' + providerId, {
       method: 'DELETE',
     }),
+  verifyCredential: (providerId: string) =>
+    credentialRequest<VerifyResult>('/credentials/' + providerId + '/verify', { method: 'POST' }),
+  /** The file is read in the browser; only its text is sent, and only last-four digits return. */
+  previewEnvImport: (text: string) =>
+    credentialRequest<EnvImportPreview>('/credentials/import/env', {
+      method: 'POST',
+      body: JSON.stringify({ text }),
+    }),
+  commitEnvImport: (text: string, providerIds: string[]) =>
+    credentialRequest<{ providers: CredentialStatus[] }>('/credentials/import/env/commit', {
+      method: 'POST',
+      body: JSON.stringify({ text, providerIds }),
+    }),
+  integrations: () => request<IntegrationsResponse>('/integrations'),
 
   /**
    * Pause is cooperative: this resolves once the server has accepted the
@@ -403,8 +429,12 @@ export const api = {
 
   /* ------------------------------------------------------------ Task board */
 
-  createBoard: (body: { request: string; repoFiles?: string[]; private?: boolean; base?: string }) =>
-    request<BoardSnapshot>('/tasks', { method: 'POST', body: JSON.stringify(body) }),
+  createBoard: (body: {
+    request: string;
+    repoFiles?: string[];
+    private?: boolean;
+    base?: string;
+  }) => request<BoardSnapshot>('/tasks', { method: 'POST', body: JSON.stringify(body) }),
 
   board: (boardId: string) => request<BoardSnapshot>('/tasks/' + encodeURIComponent(boardId)),
 
@@ -433,7 +463,11 @@ export const api = {
   /** Pick one of a task's built variants: it merges, the rest are deleted, the pick is a signal. */
   pickVariant: (boardId: string, taskId: string, variantId: string) =>
     request<{ task: Task }>(
-      '/tasks/' + encodeURIComponent(boardId) + '/tasks/' + encodeURIComponent(taskId) + '/variants/pick',
+      '/tasks/' +
+        encodeURIComponent(boardId) +
+        '/tasks/' +
+        encodeURIComponent(taskId) +
+        '/variants/pick',
       { method: 'POST', body: JSON.stringify({ variantId }) },
     ),
 
@@ -448,12 +482,16 @@ export const api = {
   /* ---------------------------------------------------- What Zephyr learned */
 
   learningFeed: (filter: { status?: string; kind?: string } = {}) => {
-    const q = new URLSearchParams(Object.entries(filter).filter((e): e is [string, string] => !!e[1]));
+    const q = new URLSearchParams(
+      Object.entries(filter).filter((e): e is [string, string] => !!e[1]),
+    );
     return request<{ items: FeedItem[] }>('/learning' + (q.size ? '?' + q : ''));
   },
 
   learningAction: (id: string, action: 'revert' | 'accept' | 'promote') =>
-    request<{ entry: LearnedEntry }>('/learning/' + encodeURIComponent(id) + '/' + action, { method: 'POST' }),
+    request<{ entry: LearnedEntry }>('/learning/' + encodeURIComponent(id) + '/' + action, {
+      method: 'POST',
+    }),
 
   learningRestore: (id: string, version: number) =>
     request<{ entry: LearnedEntry }>('/learning/' + encodeURIComponent(id) + '/restore', {
@@ -464,11 +502,15 @@ export const api = {
   learningPass: () => request<LearningPassResult>('/learning/pass', { method: 'POST' }),
 
   learningPropose: (ids: string[]) =>
-    request<ProjectProposal>('/learning/proposals', { method: 'POST', body: JSON.stringify({ ids }) }),
+    request<ProjectProposal>('/learning/proposals', {
+      method: 'POST',
+      body: JSON.stringify({ ids }),
+    }),
 
   learningExport: () => request<unknown>('/learning/export'),
 
-  learningDeleteAll: () => request<{ signals: number; entries: number }>('/learning', { method: 'DELETE' }),
+  learningDeleteAll: () =>
+    request<{ signals: number; entries: number }>('/learning', { method: 'DELETE' }),
 
   learningFeedback: (body: {
     rating: 'up' | 'down';
@@ -476,7 +518,8 @@ export const api = {
     taskId?: string;
     runId?: string;
     private?: boolean;
-  }) => request<unknown>('/learning/signals/feedback', { method: 'POST', body: JSON.stringify(body) }),
+  }) =>
+    request<unknown>('/learning/signals/feedback', { method: 'POST', body: JSON.stringify(body) }),
 
   learningVariantPick: (body: {
     chosen: string;
@@ -484,7 +527,11 @@ export const api = {
     taskId?: string;
     runId?: string;
     private?: boolean;
-  }) => request<unknown>('/learning/signals/variant-pick', { method: 'POST', body: JSON.stringify(body) }),
+  }) =>
+    request<unknown>('/learning/signals/variant-pick', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
 
   decide: (approvalId: string, decision: ApprovalDecision) =>
     request<{ approval: Approval }>('/approvals/' + approvalId + '/decide', {
